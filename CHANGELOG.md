@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.2](https://github.com/toovinod/octopus/compare/v0.1.1...v0.1.2) (2026-11-16)
+
+
+### Features
+
+* **daemon:** let OCTOPUS_GIT_TIMEOUT and OCTOPUS_GIT_NETWORK_TIMEOUT raise the git limits ([483d62c](https://github.com/toovinod/octopus/commit/483d62cdb9b7d403efc19820edc2c8aa1e305945))
+
+
+### Bug Fixes
+
+* **daemon:** accept any Codex at or above the generated protocol version ([2672d69](https://github.com/toovinod/octopus/commit/2672d695634e066614d26597f7975e01e8190ac5))
+* **daemon:** offer Claude Fable 5.2 in place of 5.1 ([b3b18f1](https://github.com/toovinod/octopus/commit/b3b18f1836a3cb6e0a8f23cb6b4949b22a6ad311))
+* **daemon:** read each agent's API key from the keychain once per run ([952a6f5](https://github.com/toovinod/octopus/commit/952a6f5f83de010f99202dfcaa40c4772300340f))
+* **desktop:** reuse the cached daemon build in dev so the keychain keeps trusting it ([e9c6e44](https://github.com/toovinod/octopus/commit/e9c6e44e4bf0cbb1574e0255c599491dc6297d3f))
+
 ## [0.1.1](https://github.com/toovinod/octopus/compare/v0.1.0...v0.1.1) (2026-11-16)
 
 
