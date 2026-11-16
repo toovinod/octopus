@@ -9,6 +9,7 @@
 		"ignoreUnknown": false,
 		"includes": [
 			"**",
+			"!!CHANGELOG.md",
 			"!!apps/daemon/src/agents/codex/generated",
 			"!!apps/daemon/src/database/migrations",
 			"!!packages/db-cloud/drizzle",
