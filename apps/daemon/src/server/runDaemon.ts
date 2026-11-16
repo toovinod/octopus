@@ -1,3 +1,4 @@
+import { gitTimeoutSettingsFromConfig } from "../git/GitTimeoutSettings.ts";
 import { BunRuntime, BunServices, BunStdio } from "@effect/platform-bun";
 import type { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import type { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
@@ -20,6 +21,7 @@ export const runDaemon = (agents: Layer.Layer<Agents, never, ProcessRegistry>) =
 		Layer.provideMerge(ProcessRegistry.layer.pipe(Layer.provide(BunServices.layer))),
 		Layer.provideMerge(Shutdown.layer),
 		Layer.provideMerge(DaemonConfig.layer),
+		Layer.provideMerge(gitTimeoutSettingsFromConfig),
 		Layer.provide(BunStdio.layer),
 	);
 
