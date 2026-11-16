@@ -4,7 +4,7 @@
 	"type": "module",
 	"private": true,
 	"scripts": {
-		"dev": "bun run --cwd ../daemon build && tauri dev",
+		"dev": "turbo run build --filter=daemon --output-logs=errors-only && tauri dev",
 		"build": "tauri build --no-bundle",
 		"tauri": "tauri"
 	},
