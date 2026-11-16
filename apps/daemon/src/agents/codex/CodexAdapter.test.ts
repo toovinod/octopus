@@ -204,7 +204,7 @@ describe("CodexAdapter", () => {
 		expect(agentEvents[2]).toMatchObject({ text: "error -32601" });
 	});
 
-	test("fails when the installed version differs from the generated types", async () => {
+	test("fails when the installed version is older than the generated types", async () => {
 		const error = await runWithCodex(Effect.flip(checkAuth), `${import.meta.dir}/fixtures/outdatedCodex.ts`);
 		expect(error).toMatchObject({
 			_tag: "CodexVersionMismatchError",
@@ -212,8 +212,13 @@ describe("CodexAdapter", () => {
 		});
 		const pinned = codexVersionFile.trim();
 		expect(error.message).toBe(
-			`Octopus needs Codex ${pinned}, but the installed codex is 0.0.1. Install Codex ${pinned} to use it with Octopus.`,
+			`Octopus needs Codex ${pinned} or newer, but the installed codex is 0.0.1. Update Codex to use it with Octopus.`,
 		);
+	});
+
+	test("accepts a version newer than the generated types", async () => {
+		const status = await runWithCodex(checkAuth, `${import.meta.dir}/fixtures/newerCodex.ts`);
+		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
 	});
 
 	test("reports a missing executable as not installed", async () => {

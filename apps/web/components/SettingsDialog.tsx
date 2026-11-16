@@ -95,7 +95,7 @@ const availabilityText = (availability: AgentAvailability) => {
 		case "notInstalled":
 			return "Not installed on this computer";
 		case "versionMismatch":
-			return `Version ${availability.actual} is installed, Octopus needs ${availability.expected}`;
+			return `Version ${availability.actual} is installed, Octopus needs ${availability.expected} or newer`;
 		case "unknown":
 			return availability.message;
 	}

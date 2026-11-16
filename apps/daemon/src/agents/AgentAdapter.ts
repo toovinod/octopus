@@ -65,7 +65,7 @@ export class CodexVersionMismatchError extends Schema.TaggedError<CodexVersionMi
 	{ expected: Schema.String, actual: Schema.String },
 ) {
 	override get message() {
-		return `Octopus needs Codex ${this.expected}, but the installed codex is ${this.actual || "an unknown version"}. Install Codex ${this.expected} to use it with Octopus.`;
+		return `Octopus needs Codex ${this.expected} or newer, but the installed codex is ${this.actual || "an unknown version"}. Update Codex to use it with Octopus.`;
 	}
 }
 

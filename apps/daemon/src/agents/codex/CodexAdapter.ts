@@ -121,7 +121,9 @@ const checkVersion = Effect.fn("CodexAdapter.checkVersion")(function* (executabl
 		.pipe(Effect.mapError(toAgentError(executable, "Could not run codex --version.")));
 	// `codex --version` prints "codex-cli <version>".
 	const actual = output.trim().split(" ").at(-1) ?? "";
-	if (actual !== CODEX_VERSION) {
+	// The protocol types come from CODEX_VERSION. Newer releases keep that protocol working, and anything
+	// they change shows up as a decode error at the boundary, so only an older Codex is refused.
+	if (!Bun.semver.satisfies(actual, `>=${CODEX_VERSION}`)) {
 		return yield* new CodexVersionMismatchError({
 			expected: CODEX_VERSION,
 			actual,
