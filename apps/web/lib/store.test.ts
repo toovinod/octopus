@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import { Predicate } from "effect";
 
 // The daemon answers each sendMessage with the next of these outcomes.
 const outcomes: Array<"ok" | "busy"> = [];
@@ -17,7 +18,9 @@ mock.module("./daemonRuntime.ts", () => ({
 	},
 	followDaemon: () => () => {},
 	errorMessage: (error: { readonly message: string }) => error.message,
-	errorTag: () => null,
+	// mock.module replaces the module for every test file in the run, so this must behave like the real one.
+	errorTag: (error: unknown) =>
+		Predicate.hasProperty(error, "_tag") && Predicate.isString(error._tag) ? error._tag : null,
 }));
 
 const { discardFailedSend, failedSendsOf, getState, retryFailedSend, sendMessage } = await import("./store.ts");
