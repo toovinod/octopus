@@ -34,6 +34,22 @@ describe("followReattaching", () => {
 		expect(stream.attaches()).toBe(2);
 	});
 
+	test("a drop that onDrop calls final stops without reattaching", async () => {
+		const stream = droppingOnce();
+		const drops: Array<unknown> = [];
+		followReattaching(stream.follow, {
+			onItem: () => undefined,
+			onReattach: () => undefined,
+			onDrop: (error) => {
+				drops.push(error);
+				return false;
+			},
+		});
+		await Bun.sleep(1500);
+		expect(drops).toHaveLength(1);
+		expect(stream.attaches()).toBe(1);
+	});
+
 	test("stopping while waiting to reattach stops for good", async () => {
 		const stream = droppingOnce();
 		const stop = followReattaching(stream.follow, { onItem: () => undefined, onReattach: () => undefined });
