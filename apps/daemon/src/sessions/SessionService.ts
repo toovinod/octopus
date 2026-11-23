@@ -13,7 +13,6 @@ import {
 	ImageMediaType,
 	ImagesNotSupportedError,
 	ResubscribeRequiredError,
-	SessionLimitReachedError,
 	SessionNotFoundError,
 } from "@repo/contracts/AgentSession";
 import {
@@ -29,8 +28,10 @@ import {
 } from "../agents/AgentAdapter.ts";
 import {
 	type Cause,
+	Clock,
 	Context,
 	Deferred,
+	Duration,
 	Effect,
 	Exit,
 	FileSystem,
@@ -38,8 +39,10 @@ import {
 	Option,
 	PubSub,
 	Queue,
+	RcMap,
 	type Redacted,
 	Result,
+	Schedule,
 	Schema,
 	Scope,
 	Semaphore,
@@ -63,12 +66,12 @@ import { newId } from "../database/newId.ts";
 import { Base64 } from "effect/encoding";
 import { join } from "node:path";
 
-// Agent processes are the expensive part, so only they are capped. Sessions are unlimited.
-export const MAX_RUNNING_SESSIONS = 8;
 const HISTORY_PAGE_SIZE = 200;
 const SUBSCRIBER_MAX_EVENTS = 1_000;
 const SUBSCRIBER_MAX_BYTES = 1_000_000;
 const STOP_GRACE = "5 seconds";
+const IDLE_TIMEOUT = Duration.toNanosUnsafe("5 minutes");
+const IDLE_SWEEP_INTERVAL = "30 seconds";
 
 type SessionRow = typeof agentSession.$inferSelect;
 type RestingStatus = Extract<AgentSessionStatus, "idle" | "interrupted" | "failed">;
@@ -83,6 +86,8 @@ interface Runtime {
 	readonly scope: Scope.Closeable;
 	// Completes once every event of the process is stored.
 	readonly done: Deferred.Deferred<void>;
+	ending: boolean;
+	idleSince: bigint;
 	nextSequence: number;
 	// Turns sent and not yet completed, including queued ones.
 	outstanding: number;
@@ -145,12 +150,17 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const fs = yield* FileSystem.FileSystem;
 		const { dataDir } = yield* DaemonConfig;
 		const attachmentsDir = (sessionId: string) => join(dataDir, "attachments", sessionId);
+		const clock = yield* Clock.Clock;
 		const events = yield* PubSub.unbounded<Published>();
 		const sessionChanges = yield* PubSub.unbounded<AgentSession>();
-		// Insertion order is least recently used first, which picks the process to stop at the cap.
 		const runtimes = new Map<string, Runtime>();
-		// Starting and stopping processes one at a time keeps the cap exact.
-		const processLock = yield* Semaphore.make(1);
+		const processLocks = yield* RcMap.make({ lookup: (_sessionId: string) => Semaphore.make(1) });
+		// A send and a stop must agree on which process owns the session, even as other sessions start or stop.
+		const withProcessLock = <A, E, R>(sessionId: string, effect: Effect.Effect<A, E, R>) =>
+			RcMap.get(processLocks, sessionId).pipe(
+				Effect.flatMap((lock) => lock.withPermit(effect)),
+				Effect.scoped,
+			);
 		// Event consumers live here. Its finalizer runs after the shutdown finalizer below,
 		// so consumers can still store the last events of the processes being stopped.
 		const consumers = yield* Scope.fork(yield* Effect.scope);
@@ -188,6 +198,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const refreshStatus = (runtime: Runtime) => {
 			const status = statusOf(runtime);
 			if (status === runtime.status) return Effect.void;
+			if (!isBusy(status)) runtime.idleSince = clock.currentTimeNanosUnsafe();
 			// Set before the write so concurrent callers write in the order they decided.
 			runtime.status = status;
 			return Effect.asVoid(updateSession(runtime.sessionId, { status }));
@@ -237,7 +248,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					Stream.runForEach((event) => record(runtime, event)),
 					Effect.result,
 				);
-				if (runtimes.get(runtime.sessionId) === runtime) runtimes.delete(runtime.sessionId);
+				runtime.ending = true;
 				yield* Scope.close(runtime.scope, Exit.void);
 				runtime.approvals.clear();
 				runtime.outstanding = 0;
@@ -264,35 +275,47 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			(effect, runtime) =>
 				effect.pipe(
 					Effect.catch((error) => Effect.logError("Could not finish an agent session", error)),
-					Effect.ensuring(Deferred.succeed(runtime.done, undefined)),
+					Effect.ensuring(
+						Effect.sync(() => {
+							if (runtimes.get(runtime.sessionId) === runtime) runtimes.delete(runtime.sessionId);
+						}).pipe(Effect.andThen(Deferred.succeed(runtime.done, undefined))),
+					),
 				),
 		);
 
-		// Callers hold processLock.
+		// Callers hold this session's process lock.
 		const stopRuntime = Effect.fnUntraced(function* (runtime: Runtime) {
-			runtimes.delete(runtime.sessionId);
-			if (isBusy(runtime.status)) {
-				// Cancels pending approvals and records the interrupted turn before the process goes.
-				yield* runtime.handle.interrupt.pipe(
-					Effect.timeoutOption(STOP_GRACE),
-					Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
-				);
-			}
-			yield* Scope.close(runtime.scope, Exit.void);
-			yield* Deferred.await(runtime.done);
+			// Cancel pending approvals and record the interrupted turn before closing the process.
+			const interrupt =
+				!runtime.ending && isBusy(runtime.status)
+					? runtime.handle.interrupt.pipe(
+							Effect.timeoutOption(STOP_GRACE),
+							Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
+						)
+					: Effect.void;
+			yield* interrupt.pipe(
+				Effect.ensuring(Scope.close(runtime.scope, Exit.void).pipe(Effect.andThen(Deferred.await(runtime.done)))),
+			);
 		});
 
-		const makeRoom = Effect.gen(function* () {
-			if (runtimes.size < MAX_RUNNING_SESSIONS) return;
-			const idle = [...runtimes.values()].find((runtime) => !isBusy(runtime.status));
-			if (idle === undefined) {
-				return yield* new SessionLimitReachedError({ limit: MAX_RUNNING_SESSIONS });
-			}
-			// An idle process resumes through its native id on the next message, so stopping it loses nothing.
-			yield* Effect.logInfo("Stopping the least recently used idle agent").pipe(
-				Effect.annotateLogs({ sessionId: idle.sessionId }),
+		const stopRuntimes = (shouldStop: (runtime: Runtime) => boolean) =>
+			Effect.suspend(() =>
+				Effect.forEach(
+					[...runtimes.values()].filter(shouldStop),
+					(runtime) =>
+						withProcessLock(
+							runtime.sessionId,
+							Effect.suspend(() =>
+								runtimes.get(runtime.sessionId) === runtime && shouldStop(runtime) ? stopRuntime(runtime) : Effect.void,
+							),
+						),
+					{ concurrency: "unbounded", discard: true },
+				),
 			);
-			yield* stopRuntime(idle);
+
+		const stopExpiredRuntimes = Effect.suspend(() => {
+			const cutoff = clock.currentTimeNanosUnsafe() - IDLE_TIMEOUT;
+			return stopRuntimes((runtime) => !isBusy(runtime.status) && runtime.idleSince <= cutoff);
 		});
 
 		// The user's choice, else an API key when one is stored, else the agent's first mode.
@@ -357,7 +380,6 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				return yield* new WorkspaceArchivedError({ workspaceId: row.workspaceId });
 			}
 			const auth = yield* authFor(row.agent);
-			yield* makeRoom;
 			const scope = yield* Scope.make();
 			const handle = yield* adapters[row.agent]
 				.startSession({
@@ -386,6 +408,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				handle,
 				scope,
 				done: yield* Deferred.make<void>(),
+				ending: false,
+				idleSince: clock.currentTimeNanosUnsafe(),
 				nextSequence: (stored?.last ?? -1) + 1,
 				outstanding: 0,
 				approvals: new Set(),
@@ -403,12 +427,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return runtime;
 		});
 
-		const ensureRuntime = (sessionId: string) =>
-			Effect.gen(function* () {
-				const existing = runtimes.get(sessionId);
-				if (existing !== undefined) return existing;
-				return yield* startRuntime(yield* getRow(sessionId));
-			}).pipe(Semaphore.withPermit(processLock));
+		const ensureRuntime = Effect.fnUntraced(function* (sessionId: string) {
+			const existing = runtimes.get(sessionId);
+			if (existing !== undefined) {
+				if (!existing.ending) return existing;
+				// Its last events and status must be saved before the replacement reads them.
+				yield* Deferred.await(existing.done);
+			}
+			return yield* startRuntime(yield* getRow(sessionId));
+		});
 
 		const checkImagesSupported = Effect.fnUntraced(function* (sessionId: string) {
 			const row = yield* getRow(sessionId);
@@ -436,42 +463,36 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			);
 		}, Effect.provide(services));
 
-		const sendMessage = Effect.fn("SessionService.sendMessage")(function* (
-			sessionId: string,
-			text: string,
-			images: ReadonlyArray<ImageData>,
-			steer: boolean,
-		) {
-			if (images.length > 0) yield* checkImagesSupported(sessionId);
-			const runtime = yield* ensureRuntime(sessionId);
-			if (runtimes.get(sessionId) === runtime) {
-				runtimes.delete(sessionId);
-				runtimes.set(sessionId, runtime);
-			}
-			const message = {
-				id: yield* newId.pipe(Effect.provide(services)),
-				text,
-				images: yield* storeImages(sessionId, images),
-			};
-			// Counted before sending, so the turn's own completion can never arrive first.
-			runtime.outstanding++;
-			yield* refreshStatus(runtime);
-			const sent = yield* runtime.handle.sendMessage(message, { steer }).pipe(
-				Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
-				Effect.tapError(() =>
-					Effect.gen(function* () {
-						runtime.outstanding--;
-						yield* refreshStatus(runtime);
-						// The message was not stored, so nothing will ever ask for its images.
-						yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
-					}),
-				),
-			);
-			if (sent === "steered") {
-				runtime.outstanding--;
+		const sendMessage = Effect.fn("SessionService.sendMessage")(
+			function* (sessionId: string, text: string, images: ReadonlyArray<ImageData>, steer: boolean) {
+				if (images.length > 0) yield* checkImagesSupported(sessionId);
+				const runtime = yield* ensureRuntime(sessionId);
+				const message = {
+					id: yield* newId.pipe(Effect.provide(services)),
+					text,
+					images: yield* storeImages(sessionId, images),
+				};
+				// Counted before sending, so the turn's own completion can never arrive first.
+				runtime.outstanding++;
 				yield* refreshStatus(runtime);
-			}
-		});
+				const sent = yield* runtime.handle.sendMessage(message, { steer }).pipe(
+					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
+					Effect.tapError(() =>
+						Effect.gen(function* () {
+							runtime.outstanding--;
+							yield* refreshStatus(runtime);
+							// The message was not stored, so nothing will ever ask for its images.
+							yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
+						}),
+					),
+				);
+				if (sent === "steered") {
+					runtime.outstanding--;
+					yield* refreshStatus(runtime);
+				}
+			},
+			(effect, sessionId) => withProcessLock(sessionId, effect),
+		);
 
 		const respondToApproval = Effect.fn("SessionService.respondToApproval")(function* (
 			sessionId: string,
@@ -495,21 +516,22 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.interrupt;
 		});
 
-		const stop = Effect.fn("SessionService.stop")(function* (sessionId: string) {
-			const runtime = runtimes.get(sessionId);
-			if (runtime === undefined) {
-				yield* getRow(sessionId);
-				return;
-			}
-			yield* stopRuntime(runtime);
-		}, Semaphore.withPermit(processLock));
+		const stop = Effect.fn("SessionService.stop")(
+			function* (sessionId: string) {
+				const runtime = runtimes.get(sessionId);
+				if (runtime === undefined) {
+					yield* getRow(sessionId);
+					return;
+				}
+				yield* stopRuntime(runtime);
+			},
+			(effect, sessionId) => withProcessLock(sessionId, effect),
+		);
 
 		// Archiving a workspace releases every agent process in it.
-		const stopWorkspace = Effect.fn("SessionService.stopWorkspace")(function* (workspaceId: string) {
-			for (const runtime of [...runtimes.values()]) {
-				if (runtime.workspaceId === workspaceId) yield* stopRuntime(runtime);
-			}
-		}, Semaphore.withPermit(processLock));
+		const stopWorkspace = Effect.fn("SessionService.stopWorkspace")((workspaceId: string) =>
+			stopRuntimes((runtime) => runtime.workspaceId === workspaceId),
+		);
 
 		// Only once the workspace is archived: an archive that fails leaves its chats usable.
 		const deleteWorkspaceAttachments = Effect.fn("SessionService.deleteWorkspaceAttachments")(function* (
@@ -845,12 +867,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		});
 		yield* recoverSessions;
 
-		yield* Effect.addFinalizer(() =>
-			// In parallel, so every agent gets the same grace and shutdown stays within its deadline.
-			Effect.forEach([...runtimes.values()], stopRuntime, { concurrency: "unbounded", discard: true }).pipe(
-				Semaphore.withPermit(processLock),
-			),
-		);
+		// Stop the idle sweep first, then release every remaining runtime while consumers can still save events.
+		yield* Effect.addFinalizer(() => stopRuntimes(() => true));
+		yield* stopExpiredRuntimes.pipe(Effect.repeat(Schedule.spaced(IDLE_SWEEP_INTERVAL)), Effect.forkScoped);
 
 		return {
 			listAgents,

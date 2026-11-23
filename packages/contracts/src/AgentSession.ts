@@ -74,15 +74,6 @@ export class SessionNotFoundError extends Schema.TaggedError<SessionNotFoundErro
 	}
 }
 
-export class SessionLimitReachedError extends Schema.TaggedError<SessionLimitReachedError>()(
-	"SessionLimitReachedError",
-	{ limit: Schema.Int },
-) {
-	override get message() {
-		return `${this.limit} agents are already working. Stop one or wait for a turn to finish.`;
-	}
-}
-
 // Retryable: a turn is running and the message queue is full.
 export class SessionBusyError extends Schema.TaggedError<SessionBusyError>()("SessionBusyError", {
 	queued: Schema.Int,

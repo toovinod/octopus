@@ -12,7 +12,6 @@ import {
 	ApprovalNotFoundError,
 	ResubscribeRequiredError,
 	SessionBusyError,
-	SessionLimitReachedError,
 	SessionNotFoundError,
 } from "./AgentSession.ts";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "./Workspace.ts";
@@ -84,7 +83,6 @@ export class SessionRpcs extends RpcGroup.make(
 		},
 		error: Schema.Union([
 			SessionNotFoundError,
-			SessionLimitReachedError,
 			SessionBusyError,
 			AgentUnavailableError,
 			ImagesNotSupportedError,

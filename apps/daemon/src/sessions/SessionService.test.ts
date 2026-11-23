@@ -12,6 +12,7 @@ import {
 	FileSystem,
 	Layer,
 	Logger,
+	Queue,
 	Redacted,
 	Schedule,
 	Schema,
@@ -23,7 +24,6 @@ import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapte
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
 import type { AgentSessionStatus, AgentKind } from "@repo/contracts/AgentSession";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
-import { MAX_RUNNING_SESSIONS, SessionService } from "./SessionService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { agentSession, sessionEvent } from "../database/schema.ts";
@@ -32,7 +32,9 @@ import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { AgentEvent } from "@repo/contracts/AgentEvent";
+import { SessionService } from "./SessionService.ts";
 import { describe, expect, test } from "bun:test";
+import { TestClock } from "effect/testing";
 import { runGit } from "../git/runGit.ts";
 import { asc, eq } from "drizzle-orm";
 import { join } from "node:path";
@@ -348,32 +350,23 @@ describe("SessionService", () => {
 		expect(outcome._tag === "Failure" && outcome.failure._tag).toBe("ResubscribeRequiredError");
 	});
 
-	test("caps running agents at 8 and stops the least recently used idle one for a new one", async () => {
-		const result = await runServiceTest((tempDir) =>
+	test("runs nine sessions concurrently while each waits for approval", async () => {
+		const active = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const sessions = yield* SessionService;
 				const workspace = yield* addWorkspace(tempDir);
-				const created = yield* Effect.forEach(Array.from({ length: MAX_RUNNING_SESSIONS + 1 }), () =>
+				const created = yield* Effect.forEach(Array.from({ length: 9 }), () =>
 					sessions.create({ workspaceId: workspace.id, agent: "codex", model: "replay", effort: null }),
 				);
-				for (const session of created.slice(0, MAX_RUNNING_SESSIONS)) {
+				for (const session of created) {
 					yield* sessions.sendMessage(session.id, "run the tests", [], false);
 					yield* waitForStatus(session.id, "awaitingApproval");
 				}
-				const last = created[MAX_RUNNING_SESSIONS]?.id ?? "";
-				const refused = yield* Effect.flip(sessions.sendMessage(last, "run the tests", [], false));
-				const first = created[0]?.id ?? "";
-				yield* sessions.respondToApproval(first, "0", "allowOnce");
-				yield* waitForStatus(first, "idle");
-				yield* sessions.sendMessage(last, "run the tests", [], false);
-				yield* waitForStatus(last, "awaitingApproval");
-				// The first session's process is gone, so its approval cannot be answered any more.
-				const firstGone = yield* Effect.flip(sessions.respondToApproval(first, "0", "allowOnce"));
-				return { refused, firstGone };
+				return yield* sessions.list(workspace.id);
 			}),
 		);
-		expect(result.refused).toMatchObject({ _tag: "SessionLimitReachedError", limit: 8 });
-		expect(result.firstGone._tag).toBe("ApprovalNotFoundError");
+		expect(active).toHaveLength(9);
+		expect(active.every((session) => session.status === "awaitingApproval")).toBe(true);
 	});
 
 	test("watching starts with every session of the active workspaces, then follows changes", async () => {
@@ -511,6 +504,130 @@ describe("SessionService", () => {
 			trustProjectSettings: false,
 			auth: { mode: "subscription" },
 		});
+	});
+
+	test("releases an expired idle process and resumes it while a pending approval stays live", async () => {
+		await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const released = yield* Deferred.make<void>();
+				const replay = makeReplayAdapter(commandWithApproval);
+				const codex = spyOn({
+					...replay,
+					startSession: (input) =>
+						replay
+							.startSession(input)
+							.pipe(
+								Effect.tap(() =>
+									input.model === "idle"
+										? Effect.addFinalizer(() => Deferred.succeed(released, undefined))
+										: Effect.void,
+								),
+							),
+				});
+				yield* withServices(
+					join(tempDir, "data"),
+					testAgentServices({
+						claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }),
+						codex: codex.spy,
+					}),
+				)(
+					Effect.gen(function* () {
+						const sessions = yield* SessionService;
+						const workspace = yield* addWorkspace(tempDir);
+						const idle = yield* sessions.create({
+							workspaceId: workspace.id,
+							agent: "codex",
+							model: "idle",
+							effort: null,
+						});
+						const busy = yield* sessions.create({
+							workspaceId: workspace.id,
+							agent: "codex",
+							model: "replay",
+							effort: null,
+						});
+						for (const session of [idle, busy]) {
+							yield* sessions.sendMessage(session.id, "run the tests", [], false);
+							yield* TestClock.withLive(waitForStatus(session.id, "awaitingApproval"));
+						}
+						yield* TestClock.adjust("4 minutes");
+						yield* sessions.respondToApproval(idle.id, "0", "allowOnce");
+						yield* TestClock.withLive(waitForStatus(idle.id, "idle"));
+						yield* TestClock.adjust("4 minutes");
+						expect(yield* Deferred.isDone(released)).toBe(false);
+						yield* TestClock.adjust("1 minute");
+						yield* TestClock.withLive(Deferred.await(released).pipe(Effect.timeout("1 second")));
+						expect(yield* statusOf(idle.id)).toBe("idle");
+						yield* sessions.respondToApproval(busy.id, "0", "allowOnce");
+						yield* sessions.sendMessage(idle.id, "run again", [], false);
+						yield* TestClock.withLive(waitForStatus(idle.id, "awaitingApproval"));
+						expect(codex.inputs.map((input) => input.resumeId)).toEqual([undefined, undefined, "thread-replay"]);
+					}),
+				);
+			}).pipe(Effect.provide(TestClock.layer())),
+		);
+	});
+
+	test("archiving stops agents in parallel and leaves other workspaces responsive", async () => {
+		await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const stopping = yield* Queue.unbounded<string>();
+				const release = yield* Deferred.make<void>();
+				const replay = makeReplayAdapter(commandWithApproval);
+				const codex: AgentAdapter = {
+					...replay,
+					startSession: (input) =>
+						replay.startSession(input).pipe(
+							Effect.map((handle) => ({
+								...handle,
+								interrupt: Queue.offer(stopping, input.model).pipe(
+									Effect.andThen(Deferred.await(release)),
+									Effect.andThen(handle.interrupt),
+								),
+							})),
+						),
+				};
+				yield* withServices(
+					join(tempDir, "data"),
+					testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+				)(
+					Effect.gen(function* () {
+						const sessions = yield* SessionService;
+						const workspaces = yield* WorkspaceService;
+						const workspace = yield* addWorkspace(tempDir);
+						const otherWorkspace = yield* workspaces.create({
+							kind: "worktree",
+							projectId: workspace.projectId,
+							name: "other",
+						});
+						for (const model of ["first", "second"]) {
+							const session = yield* sessions.create({
+								workspaceId: workspace.id,
+								agent: "codex",
+								model,
+								effort: null,
+							});
+							yield* sessions.sendMessage(session.id, "run the tests", [], false);
+							yield* waitForStatus(session.id, "awaitingApproval");
+						}
+						const other = yield* sessions.create({
+							workspaceId: otherWorkspace.id,
+							agent: "codex",
+							model: "replay",
+							effort: null,
+						});
+						const archiving = yield* workspaces.archive(workspace.id, { force: false }).pipe(Effect.forkChild);
+						yield* Effect.gen(function* () {
+							const models = [yield* Queue.take(stopping), yield* Queue.take(stopping)];
+							expect(models.sort()).toEqual(["first", "second"]);
+							yield* sessions.sendMessage(other.id, "run the tests", [], false);
+							yield* waitForStatus(other.id, "awaitingApproval");
+						}).pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+						expect((yield* Fiber.join(archiving)).status).toBe("archived");
+					}),
+				);
+			}),
+		);
 	});
 
 	test("archiving a workspace stops its agent processes", async () => {
