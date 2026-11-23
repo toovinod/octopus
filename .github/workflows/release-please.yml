@@ -43,7 +43,6 @@ jobs:
         include:
           - name: macOS Apple silicon
             os: macos-15
-            bundles: dmg
             files: bundle/dmg/*.dmg
           - name: Linux x64
             os: ubuntu-24.04
@@ -71,7 +70,34 @@ jobs:
       # The desktop package's own build skips bundling, so build what it bundles, then bundle here.
       - run: bunx turbo run build --filter=daemon --filter=web
       - run: bunx tauri build --bundles ${{ matrix.bundles }}
+        if: runner.os == 'Linux'
         working-directory: apps/desktop
+      - name: Build the macOS app
+        if: runner.os == 'macOS'
+        run: bun run tauri build --no-bundle
+        working-directory: apps/desktop
+      - name: Bundle the macOS disk image
+        if: runner.os == 'macOS'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          bundle_log=$(mktemp)
+          trap 'rm -f "$bundle_log"' EXIT
+          for attempt in 1 2 3; do
+            if bun run tauri bundle --bundles dmg >"$bundle_log" 2>&1; then
+              cat "$bundle_log"
+              exit 0
+            else
+              status=$?
+            fi
+            cat "$bundle_log"
+            # Hosted macOS runners can temporarily hold a file open during hdiutil create.
+            if [[ "$attempt" -eq 3 ]] || ! grep -Fq 'hdiutil: create failed - Resource busy' "$bundle_log"; then
+              exit "$status"
+            fi
+            echo "::warning::hdiutil reported a busy resource on attempt $attempt. Retrying the DMG bundle."
+            sleep "$((attempt * 5))"
+          done
       - name: Attach to the release
         working-directory: apps/desktop/src-tauri/target/release
         env:
