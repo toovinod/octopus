@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/toovinod/octopus/compare/v0.1.2...v0.1.3) (2026-11-23)
+
+
+### Bug Fixes
+
+* **ci:** retry busy macOS disk image packaging ([1ad97a1](https://github.com/toovinod/octopus/commit/1ad97a1b8074236d1d14adffb2590326d4e64e3e))
+* **daemon:** run agents without a fixed concurrency cap ([91d0c71](https://github.com/toovinod/octopus/commit/91d0c71e2618f2f7774b7219c085c80e27549592))
+
 ## [0.1.2](https://github.com/toovinod/octopus/compare/v0.1.1...v0.1.2) (2026-11-16)
 
 
