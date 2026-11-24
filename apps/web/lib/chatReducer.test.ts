@@ -42,6 +42,45 @@ describe("applyEvents", () => {
 		expect(done.lastSequence).toBe(6);
 	});
 
+	test("streams thinking into its own item above the reply and stores the completed text", () => {
+		nextSequence = 0;
+		const state = applyEvents(emptyChat("s"), [
+			live({ type: "reasoning.delta", itemId: "m1:0", text: "Split " }),
+			live({ type: "reasoning.delta", itemId: "m1:0", text: "it up." }),
+			live({ type: "message.delta", itemId: "m1:1", text: "391" }),
+		]);
+		expect(state.items).toEqual([
+			{ kind: "reasoning", key: "reasoning:m1:0", text: "Split it up.", streaming: true },
+			{ kind: "assistant", key: "message:m1:1", text: "391", streaming: true },
+		]);
+		const done = applyEvents(state, [
+			stored({ type: "reasoning.completed", itemId: "m1:0", text: "Split it up." }),
+			stored({ type: "turn.completed", turnId: "t1", result: { status: "completed" } }),
+		]);
+		expect(done.items).toEqual([
+			{ kind: "reasoning", key: "reasoning:m1:0", text: "Split it up.", streaming: false },
+			{ kind: "assistant", key: "message:m1:1", text: "391", streaming: false },
+		]);
+	});
+
+	test("a turn that ends before thinking completes stops it streaming", () => {
+		nextSequence = 0;
+		const state = applyEvents(emptyChat("s"), [
+			live({ type: "reasoning.delta", itemId: "r1", text: "Hmm" }),
+			stored({ type: "turn.completed", turnId: "t1", result: { status: "interrupted" } }),
+		]);
+		expect(state.items[0]).toMatchObject({ kind: "reasoning", text: "Hmm", streaming: false });
+	});
+
+	test("history alone shows the stored thinking", () => {
+		nextSequence = 0;
+		const state = applyEvents(emptyChat("s"), [
+			stored({ type: "reasoning.completed", itemId: "r1", text: "Plan" }),
+			stored({ type: "message.completed", itemId: "m1", text: "Done" }),
+		]);
+		expect(state.items.map((item) => item.key)).toEqual(["reasoning:r1", "message:m1"]);
+	});
+
 	test("skips stored events it already holds after a resubscribe", () => {
 		nextSequence = 0;
 		const first = stored({ type: "message.completed", itemId: "m1", text: "Hi" });

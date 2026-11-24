@@ -83,6 +83,17 @@ export const AgentEvent = Schema.Union([
 		itemId: Schema.String,
 		text: Schema.String,
 	}),
+	// The model's thinking before or between replies. Deltas are live only, like message deltas.
+	Schema.Struct({
+		type: Schema.Literal("reasoning.delta"),
+		itemId: Schema.String,
+		text: Schema.String,
+	}),
+	Schema.Struct({
+		type: Schema.Literal("reasoning.completed"),
+		itemId: Schema.String,
+		text: Schema.String,
+	}),
 	Schema.Struct({
 		type: Schema.Literal("tool.started"),
 		itemId: Schema.String,
@@ -122,3 +133,6 @@ export const AgentEvent = Schema.Union([
 	}),
 ]).pipe(Schema.toTaggedUnion("type"));
 export type AgentEvent = typeof AgentEvent.Type;
+
+// Streaming deltas reach live subscribers but are never stored. The completed event is.
+export const isLiveOnly = (event: AgentEvent) => event.type === "message.delta" || event.type === "reasoning.delta";

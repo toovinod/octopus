@@ -12,6 +12,7 @@ export type ChatItem =
 			readonly attachments: ReadonlyArray<{ readonly id: string; readonly mediaType: string }>;
 	  }
 	| { readonly kind: "assistant"; readonly key: string; readonly text: string; readonly streaming: boolean }
+	| { readonly kind: "reasoning"; readonly key: string; readonly text: string; readonly streaming: boolean }
 	| {
 			readonly kind: "tool";
 			readonly key: string;
@@ -102,6 +103,16 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 			case "message.completed":
 				put({ kind: "assistant", key: `message:${event.itemId}`, text: event.text, streaming: false });
 				break;
+			case "reasoning.delta": {
+				const key = `reasoning:${event.itemId}`;
+				const current = find(key);
+				const text = current?.kind === "reasoning" ? current.text + event.text : event.text;
+				put({ kind: "reasoning", key, text, streaming: true });
+				break;
+			}
+			case "reasoning.completed":
+				put({ kind: "reasoning", key: `reasoning:${event.itemId}`, text: event.text, streaming: false });
+				break;
 			case "tool.started":
 				put({ kind: "tool", key: `tool:${event.itemId}`, tool: event.tool, status: "running", output: null });
 				break;
@@ -134,7 +145,9 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 			}
 			case "turn.completed":
 				for (const [index, item] of items.entries()) {
-					if (item.kind === "assistant" && item.streaming) items[index] = { ...item, streaming: false };
+					if ((item.kind === "assistant" || item.kind === "reasoning") && item.streaming) {
+						items[index] = { ...item, streaming: false };
+					}
 				}
 				if (event.result.status === "interrupted") {
 					put({ kind: "notice", key: `turn:${event.turnId}`, tone: "warning", text: "Interrupted" });

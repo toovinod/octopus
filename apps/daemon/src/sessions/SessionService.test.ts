@@ -178,6 +178,48 @@ describe("SessionService", () => {
 		expect(result.row?.nativeSessionId).toBe("thread-replay");
 	});
 
+	test("publishes reasoning deltas live and stores only the completed reasoning", async () => {
+		const recording: Recording = {
+			kind: "codex",
+			nativeSessionId: "thread-thinking",
+			turns: [
+				[
+					{ type: "reasoning.delta", itemId: "r1", text: "Plan" },
+					{ type: "reasoning.delta", itemId: "r1", text: " it" },
+					{ type: "reasoning.completed", itemId: "r1", text: "Plan it" },
+					{ type: "turn.completed", turnId: "t1", result: { status: "completed" } },
+				],
+			],
+		};
+		const result = await runWithRecording(recording, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const live = yield* eventsUntil(session.id, -1, "turn.completed").pipe(Effect.forkChild);
+				// Let the subscription register before the turn starts.
+				yield* Effect.sleep("100 millis");
+				yield* sessions.sendMessage(session.id, "think", [], false);
+				const received = yield* Fiber.join(live);
+				yield* waitForStatus(session.id, "idle");
+				return { received, stored: yield* storedEvents(session.id) };
+			}),
+		);
+		expect(result.received.map((stored) => [stored.event.type, stored.sequence])).toEqual([
+			["session.started", 0],
+			["user.message", 1],
+			["reasoning.delta", null],
+			["reasoning.delta", null],
+			["reasoning.completed", 2],
+			["turn.completed", 3],
+		]);
+		expect(result.stored.map((row) => row.type)).toEqual([
+			"session.started",
+			"user.message",
+			"reasoning.completed",
+			"turn.completed",
+		]);
+	});
+
 	test("a cursor subscription has no gap or duplicate while events arrive during paging", async () => {
 		const recording: Recording = {
 			kind: "codex",

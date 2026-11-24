@@ -123,6 +123,23 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test("streams the reasoning summary, one paragraph per part", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("think"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.filter((event) => event.type.startsWith("reasoning.") || event.type.startsWith("message."))).toEqual([
+			{ type: "reasoning.delta", itemId: "rs-1", text: "Read the " },
+			{ type: "reasoning.delta", itemId: "rs-1", text: "tests" },
+			{ type: "reasoning.delta", itemId: "rs-1", text: "\n\n" },
+			{ type: "reasoning.delta", itemId: "rs-1", text: "Then run them" },
+			{ type: "reasoning.completed", itemId: "rs-1", text: "Read the tests\n\nThen run them" },
+			{ type: "message.completed", itemId: "msg-1", text: "Done" },
+		]);
+	});
+
 	test("round-trips a command approval", async () => {
 		const [requested, rest] = await runSession((handle) =>
 			Effect.gen(function* () {
