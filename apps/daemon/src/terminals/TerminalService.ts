@@ -37,7 +37,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		// and everything it started.
 		const fibers = yield* FiberMap.make<string>();
 
-		const publish = (terminal: RunningTerminal, output: TerminalOutput) => {
+		const publish = (terminal: Pick<RunningTerminal, "output" | "appended">, output: TerminalOutput) => {
 			terminal.appended.count++;
 			PubSub.publishUnsafe(terminal.output, { index: terminal.appended.count, output });
 		};
@@ -53,10 +53,11 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 					command: [shell, "-l"],
 					cwd,
 					...size,
+					// The shell can print before spawnTerminal returns, so this must not need the finished terminal.
 					onData: (bytes) => {
 						const data = decoder.decode(bytes, { stream: true });
 						scrollback.append(data);
-						publish(terminal, { type: "data", data });
+						publish({ output, appended }, { type: "data", data });
 					},
 				});
 				const terminal: RunningTerminal = { info, pty, scrollback, output, appended };
