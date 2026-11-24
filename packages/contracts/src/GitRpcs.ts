@@ -99,6 +99,20 @@ export class GitRpcs extends RpcGroup.make(
 			DaemonInternalError,
 		]),
 	}),
+	// The pull request read again every few seconds while any check is pending. Ends once none is.
+	Rpc.make("watchPullRequestChecks", {
+		payload: { workspaceId: Schema.String },
+		success: PullRequestStatus,
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			GitTimeoutError,
+			BranchChangedError,
+			...GhError,
+			PullRequestReadError,
+			DaemonInternalError,
+		]),
+		stream: true,
+	}),
 	// Checks one by one, the conversation, reviews and the comments on lines of the diff.
 	Rpc.make("getPullRequestConversation", {
 		payload: { workspaceId: Schema.String },

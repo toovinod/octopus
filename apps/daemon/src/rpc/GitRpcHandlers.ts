@@ -1,3 +1,4 @@
+import { pollPullRequestChecks } from "../git/pollPullRequestChecks.ts";
 import { orInternalError } from "./orInternalError.ts";
 import { GitRpcs } from "@repo/contracts/GitRpcs";
 import { GitService } from "../git/GitService.ts";
@@ -18,6 +19,8 @@ export const GitRpcHandlers = GitRpcs.toLayer(
 				git.createPullRequest(workspaceId, { title, body, draft }).pipe(orInternalError("open the pull request")),
 			getPullRequest: ({ workspaceId }) =>
 				git.getPullRequest(workspaceId).pipe(orInternalError("read the pull request")),
+			watchPullRequestChecks: ({ workspaceId }) =>
+				pollPullRequestChecks(git.getPullRequest(workspaceId).pipe(orInternalError("read the pull request"))),
 			getPullRequestConversation: ({ workspaceId }) =>
 				git.getPullRequestConversation(workspaceId).pipe(orInternalError("read the pull request conversation")),
 			reviewPullRequest: ({ workspaceId, review }) =>

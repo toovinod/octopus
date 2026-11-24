@@ -28,7 +28,7 @@ import {
 } from "@repo/ui/components/dropdown-menu";
 import { Badge } from "@repo/ui/components/badge";
 import { Label } from "@repo/ui/components/label";
-import { callDaemon, errorMessage } from "../lib/daemonRuntime.ts";
+import { callDaemon, errorMessage, followDaemon } from "../lib/daemonRuntime.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { formatDateTime } from "../lib/format.ts";
@@ -39,7 +39,7 @@ import { Button } from "@repo/ui/components/button";
 import { Input } from "@repo/ui/components/input";
 import { feedbackMessage } from "../lib/feedbackMessage.ts";
 import { ExternalLink } from "./ExternalLink.tsx";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const MERGE_METHODS = ["squash", "merge", "rebase"] as const;
 
@@ -50,10 +50,18 @@ const MERGE_LABELS: Record<PullRequestMergeMethod, string> = {
 };
 
 export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace }) => {
-	const { loaded, reload } = useDaemonValue(
+	const { loaded, reload, replace } = useDaemonValue(
 		() => callDaemon((daemon) => daemon.getPullRequest({ workspaceId: workspace.id })),
 		workspace.id,
 	);
+	const checksPending =
+		loaded.state === "ready" && loaded.value.status === "found" && loaded.value.pullRequest.checks.pending > 0;
+	// The daemon polls GitHub while checks run and ends the watch once they are done. A failed poll only
+	// stops the updates; Reload still works.
+	useEffect(() => {
+		if (!checksPending) return;
+		return followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), { onItem: replace });
+	}, [checksPending, workspace.id, replace]);
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
@@ -177,6 +185,14 @@ const PullRequestDetails = ({
 		`${workspace.id}:${pullRequest.number}`,
 	);
 	const { checks } = pullRequest;
+	// The check list comes with the conversation, so it follows the summary when a poll changes it.
+	const checksKey = `${checks.passing}/${checks.failing}/${checks.pending}`;
+	const firstChecks = useRef(checksKey);
+	useEffect(() => {
+		if (firstChecks.current === checksKey) return;
+		firstChecks.current = checksKey;
+		reload();
+	}, [checksKey, reload]);
 	return (
 		<div className="flex flex-col">
 			<div className="flex flex-col gap-1.5 border-b p-3">
