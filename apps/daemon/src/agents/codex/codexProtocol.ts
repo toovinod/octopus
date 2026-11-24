@@ -166,6 +166,23 @@ export const FileChangeApprovalParams = Schema.Struct({
 	grantRoot: optionalText,
 });
 
+// The fields of skills/list that Octopus uses.
+export const SkillsResponse = Schema.Struct({
+	data: Schema.Array(
+		Schema.Struct({
+			skills: Schema.Array(
+				Schema.Struct({
+					name: Schema.String,
+					description: Schema.String,
+					shortDescription: Schema.optionalKey(Schema.String),
+					path: Schema.String,
+					enabled: Schema.Boolean,
+				}),
+			),
+		}),
+	),
+});
+
 export const decodeCodex =
 	<S extends Schema.Codec<unknown, unknown>>(schema: S) =>
 	(value: unknown) =>

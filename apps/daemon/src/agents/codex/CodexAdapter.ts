@@ -17,6 +17,7 @@ import {
 	TokenUsageUpdated,
 	TurnCompleted,
 	TurnResponse,
+	SkillsResponse,
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
@@ -42,6 +43,7 @@ import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.ts";
 import type { ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import type { GetAccountParams } from "./generated/v2/GetAccountParams.ts";
+import type { SkillsListParams } from "./generated/v2/SkillsListParams.ts";
 import type { ModelListParams } from "./generated/v2/ModelListParams.ts";
 import type { TurnStartParams } from "./generated/v2/TurnStartParams.ts";
 import type { TurnSteerParams } from "./generated/v2/TurnSteerParams.ts";
@@ -536,11 +538,36 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					yield* session.setNativeSessionId(thread.id);
 				}).pipe(Effect.catch(session.fail), Effect.forkScoped);
 
+				const listSkills = client.request("skills/list", { cwds: [input.cwd] } satisfies SkillsListParams).pipe(
+					Effect.flatMap(decodeCodex(SkillsResponse)),
+					Effect.map(({ data }) => data.flatMap(({ skills }) => skills).filter(({ enabled }) => enabled)),
+				);
+
+				// A skill runs when the message names it as "$name" and also carries it as an input item,
+				// the way Codex's own composer sends it.
+				const skillsNamedIn = (text: string) => {
+					const named = new Set(text.match(/\$[^\s$]+/g));
+					return named.size === 0
+						? Effect.succeed([])
+						: listSkills.pipe(
+								Effect.map((skills) =>
+									skills
+										.filter(({ name }) => named.has(`$${name}`))
+										.map(({ name, path }) => ({ type: "skill" as const, name, path })),
+								),
+							);
+				};
+
 				// Codex reads images from disk, so it gets the stored path rather than the bytes.
-				const toInput = ({ text, images }: UserMessage): Array<UserInput> => [
-					{ type: "text", text, text_elements: [] },
-					...images.map(({ path }) => ({ type: "localImage" as const, path })),
-				];
+				const toInput = ({ text, images }: UserMessage) =>
+					Effect.map(
+						skillsNamedIn(text),
+						(skills): Array<UserInput> => [
+							{ type: "text", text, text_elements: [] },
+							...images.map(({ path }) => ({ type: "localImage" as const, path })),
+							...skills,
+						],
+					);
 
 				const interrupt = (turnId: string) =>
 					Effect.gen(function* () {
@@ -560,7 +587,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 									model,
 									effort,
 									...turnPolicies[mode],
-									input: toInput(message),
+									input: yield* toInput(message),
 								} satisfies TurnStartParams)
 								.pipe(
 									Effect.flatMap(decodeCodex(TurnResponse)),
@@ -585,11 +612,18 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							}
 							yield* client.request("turn/steer", {
 								threadId,
-								input: toInput(message),
+								input: yield* toInput(message),
 								expectedTurnId: state.turnId,
 							} satisfies TurnSteerParams);
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
+					listCommands: Effect.map(listSkills, (skills) =>
+						skills.map(({ name, description, shortDescription }) => ({
+							name: `$${name}`,
+							description: shortDescription ?? description,
+							argumentHint: null,
+						})),
+					),
 					// Before Codex names the turn, the interrupt waits for the name.
 					interruptTurn: Effect.gen(function* () {
 						const state = yield* Ref.getAndUpdate(currentTurn, (state) =>

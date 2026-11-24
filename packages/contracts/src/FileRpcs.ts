@@ -17,4 +17,10 @@ export class FileRpcs extends RpcGroup.make(
 		success: FileContent,
 		error: Schema.Union([WorkspaceNotFoundError, FileNotFoundError, FileReadError, DaemonInternalError]),
 	}),
+	// The workspace files that best match a query, at most 50, for "@" mentions.
+	Rpc.make("searchFiles", {
+		payload: { workspaceId: Schema.String, query: Schema.String },
+		success: Schema.Array(Schema.String),
+		error: Schema.Union([WorkspaceNotFoundError, GitTimeoutError, DaemonInternalError]),
+	}),
 ) {}

@@ -19,7 +19,12 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
-import { type AgentCapabilities, ApprovalNotFoundError, SessionBusyError } from "@repo/contracts/AgentSession";
+import {
+	type AgentCapabilities,
+	type AgentCommand,
+	ApprovalNotFoundError,
+	SessionBusyError,
+} from "@repo/contracts/AgentSession";
 import type { AgentEvent, ApprovalDecision, ApprovalOutcome } from "@repo/contracts/AgentEvent";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
@@ -48,6 +53,7 @@ export interface TurnDriver {
 	steerTurn(message: UserMessage): Effect.Effect<void, AgentError>;
 	readonly interruptTurn: Effect.Effect<void, AgentError>;
 	updateSettings(settings: SessionSettings): Effect.Effect<void, AgentError>;
+	readonly listCommands: Effect.Effect<ReadonlyArray<AgentCommand>, AgentError>;
 }
 
 export interface AgentSession {
@@ -210,6 +216,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 					}
 				}),
 				updateSettings: driver.updateSettings,
+				listCommands: driver.listCommands,
 			} satisfies AgentSessionHandle;
 		});
 

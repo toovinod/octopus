@@ -149,6 +149,17 @@ describe("SessionService", () => {
 		]);
 	});
 
+	test("starts the agent to list its commands before the first message", async () => {
+		const commands = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				return yield* sessions.listCommands(session.id);
+			}),
+		);
+		expect(commands).toEqual([{ name: "/review", description: "Review the changes", argumentHint: null }]);
+	});
+
 	test("stores events with gapless sequences and keeps deltas live only", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -821,6 +832,7 @@ describe("SessionService", () => {
 						steerTurn: () => Effect.void,
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
 					});
 				}),
 		};
@@ -861,6 +873,7 @@ describe("SessionService", () => {
 						steerTurn: () => Effect.fail(new AgentProtocolError({ message: "No active turn", cause: null })),
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
 					});
 				}),
 		};

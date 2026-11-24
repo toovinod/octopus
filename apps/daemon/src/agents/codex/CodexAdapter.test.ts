@@ -378,6 +378,25 @@ describe("CodexAdapter", () => {
 		expect(reply).toMatchObject({ text: JSON.stringify([{ type: "localImage", path: "/data/image-1" }]) });
 	});
 
+	test("lists enabled skills as $ commands", async () => {
+		expect(await runSession((handle) => handle.listCommands)).toEqual([
+			{ name: "$tester", description: "Runs the tests", argumentHint: null },
+		]);
+	});
+
+	test("sends a skill the message names as a skill input, and ignores unknown or disabled ones", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("images: $tester then $off and $nope"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		const reply = events.find((event) => event.type === "message.completed");
+		expect(reply).toMatchObject({
+			text: JSON.stringify([{ type: "skill", name: "tester", path: "/skills/tester/SKILL.md" }]),
+		});
+	});
+
 	test("reports context usage and plan limits with readable windows", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {

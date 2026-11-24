@@ -542,6 +542,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			(effect, sessionId) => withProcessLock(sessionId, effect),
 		);
 
+		const listCommands = Effect.fn("SessionService.listCommands")(
+			function* (sessionId: string) {
+				const runtime = yield* ensureRuntime(sessionId);
+				return yield* runtime.handle.listCommands.pipe(Effect.mapError(toUnavailable(runtime.agent)));
+			},
+			(effect, sessionId) => withProcessLock(sessionId, effect),
+		);
+
 		const respondToApproval = Effect.fn("SessionService.respondToApproval")(function* (
 			sessionId: string,
 			requestId: string,
@@ -949,6 +957,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			updateSettings,
 			sendMessage: (...args: Parameters<typeof sendMessage>) =>
 				Effect.flatMap(getRow(args[0]), (row) => workspaceLock.starting(row.workspaceId, sendMessage(...args))),
+			// It can start the agent, so like sendMessage it may not race an archive.
+			listCommands: (sessionId: string) =>
+				Effect.flatMap(getRow(sessionId), (row) => workspaceLock.starting(row.workspaceId, listCommands(sessionId))),
 			respondToApproval,
 			interrupt,
 			stop,

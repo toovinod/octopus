@@ -31,6 +31,15 @@ export class AgentSession extends Schema.Class<AgentSession>("AgentSession")({
 	updatedAt: Schema.String,
 }) {}
 
+// A command the user can start a message with. The name includes its prefix, "/review" for
+// Claude Code or "$skill" for a Codex skill, and is sent as typed.
+export const AgentCommand = Schema.Struct({
+	name: Schema.String,
+	description: Schema.String,
+	argumentHint: Schema.NullOr(Schema.String),
+});
+export type AgentCommand = typeof AgentCommand.Type;
+
 export const AgentModel = Schema.Struct({
 	id: Schema.String,
 	label: Schema.String,

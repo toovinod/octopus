@@ -475,6 +475,13 @@ export const renameSession = async (sessionId: string, title: string) => {
 	setState((current) => ({ sessions: { ...current.sessions, [sessionId]: saved ?? before } }));
 };
 
+// For the composer's suggestions. Null when the call failed, after a toast says why.
+export const listSessionCommands = (sessionId: string) =>
+	attempt(() => callDaemon((daemon) => daemon.listSessionCommands({ sessionId })));
+
+export const searchFiles = (workspaceId: string, query: string) =>
+	attempt(() => callDaemon((daemon) => daemon.searchFiles({ workspaceId, query })));
+
 export const updateSessionSettings = async (
 	sessionId: string,
 	changes: Partial<Pick<AgentSession, "model" | "effort" | "mode">>,

@@ -1,6 +1,7 @@
 import {
 	type AgentAuthMode,
 	type AgentCapabilities,
+	type AgentCommand,
 	type AgentInfo,
 	type ImageMediaType,
 	AgentKind,
@@ -134,6 +135,7 @@ export interface AgentSessionHandle {
 	readonly interrupt: Effect.Effect<void, AgentError>;
 	// Applies from the next turn.
 	updateSettings(settings: SessionSettings): Effect.Effect<void, AgentError>;
+	readonly listCommands: Effect.Effect<ReadonlyArray<AgentCommand>, AgentError>;
 }
 
 export interface AgentAdapter {

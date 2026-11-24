@@ -251,6 +251,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
 				setPermissionMode: async (permissionMode) => void settingsChanges.push({ permissionMode }),
+				supportedCommands: async () => [
+					{ name: "review", description: "Review the branch", argumentHint: "" },
+					{ name: "fix-issue", description: "Fix a GitHub issue", argumentHint: "<number>" },
+				],
 				close: () => {},
 			};
 		},
@@ -666,6 +670,13 @@ describe("sessionAllowRules", () => {
 			handle.sendMessage(userMessage("leave plan mode")).pipe(Effect.andThen(takeUntil(handle, "turn.completed"))),
 		);
 		expect(events).toContainEqual({ type: "mode.changed", mode: "ask" });
+	});
+
+	test("lists Claude's slash commands with their prefix, and no empty argument hint", async () => {
+		expect(await runSession((handle) => handle.listCommands)).toEqual([
+			{ name: "/review", description: "Review the branch", argumentHint: null },
+			{ name: "/fix-issue", description: "Fix a GitHub issue", argumentHint: "<number>" },
+		]);
 	});
 
 	test("sends images as image blocks before the text", async () => {

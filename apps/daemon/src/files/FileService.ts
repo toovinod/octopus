@@ -3,12 +3,16 @@ import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { Context, Effect, type FileSystem, Layer } from "effect";
 import { readWorkspaceFile } from "./readWorkspaceFile.ts";
 import type { ChildProcessSpawner } from "effect/process";
+import { rankFilePaths } from "./rankFilePaths.ts";
 import { leavesRoot } from "./leavesRoot.ts";
 import { runGit } from "../git/runGit.ts";
 import { normalize } from "node:path";
 
 // Bigger files are not sent to the viewer, which renders them in full.
 export const READ_FILE_BYTE_LIMIT = 1024 * 1024;
+
+// Enough to pick from. The popover shows the best ones, never the whole repo.
+export const SEARCH_FILES_LIMIT = 50;
 
 // Children of `directory` from git's list of files, which already leaves out ignored ones.
 const childrenOf = (directory: string, files: ReadonlyArray<string>): ReadonlyArray<FileEntry> => {
@@ -52,7 +56,18 @@ export class FileService extends Context.Service<FileService>()("octopus/daemon/
 			return { ...read, path } satisfies FileContent;
 		}, Effect.provide(services));
 
-		return { listDirectory, readFile };
+		// For "@" mentions. Ranked here, so a large repo's file list never goes to the client.
+		const searchFiles = Effect.fn("FileService.searchFiles")(function* (workspaceId: string, query: string) {
+			const { path: root } = yield* workspaces.get(workspaceId);
+			const output = yield* runGit(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
+			return rankFilePaths(
+				output.split("\0").filter((file) => file !== ""),
+				query,
+				SEARCH_FILES_LIMIT,
+			);
+		}, Effect.provide(services));
+
+		return { listDirectory, readFile, searchFiles };
 	}),
 }) {
 	static readonly layer = Layer.effect(FileService, FileService.make);

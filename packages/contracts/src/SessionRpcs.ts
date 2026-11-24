@@ -1,4 +1,5 @@
 import {
+	AgentCommand,
 	AgentAuthMode,
 	AgentInfo,
 	AgentMode,
@@ -109,6 +110,12 @@ export class SessionRpcs extends RpcGroup.make(
 			WorkspaceArchivedError,
 			DaemonInternalError,
 		]),
+	}),
+	// Starts the agent if it is not running, since only a running agent knows its commands.
+	Rpc.make("listSessionCommands", {
+		payload: { sessionId: Schema.String },
+		success: Schema.Array(AgentCommand),
+		error: Schema.Union([SessionNotFoundError, AgentUnavailableError, WorkspaceArchivedError, DaemonInternalError]),
 	}),
 	Rpc.make("getAttachment", {
 		payload: { sessionId: Schema.String, attachmentId: Schema.String },

@@ -28,6 +28,7 @@ const runQuietAgent = <A>(
 			steerTurn: () => Effect.void,
 			interruptTurn: onInterrupt(session),
 			updateSettings: () => Effect.void,
+			listCommands: Effect.succeed([]),
 		});
 		return yield* program(handle, session);
 	}).pipe(Effect.scoped, Effect.provideService(TurnWatchdogSettings, watchdog), Effect.runPromise);

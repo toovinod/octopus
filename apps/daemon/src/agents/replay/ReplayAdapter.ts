@@ -63,6 +63,8 @@ export const makeReplayAdapter = (recording: Recording): AgentAdapter => ({
 
 		yield* session.setNativeSessionId(recording.nativeSessionId);
 		return yield* session.start({
+			// One command, so the composer's command list can be tried without a real agent.
+			listCommands: Effect.succeed([{ name: "/review", description: "Review the changes", argumentHint: null }]),
 			startTurn: () =>
 				Effect.gen(function* () {
 					const index = yield* Ref.getAndUpdate(nextTurn, (n) => n + 1);

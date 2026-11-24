@@ -17,6 +17,8 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 				sessions.rename(sessionId, title).pipe(orInternalError("rename the chat")),
 			sendMessage: ({ sessionId, text, images, steer }) =>
 				sessions.sendMessage(sessionId, text, images, steer).pipe(orInternalError("send the message")),
+			listSessionCommands: ({ sessionId }) =>
+				sessions.listCommands(sessionId).pipe(orInternalError("list the commands")),
 			respondToApproval: ({ sessionId, requestId, decision }) =>
 				sessions.respondToApproval(sessionId, requestId, decision).pipe(orInternalError("answer the approval")),
 			interruptSession: ({ sessionId }) => sessions.interrupt(sessionId).pipe(orInternalError("stop the turn")),

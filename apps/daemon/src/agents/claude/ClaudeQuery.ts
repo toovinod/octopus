@@ -4,6 +4,7 @@ import {
 	type PermissionMode,
 	query,
 	type SDKUserMessage,
+	type SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import { Context, Layer } from "effect";
 
@@ -15,6 +16,7 @@ export interface ClaudeQueryRun {
 	setModel(model: string): Promise<void>;
 	setEffort(effort: EffortLevel | null): Promise<void>;
 	setPermissionMode(mode: PermissionMode): Promise<void>;
+	supportedCommands(): Promise<ReadonlyArray<SlashCommand>>;
 	close(): void;
 }
 
@@ -35,6 +37,7 @@ export class ClaudeQuery extends Context.Service<
 					setModel: (model) => run.setModel(model),
 					setEffort: (effortLevel) => run.applyFlagSettings({ effortLevel }),
 					setPermissionMode: (mode) => run.setPermissionMode(mode),
+					supportedCommands: () => run.supportedCommands(),
 					close: () => run.close(),
 				};
 			},

@@ -251,6 +251,23 @@ const serve = async () => {
 					50,
 				);
 				break;
+			case "skills/list":
+				send({
+					id: message.id,
+					result: {
+						data: [
+							{
+								cwd: message.params.cwds[0],
+								skills: [
+									{ name: "tester", description: "Runs the tests", path: "/skills/tester/SKILL.md", enabled: true },
+									{ name: "off", description: "Turned off", path: "/skills/off/SKILL.md", enabled: false },
+								],
+								errors: [],
+							},
+						],
+					},
+				});
+				break;
 			case "model/list":
 				send({
 					id: message.id,

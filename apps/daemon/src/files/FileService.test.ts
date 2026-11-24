@@ -57,6 +57,20 @@ describe("FileService", () => {
 		]);
 	});
 
+	test("searches every file but ignored ones, best match first", async () => {
+		const found = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const files = yield* FileService;
+				const created = yield* createWorkspace(tempDir);
+				return {
+					inner: yield* files.searchFiles(created.id, "inner"),
+					ignored: yield* files.searchFiles(created.id, "out.js"),
+				};
+			}),
+		);
+		expect(found).toEqual({ inner: ["src/deep/inner.ts"], ignored: [] });
+	});
+
 	test("reads text, flags binary and large files, and never leaves the workspace", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

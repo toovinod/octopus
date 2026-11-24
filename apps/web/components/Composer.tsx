@@ -35,6 +35,8 @@ import {
 	DialogTitle,
 } from "@repo/ui/components/dialog";
 import { modeLabels, nextMode, orderedModes } from "../lib/agentModes.ts";
+import { type Suggestion, SuggestionList, useSuggestions } from "./ComposerSuggestions.tsx";
+import { insertSuggestion, tokenAt } from "../lib/composerSuggestions.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
 import { cn } from "@repo/ui/lib/utils";
@@ -68,6 +70,19 @@ export const Composer = memo(
 		const busy = session.status === "running" || session.status === "awaitingApproval";
 		const steer = busy && agent?.capabilities.steerWhileRunning === true;
 		const failedSends = useAppState((current) => failedSendsOf(current, session.id));
+		const [caret, setCaret] = useState(0);
+		// Escape hides the suggestions for the word it was pressed in.
+		const [dismissedAt, setDismissedAt] = useState<number | null>(null);
+		const [highlight, setHighlight] = useState(0);
+		const typed = tokenAt(draft.text, caret);
+		const token = typed !== null && typed.start !== dismissedAt ? typed : null;
+		const suggestions = useSuggestions(session, token);
+		const shown = Math.min(highlight, suggestions.length - 1);
+
+		// biome-ignore lint/correctness/useExhaustiveDependencies: a new word or query starts at the top.
+		useEffect(() => {
+			setHighlight(0);
+		}, [token?.start, token?.query]);
 
 		useEffect(() => {
 			drafts.set(session.id, draft);
@@ -95,6 +110,14 @@ export const Composer = memo(
 				return { ...current, images: current.images.filter((item) => item.id !== id) };
 			});
 
+		const pick = (suggestion: Suggestion) => {
+			if (token === null) return;
+			const next = insertSuggestion(draft.text, token, suggestion.insert);
+			setDraft((current) => ({ ...current, text: next.text }));
+			setCaret(next.caret);
+			requestAnimationFrame(() => textRef.current?.setSelectionRange(next.caret, next.caret));
+		};
+
 		const send = () => {
 			const text = draft.text.trim();
 			if (text === "" && draft.images.length === 0) return;
@@ -112,7 +135,7 @@ export const Composer = memo(
 				{/* biome-ignore lint/a11y/noStaticElementInteractions: dropping images is an extra way in, the + button is the accessible one. */}
 				<div
 					className={cn(
-						"flex flex-col rounded-xl border border-border bg-card transition-colors focus-within:border-input",
+						"relative flex flex-col rounded-xl border border-border bg-card transition-colors focus-within:border-input",
 						dragging && "border-running",
 					)}
 					onDragOver={(event) => {
@@ -127,6 +150,9 @@ export const Composer = memo(
 						void addFiles([...event.dataTransfer.files]);
 					}}
 				>
+					{suggestions.length === 0 ? null : (
+						<SuggestionList suggestions={suggestions} highlight={shown} onPick={pick} onHighlight={setHighlight} />
+					)}
 					{draft.images.length === 0 ? null : (
 						<div className="flex flex-wrap gap-2 px-3 pt-3">
 							{draft.images.map((image) => (
@@ -155,7 +181,12 @@ export const Composer = memo(
 							// Never in a transition: a controlled field that updates late drops keys and moves the caret.
 							const text = event.target.value;
 							setDraft((current) => ({ ...current, text }));
+							const nextCaret = event.target.selectionStart;
+							setCaret(nextCaret);
+							// The dismissal lasts only while that word does, so a new one gets suggestions again.
+							setDismissedAt((current) => (tokenAt(text, nextCaret)?.start === current ? current : null));
 						}}
+						onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
 						onPaste={(event) => {
 							const files = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
 							if (files.length > 0) {
@@ -164,6 +195,25 @@ export const Composer = memo(
 							}
 						}}
 						onKeyDown={(event) => {
+							const picked = suggestions[shown];
+							if (picked !== undefined && token !== null && !event.nativeEvent.isComposing) {
+								const move = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+								if (move !== 0) {
+									event.preventDefault();
+									setHighlight((shown + move + suggestions.length) % suggestions.length);
+									return;
+								}
+								if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey) {
+									event.preventDefault();
+									pick(picked);
+									return;
+								}
+								if (event.key === "Escape") {
+									event.preventDefault();
+									setDismissedAt(token.start);
+									return;
+								}
+							}
 							if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
 								event.preventDefault();
 								send();

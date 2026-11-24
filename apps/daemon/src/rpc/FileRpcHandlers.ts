@@ -10,6 +10,8 @@ export const FileRpcHandlers = FileRpcs.toLayer(
 			listDirectory: ({ workspaceId, path }) =>
 				files.listDirectory(workspaceId, path).pipe(orInternalError("list the files")),
 			readFile: ({ workspaceId, path }) => files.readFile(workspaceId, path).pipe(orInternalError("read the file")),
+			searchFiles: ({ workspaceId, query }) =>
+				files.searchFiles(workspaceId, query).pipe(orInternalError("search the files")),
 		});
 	}),
 );

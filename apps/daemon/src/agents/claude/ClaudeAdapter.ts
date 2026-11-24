@@ -687,6 +687,18 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 							},
 							catch: (cause) => new AgentProcessError({ message: "Could not change the chat's settings.", cause }),
 						}),
+					listCommands: Effect.tryPromise({
+						try: () => run.supportedCommands(),
+						catch: (cause) => new AgentProcessError({ message: "Could not list Claude Code's commands.", cause }),
+					}).pipe(
+						Effect.map((commands) =>
+							commands.map(({ name, description, argumentHint }) => ({
+								name: `/${name}`,
+								description,
+								argumentHint: argumentHint === "" ? null : argumentHint,
+							})),
+						),
+					),
 					interruptTurn: Effect.gen(function* () {
 						yield* Ref.set(interrupting, true);
 						yield* Effect.tryPromise({
