@@ -8,12 +8,12 @@ import type {
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { ConfigProvider, Effect, Layer, Redacted, Stream } from "effect";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
-import { Effect, Layer, Stream } from "effect";
 
 const newSession: StartSessionInput = {
 	cwd: "/repo",
@@ -217,13 +217,14 @@ const runSession = <A, E>(
 	options: {
 		input?: StartSessionInput;
 		permissions?: Array<PermissionResult>;
+		configProvider?: ConfigProvider.ConfigProvider;
 	} = {},
 ) =>
 	runWithClaude(
 		Effect.gen(function* () {
 			const claude = yield* ClaudeAdapter;
 			return yield* program(yield* claude.startSession(options.input ?? newSession));
-		}).pipe(Effect.scoped),
+		}).pipe(Effect.scoped, Effect.provide(ConfigProvider.layer(options.configProvider ?? ConfigProvider.fromEnv()))),
 		options.permissions,
 	);
 
@@ -389,6 +390,25 @@ describe("ClaudeAdapter", () => {
 		]);
 		expect(error._tag).toBe("ApprovalNotFoundError");
 		expect(permissions).toMatchObject([{ behavior: "deny" }]);
+	});
+
+	test("API key mode passes proxy, certificate and config folder variables to claude", async () => {
+		const env = {
+			PATH: "/bin",
+			HTTPS_PROXY: "http://proxy:8080",
+			HTTP_PROXY: "http://proxy:8080",
+			NO_PROXY: "localhost",
+			NODE_EXTRA_CA_CERTS: "/certs/corp.pem",
+			CLAUDE_CONFIG_DIR: "/home/dev/.claude-work",
+			XDG_CONFIG_HOME: "/home/dev/.config",
+			UNRELATED_SECRET: "keep out",
+		};
+		await runSession(() => Effect.void, {
+			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
+			configProvider: ConfigProvider.fromEnv({ env }),
+		});
+		const { UNRELATED_SECRET: _, ...passed } = env;
+		expect(startedWith.at(-1)?.env).toEqual({ ...passed, ANTHROPIC_API_KEY: "sk-test" });
 	});
 
 	test("resumes an existing session", async () => {

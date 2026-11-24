@@ -75,7 +75,30 @@ const models: AgentModels = {
 
 // The SDK replaces the whole child environment when `env` is set, so API key mode passes
 // these through explicitly. Subscription mode leaves `env` unset and inherits everything.
-const inheritedVariables = ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "TERM"];
+// Proxies and extra CA certificates keep claude working on corporate networks, and the config
+// folders keep it reading the user's own settings.
+const inheritedVariables = [
+	"PATH",
+	"HOME",
+	"USER",
+	"SHELL",
+	"TMPDIR",
+	"LANG",
+	"TERM",
+	"HTTPS_PROXY",
+	"HTTP_PROXY",
+	"NO_PROXY",
+	"https_proxy",
+	"http_proxy",
+	"no_proxy",
+	"NODE_EXTRA_CA_CERTS",
+	"CLAUDE_CONFIG_DIR",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_RUNTIME_DIR",
+];
 
 const apiKeyEnvironment = Effect.fnUntraced(function* (apiKey: Redacted.Redacted<string>) {
 	const env: Record<string, string> = {};
