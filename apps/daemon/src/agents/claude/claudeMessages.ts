@@ -72,6 +72,12 @@ export const ClaudeMessage = Schema.Union([
 		subtype: Schema.Literal("init"),
 		session_id: Schema.String,
 	}),
+	// Claude reports its permission mode when it changes it, for example after the user approves a plan.
+	Schema.Struct({
+		type: Schema.Literal("system"),
+		subtype: Schema.Literal("status"),
+		permissionMode: Schema.optionalKey(Schema.String),
+	}),
 	Schema.Struct({
 		type: Schema.Literal("stream_event"),
 		parent_tool_use_id: parentToolUseId,

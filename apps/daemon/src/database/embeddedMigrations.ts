@@ -1,5 +1,6 @@
 import sessionEffort from "./migrations/20261107172147_sessionEffort/migration.sql" with { type: "text" };
 import projectTrust from "./migrations/20261107165335_projectTrust/migration.sql" with { type: "text" };
+import sessionMode from "./migrations/20261124194508_sessionMode/migration.sql" with { type: "text" };
 import init from "./migrations/20261107072057_init/migration.sql" with { type: "text" };
 import { formatToMillis } from "drizzle-orm/migrator.utils";
 import type { MigrationMeta } from "drizzle-orm/migrator";
@@ -10,6 +11,7 @@ const migrationFiles = [
 	{ name: "20261107072057_init", sql: init },
 	{ name: "20261107165335_projectTrust", sql: projectTrust },
 	{ name: "20261107172147_sessionEffort", sql: sessionEffort },
+	{ name: "20261124194508_sessionMode", sql: sessionMode },
 ] as const;
 
 // Mirrors drizzle's readMigrationFiles so hashes match migrations applied from the folder.

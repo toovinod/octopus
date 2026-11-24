@@ -4,6 +4,7 @@ import {
 	type AgentInfo,
 	type ImageMediaType,
 	AgentKind,
+	AgentMode,
 	type ApprovalNotFoundError,
 	type SessionBusyError,
 } from "@repo/contracts/AgentSession";
@@ -15,6 +16,7 @@ export const StartSessionInput = Schema.Struct({
 	model: Schema.String,
 	// Effort names differ per agent. Adapters ignore one their agent does not know.
 	effort: Schema.NullOr(Schema.String),
+	mode: AgentMode,
 	resumeId: Schema.optionalKey(Schema.String),
 	// A repo's own agent settings can add hooks that run commands and allow rules that
 	// skip approvals, so they load only when the user has trusted the project.
@@ -101,6 +103,7 @@ export type AgentModels = Pick<AgentInfo, "models" | "defaultModel">;
 export interface SessionSettings {
 	readonly model: string;
 	readonly effort: string | null;
+	readonly mode: AgentMode;
 }
 
 export interface UserImage {

@@ -26,9 +26,9 @@ import {
 	testAgentServices,
 } from "../testing/testAgentServices.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
+import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/AgentSession";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
-import type { AgentSessionStatus, AgentKind } from "@repo/contracts/AgentSession";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
@@ -977,13 +977,79 @@ describe("SessionService", () => {
 						effort: "low",
 					});
 					yield* sessions.sendMessage(session.id, "run the tests", [], false);
-					return yield* sessions.updateSettings(session.id, { model: "other", effort: "high" });
+					return yield* sessions.updateSettings(session.id, { model: "other", effort: "high", mode: "ask" });
 				}),
 			),
 		);
 		expect(inputs[0]).toMatchObject({ model: "replay", effort: "low" });
-		expect(changes).toEqual([{ model: "other", effort: "high" }]);
+		expect(changes).toEqual([{ model: "other", effort: "high", mode: "ask" }]);
 		expect(updated).toMatchObject({ model: "other", effort: "high" });
+	});
+
+	test("a session starts in its agent's default mode, and one stored without a mode reads as it", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* Effect.flatMap(LocalDatabase, (database) =>
+					database.query((db) => db.update(agentSession).set({ mode: null }).where(eq(agentSession.id, session.id))),
+				);
+				const [listed] = yield* sessions.list(session.workspaceId);
+				return { session, listed };
+			}),
+		);
+		expect(result.session.mode).toBe("ask");
+		expect(result.listed?.mode).toBe("ask");
+	});
+
+	test("refuses a mode the agent does not offer, and full access until the project is trusted", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const settings = (mode: AgentMode) =>
+					sessions.updateSettings(session.id, { model: "replay", effort: null, mode });
+				const notOffered = yield* Effect.flip(settings("auto"));
+				const untrusted = yield* Effect.flip(settings("fullAccess"));
+				const workspace = yield* Effect.flatMap(WorkspaceService, (workspaces) => workspaces.get(session.workspaceId));
+				yield* Effect.flatMap(ProjectService, (projects) => projects.setTrust(workspace.projectId, true));
+				const trusted = yield* settings("fullAccess");
+				return { notOffered, untrusted, trusted };
+			}),
+		);
+		expect(result.notOffered).toMatchObject({ _tag: "ModeNotAllowedError", mode: "auto" });
+		expect(result.untrusted).toMatchObject({ _tag: "ModeNotAllowedError", mode: "fullAccess" });
+		expect(result.trusted.mode).toBe("fullAccess");
+	});
+
+	test("keeps the mode the agent switches to by itself", async () => {
+		const codex = makeReplayAdapter({
+			kind: "codex",
+			nativeSessionId: "replay-mode",
+			turns: [
+				[
+					{ type: "mode.changed", mode: "ask" },
+					{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } },
+				],
+			],
+		});
+		const mode = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.updateSettings(session.id, { model: "replay", effort: null, mode: "plan" });
+					yield* sessions.sendMessage(session.id, "make a plan", [], false);
+					yield* waitForStatus(session.id, "idle");
+					const [listed] = yield* sessions.list(session.workspaceId);
+					return listed?.mode;
+				}),
+			),
+		);
+		expect(mode).toBe("ask");
 	});
 
 	test("keeps the stored settings when the running agent refuses the change", async () => {
@@ -1005,7 +1071,9 @@ describe("SessionService", () => {
 					const sessions = yield* SessionService;
 					const session = yield* addSession(tempDir);
 					yield* sessions.sendMessage(session.id, "run the tests", [], false);
-					const error = yield* Effect.flip(sessions.updateSettings(session.id, { model: "other", effort: "high" }));
+					const error = yield* Effect.flip(
+						sessions.updateSettings(session.id, { model: "other", effort: "high", mode: "ask" }),
+					);
 					const [row] = yield* sessions.list(session.workspaceId);
 					return { error, row };
 				}),

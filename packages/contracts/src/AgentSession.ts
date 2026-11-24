@@ -6,6 +6,11 @@ export type AgentKind = typeof AgentKind.Type;
 export const AgentAuthMode = Schema.Literals(["subscription", "apiKey"]);
 export type AgentAuthMode = typeof AgentAuthMode.Type;
 
+// How much the agent may do without asking, from least to most. Each agent offers its own subset
+// (AgentCapabilities.modes) and maps it onto its own permission settings.
+export const AgentMode = Schema.Literals(["readOnly", "plan", "ask", "acceptEdits", "auto", "fullAccess"]);
+export type AgentMode = typeof AgentMode.Type;
+
 // Agent sessions are not jobs, so they keep their own union.
 export const AgentSessionStatus = Schema.Literals(["idle", "running", "awaitingApproval", "interrupted", "failed"]);
 export type AgentSessionStatus = typeof AgentSessionStatus.Type;
@@ -17,6 +22,7 @@ export class AgentSession extends Schema.Class<AgentSession>("AgentSession")({
 	model: Schema.String,
 	nativeSessionId: Schema.NullOr(Schema.String),
 	authMode: AgentAuthMode,
+	mode: AgentMode,
 	// Effort names differ per agent and model, so they come from AgentModel.efforts.
 	effort: Schema.NullOr(Schema.String),
 	status: AgentSessionStatus,
@@ -42,6 +48,8 @@ export const AgentCapabilities = Schema.Struct({
 	fileChangeApprovals: Schema.Boolean,
 	mcpApprovals: Schema.Boolean,
 	steerWhileRunning: Schema.Boolean,
+	// The modes the user may pick, the default first.
+	modes: Schema.Array(AgentMode),
 });
 export type AgentCapabilities = typeof AgentCapabilities.Type;
 
@@ -163,6 +171,18 @@ export class AuthModeNotAllowedError extends Schema.TaggedError<AuthModeNotAllow
 	override get message() {
 		const name = this.agent === "claude" ? "Claude Code" : "Codex";
 		return `${name} cannot use ${this.mode} sign-in here.`;
+	}
+}
+
+// Full access runs commands and edits without asking, so a project's own files must not be able to start it.
+export class ModeNotAllowedError extends Schema.TaggedError<ModeNotAllowedError>()("ModeNotAllowedError", {
+	agent: AgentKind,
+	mode: AgentMode,
+}) {
+	override get message() {
+		return this.mode === "fullAccess"
+			? "Full access runs commands without asking. Trust the project first, then choose it again."
+			: "This agent does not offer that mode.";
 	}
 }
 

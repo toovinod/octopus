@@ -17,6 +17,7 @@ const capabilities: AgentCapabilities = {
 	fileChangeApprovals: true,
 	mcpApprovals: true,
 	steerWhileRunning: false,
+	modes: ["ask", "plan", "fullAccess"],
 };
 
 // Approval requests pause playback until they are answered. The session core emits

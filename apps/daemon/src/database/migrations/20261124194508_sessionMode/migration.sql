@@ -1,0 +1,1 @@
+ALTER TABLE `agentSession` ADD `mode` text;

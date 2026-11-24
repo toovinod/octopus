@@ -13,6 +13,7 @@ const newSession: StartSessionInput = {
 	cwd: import.meta.dir,
 	model: "gpt-5",
 	effort: null,
+	mode: "auto",
 	trustProjectSettings: false,
 	auth: { mode: "subscription" },
 };
@@ -336,13 +337,30 @@ describe("CodexAdapter", () => {
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("settings"));
 				const first = yield* takeUntil(handle, "turn.completed");
-				yield* handle.updateSettings({ model: "gpt-later", effort: "high" });
+				yield* handle.updateSettings({ model: "gpt-later", effort: "high", mode: "auto" });
 				yield* handle.sendMessage(userMessage("settings"));
 				const second = yield* takeUntil(handle, "turn.completed");
 				return [...first, ...second].flatMap((event) => (event.type === "message.completed" ? [event.text] : []));
 			}),
 		);
 		expect(texts).toEqual(["gpt-5/null", "gpt-later/high"]);
+	});
+
+	test.each([
+		["readOnly", "on-request", "readOnly"],
+		["ask", "untrusted", "workspaceWrite"],
+		["auto", "on-request", "workspaceWrite"],
+		["fullAccess", "never", "dangerFullAccess"],
+	] as const)("a turn in %s mode asks %s in a %s sandbox", async (mode, approvalPolicy, sandbox) => {
+		const reply = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.updateSettings({ model: "gpt-5", effort: null, mode });
+				yield* handle.sendMessage(userMessage("policy"));
+				const events = yield* takeUntil(handle, "turn.completed");
+				return events.find((event) => event.type === "message.completed");
+			}),
+		);
+		expect(reply).toMatchObject({ text: JSON.stringify([approvalPolicy, sandbox]) });
 	});
 
 	test("passes images as local files", async () => {

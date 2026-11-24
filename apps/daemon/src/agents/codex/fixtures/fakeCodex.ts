@@ -61,7 +61,13 @@ const ask = (id: number, method: string, params: object) =>
 
 const runTurn = async (
 	text: string,
-	params: { model?: string; effort?: string | null; input: Array<{ type: string; path?: string }> },
+	params: {
+		model?: string;
+		effort?: string | null;
+		approvalPolicy?: string;
+		sandboxPolicy?: { type: string };
+		input: Array<{ type: string; path?: string }>;
+	},
 ) => {
 	const failure = failures[text];
 	if (failure !== undefined) return completeTurn("failed", { additionalDetails: null, ...failure });
@@ -126,6 +132,18 @@ const runTurn = async (
 		// Reasoning with no summary has nothing to show.
 		notify("item/completed", { item: { type: "reasoning", id: "rs-2", summary: [], content: [] }, threadId, turnId });
 		notify("item/completed", { item: { type: "agentMessage", id: "msg-1", text: "Done" }, threadId, turnId });
+		return completeTurn("completed");
+	}
+	if (text.includes("policy")) {
+		notify("item/completed", {
+			item: {
+				type: "agentMessage",
+				id: "msg-1",
+				text: JSON.stringify([params.approvalPolicy, params.sandboxPolicy?.type]),
+			},
+			threadId,
+			turnId,
+		});
 		return completeTurn("completed");
 	}
 	if (text.includes("settings")) {

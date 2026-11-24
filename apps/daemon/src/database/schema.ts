@@ -1,4 +1,4 @@
-import { AgentAuthMode, AgentKind, AgentSessionStatus } from "@repo/contracts/AgentSession";
+import { AgentAuthMode, AgentKind, AgentMode, AgentSessionStatus } from "@repo/contracts/AgentSession";
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { WorkspaceKind, WorkspaceStatus } from "@repo/contracts/Workspace";
 import { ScriptRunKind } from "@repo/contracts/ScriptRun";
@@ -59,6 +59,8 @@ export const agentSession = sqliteTable(
 		authMode: text({ enum: AgentAuthMode.literals }).notNull(),
 		status: text({ enum: AgentSessionStatus.literals }).notNull(),
 		effort: text(),
+		// Null on sessions made before modes existed: they keep the agent's default mode.
+		mode: text({ enum: AgentMode.literals }),
 		title: text(),
 		createdAt: text().notNull(),
 		updatedAt: text().notNull(),

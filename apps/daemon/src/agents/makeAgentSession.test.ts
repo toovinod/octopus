@@ -11,7 +11,8 @@ const capabilities = {
 	fileChangeApprovals: false,
 	mcpApprovals: false,
 	steerWhileRunning: false,
-};
+	modes: ["ask"],
+} as const;
 
 const watchdog = { idleTimeout: Duration.millis(200), interruptGrace: Duration.millis(200) };
 

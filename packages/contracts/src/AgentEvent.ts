@@ -1,3 +1,4 @@
+import { AgentMode } from "./AgentSession.ts";
 import { Schema } from "effect";
 
 // Normalized agent events. The shape follows the Codex app-server protocol, the richer of the two,
@@ -124,6 +125,11 @@ export const AgentEvent = Schema.Union([
 		type: Schema.Literal("turn.completed"),
 		turnId: Schema.String,
 		result: TurnResult,
+	}),
+	// The agent changed its own mode, as Claude does when the user approves a plan.
+	Schema.Struct({
+		type: Schema.Literal("mode.changed"),
+		mode: AgentMode,
 	}),
 	// Non-fatal problems. A fatal one fails the event stream instead.
 	Schema.Struct({

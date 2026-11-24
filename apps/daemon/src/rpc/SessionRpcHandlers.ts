@@ -43,8 +43,8 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 			submitAgentLoginCode: ({ agent, code }) =>
 				sessions.submitLoginCode(agent, Redacted.value(code)).pipe(orInternalError("finish the sign-in")),
 			watchAgentLogins: () => sessions.watchLogins,
-			updateSessionSettings: ({ sessionId, model, effort }) =>
-				sessions.updateSettings(sessionId, { model, effort }).pipe(orInternalError("change the model")),
+			updateSessionSettings: ({ sessionId, model, effort, mode }) =>
+				sessions.updateSettings(sessionId, { model, effort, mode }).pipe(orInternalError("change the model")),
 			getAttachment: ({ sessionId, attachmentId }) =>
 				sessions.getAttachment(sessionId, attachmentId).pipe(orInternalError("load the image")),
 		});

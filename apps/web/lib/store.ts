@@ -475,15 +475,21 @@ export const renameSession = async (sessionId: string, title: string) => {
 	setState((current) => ({ sessions: { ...current.sessions, [sessionId]: saved ?? before } }));
 };
 
-export const updateSessionSettings = async (sessionId: string, model: string, effort: string | null) => {
+export const updateSessionSettings = async (
+	sessionId: string,
+	changes: Partial<Pick<AgentSession, "model" | "effort" | "mode">>,
+) => {
 	const before = state.sessions[sessionId];
 	if (before === undefined) return;
+	const { model, effort, mode } = { ...before, ...changes };
 	setState((current) => ({
-		sessions: { ...current.sessions, [sessionId]: { ...before, model, effort } },
+		sessions: { ...current.sessions, [sessionId]: { ...before, model, effort, mode } },
 		settings: { ...current.settings, lastAgent: before.agent, lastModel: model },
 	}));
 	saveSettings(state.settings);
-	const saved = await attempt(() => callDaemon((daemon) => daemon.updateSessionSettings({ sessionId, model, effort })));
+	const saved = await attempt(() =>
+		callDaemon((daemon) => daemon.updateSessionSettings({ sessionId, model, effort, mode })),
+	);
 	setState((current) => ({ sessions: { ...current.sessions, [sessionId]: saved ?? before } }));
 };
 

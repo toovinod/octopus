@@ -10,6 +10,15 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
+import type {
+	CanUseTool,
+	Options,
+	PermissionResult,
+	PermissionMode,
+	PermissionUpdate,
+	SDKUserMessage,
+	SpawnOptions,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
 	Config,
 	Context,
@@ -27,15 +36,12 @@ import {
 	Scope,
 	Stream,
 } from "effect";
-import type {
-	CanUseTool,
-	Options,
-	PermissionResult,
-	PermissionUpdate,
-	SDKUserMessage,
-	SpawnOptions,
-} from "@anthropic-ai/claude-agent-sdk";
-import { type AgentCapabilities, type AgentModel, LoginNotPendingError } from "@repo/contracts/AgentSession";
+import {
+	type AgentCapabilities,
+	type AgentMode,
+	type AgentModel,
+	LoginNotPendingError,
+} from "@repo/contracts/AgentSession";
 import type { ApprovalDecision, ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import { BashInput, ClaudeAuthStatus, ClaudeMessage, FileInput } from "./claudeMessages.ts";
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
@@ -67,6 +73,33 @@ const capabilities: AgentCapabilities = {
 	mcpApprovals: true,
 	// The SDK folds a message sent mid-turn into the running turn.
 	steerWhileRunning: true,
+	modes: ["ask", "acceptEdits", "plan", "auto", "fullAccess"],
+};
+
+// Claude has no read-only mode of its own. Plan is the closest, but readOnly is never offered.
+const permissionModes = {
+	readOnly: "plan",
+	plan: "plan",
+	ask: "default",
+	acceptEdits: "acceptEdits",
+	auto: "auto",
+	fullAccess: "bypassPermissions",
+} as const satisfies Record<AgentMode, PermissionMode>;
+
+// dontAsk denies whatever is not allowed already. Octopus never sets it, so it maps to nothing.
+const fromPermissionMode = (mode: string): Option.Option<AgentMode> => {
+	switch (mode) {
+		case "default":
+			return Option.some("ask");
+		case "acceptEdits":
+		case "plan":
+		case "auto":
+			return Option.some(mode);
+		case "bypassPermissions":
+			return Option.some("fullAccess");
+		default:
+			return Option.none();
+	}
 };
 
 // supportedModels() needs a running query, so the list is fixed here. The efforts are the SDK's
@@ -242,11 +275,17 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 		// Subagent frames belong to the Task tool call that started them.
 		if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return;
 		switch (message.type) {
-			case "system":
+			case "system": {
 				if ("session_id" in message) {
-					yield* session.setNativeSessionId(message.session_id);
+					return yield* session.setNativeSessionId(message.session_id);
+				}
+				if (!("permissionMode" in message) || message.permissionMode === undefined) return;
+				const mode = fromPermissionMode(message.permissionMode);
+				if (Option.isSome(mode)) {
+					yield* session.emit({ type: "mode.changed", mode: mode.value });
 				}
 				return;
+			}
 			case "stream_event": {
 				if (!("event" in message)) return;
 				const { event } = message;
@@ -551,8 +590,8 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// Claude Code omits thinking text unless asked, and Octopus shows it.
 					thinking: { type: "adaptive", display: "summarized" },
 					canUseTool,
-					// Never inherit a mode such as bypassPermissions from a settings file.
-					permissionMode: "default",
+					// Always set, so a settings file can never pick bypassPermissions on its own.
+					permissionMode: permissionModes[input.mode],
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
 					...Option.match(decodeEffort(input.effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
 					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),
@@ -639,13 +678,14 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// An interrupt that arrived after the last turn's result must not mark this one.
 					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
 					steerTurn: sendMessage,
-					updateSettings: ({ model, effort }) =>
+					updateSettings: ({ model, effort, mode }) =>
 						Effect.tryPromise({
 							try: async () => {
 								await run.setModel(model);
 								await run.setEffort(Option.getOrNull(decodeEffort(effort)));
+								await run.setPermissionMode(permissionModes[mode]);
 							},
-							catch: (cause) => new AgentProcessError({ message: "Could not change the model.", cause }),
+							catch: (cause) => new AgentProcessError({ message: "Could not change the chat's settings.", cause }),
 						}),
 					interruptTurn: Effect.gen(function* () {
 						yield* Ref.set(interrupting, true);

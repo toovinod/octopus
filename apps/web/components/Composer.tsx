@@ -26,6 +26,15 @@ import { memo, useEffect, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
 import { formatClockTime, formatTokens } from "../lib/format.ts";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@repo/ui/components/dialog";
+import { modeLabels, nextMode, orderedModes } from "../lib/agentModes.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
 import { cn } from "@repo/ui/lib/utils";
@@ -159,6 +168,10 @@ export const Composer = memo(
 								event.preventDefault();
 								send();
 							}
+							if (event.key === "Tab" && event.shiftKey && agent !== undefined) {
+								event.preventDefault();
+								void updateSessionSettings(session.id, { mode: nextMode(agent.capabilities.modes, session.mode) });
+							}
 						}}
 						className="max-h-60 min-h-11 resize-none rounded-none border-0 bg-transparent px-3.5 pt-3 pb-1 shadow-none placeholder:text-muted-foreground/60 focus-visible:ring-0 md:text-sm dark:bg-transparent"
 					/>
@@ -185,6 +198,7 @@ export const Composer = memo(
 								event.target.value = "";
 							}}
 						/>
+						<ModePicker session={session} agent={agent} />
 						<ModelPicker session={session} agent={agent} />
 						<div className="flex-1" />
 						<RateLimit limit={rateLimit} />
@@ -246,6 +260,76 @@ const FailedSendNotice = ({
 	</div>
 );
 
+const ModePicker = ({ session, agent }: { readonly session: AgentSession; readonly agent: AgentInfo | undefined }) => {
+	const [confirming, setConfirming] = useState(false);
+	if (agent === undefined || agent.capabilities.modes.length < 2) return null;
+	return (
+		<>
+			<DropdownMenu>
+				<Hint label="Shift+Tab switches modes">
+					<DropdownMenuTrigger asChild>
+						<Button
+							variant="ghost"
+							size="xs"
+							className={cn("text-muted-foreground", session.mode === "fullAccess" && "text-attention")}
+						>
+							{modeLabels[session.mode].label}
+							<ChevronDownIcon />
+						</Button>
+					</DropdownMenuTrigger>
+				</Hint>
+				<DropdownMenuContent align="start" className="w-72">
+					<DropdownMenuLabel className="text-xs text-muted-foreground">
+						What the agent may do without asking
+					</DropdownMenuLabel>
+					<DropdownMenuRadioGroup
+						value={session.mode}
+						onValueChange={(value) => {
+							const mode = agent.capabilities.modes.find((item) => item === value);
+							if (mode === "fullAccess") setConfirming(true);
+							else if (mode !== undefined) void updateSessionSettings(session.id, { mode });
+						}}
+					>
+						{orderedModes(agent.capabilities.modes).map((mode) => (
+							<DropdownMenuRadioItem key={mode} value={mode}>
+								<div className="flex flex-col">
+									<span>{modeLabels[mode].label}</span>
+									<span className="text-xs text-muted-foreground">{modeLabels[mode].description}</span>
+								</div>
+							</DropdownMenuRadioItem>
+						))}
+					</DropdownMenuRadioGroup>
+				</DropdownMenuContent>
+			</DropdownMenu>
+			<Dialog open={confirming} onOpenChange={setConfirming}>
+				<DialogContent className="sm:max-w-md">
+					<DialogHeader>
+						<DialogTitle>Give the agent full access?</DialogTitle>
+						<DialogDescription>
+							It will edit files and run any command without asking, including commands that reach outside this
+							workspace. Use it only on a project you trust.
+						</DialogDescription>
+					</DialogHeader>
+					<DialogFooter>
+						<Button variant="ghost" onClick={() => setConfirming(false)}>
+							Cancel
+						</Button>
+						<Button
+							variant="destructive"
+							onClick={() => {
+								setConfirming(false);
+								void updateSessionSettings(session.id, { mode: "fullAccess" });
+							}}
+						>
+							Allow full access
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+		</>
+	);
+};
+
 const ModelPicker = ({ session, agent }: { readonly session: AgentSession; readonly agent: AgentInfo | undefined }) => {
 	const model = agent?.models.find((item) => item.id === session.model);
 	return (
@@ -265,7 +349,9 @@ const ModelPicker = ({ session, agent }: { readonly session: AgentSession; reado
 						value={session.model}
 						onValueChange={(id) => {
 							const next = agent?.models.find((item) => item.id === id);
-							if (next !== undefined) void updateSessionSettings(session.id, next.id, next.defaultEffort);
+							if (next !== undefined) {
+								void updateSessionSettings(session.id, { model: next.id, effort: next.defaultEffort });
+							}
 						}}
 					>
 						{agent?.models.map((item) => (
@@ -293,7 +379,7 @@ const ModelPicker = ({ session, agent }: { readonly session: AgentSession; reado
 							value={session.effort ?? model.defaultEffort ?? ""}
 							onValueChange={(effort) => {
 								const picked = model.efforts.find((item) => item === effort);
-								if (picked !== undefined) void updateSessionSettings(session.id, model.id, picked);
+								if (picked !== undefined) void updateSessionSettings(session.id, { effort: picked });
 							}}
 						>
 							{model.efforts.map((effort) => (

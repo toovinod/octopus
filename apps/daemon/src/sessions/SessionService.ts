@@ -11,6 +11,7 @@ import {
 	AttachmentNotFoundError,
 	AuthModeNotAllowedError,
 	LoginNotPendingError,
+	ModeNotAllowedError,
 	type ImageData,
 	ImageMediaType,
 	ImagesNotSupportedError,
@@ -189,6 +190,10 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			Effect.forkScoped,
 		);
 
+		// Sessions made before modes existed have none stored and keep the agent's default.
+		const defaultMode = (agent: AgentKind) => adapters[agent].capabilities.modes[0] ?? "ask";
+		const toSession = (row: SessionRow) => new AgentSession({ ...row, mode: row.mode ?? defaultMode(row.agent) });
+
 		const getRow = Effect.fn("SessionService.getRow")(function* (sessionId: string) {
 			const [row] = yield* database.query((db) => db.select().from(agentSession).where(eq(agentSession.id, sessionId)));
 			if (row === undefined) {
@@ -199,7 +204,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 
 		const updateSession = Effect.fnUntraced(function* (
 			sessionId: string,
-			patch: Partial<Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort">>,
+			patch: Partial<
+				Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort" | "mode">
+			>,
 		) {
 			const updatedAt = yield* nowIso;
 			const [row] = yield* database.query((db) =>
@@ -210,7 +217,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					.returning(),
 			);
 			if (row === undefined) return undefined;
-			const session = new AgentSession(row);
+			const session = toSession(row);
 			yield* PubSub.publish(sessionChanges, session);
 			return session;
 		});
@@ -245,6 +252,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			switch (event.type) {
 				case "session.started":
 					yield* updateSession(sessionId, { nativeSessionId: event.nativeSessionId });
+					break;
+				case "mode.changed":
+					yield* updateSession(sessionId, { mode: event.mode });
 					break;
 				case "approval.requested":
 					runtime.approvals.add(event.requestId);
@@ -406,12 +416,21 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				return yield* new WorkspaceArchivedError({ workspaceId: row.workspaceId });
 			}
 			const auth = yield* authFor(row.agent);
+			let mode = row.mode ?? defaultMode(row.agent);
+			// The project may have lost its trust since full access was chosen.
+			if (mode === "fullAccess" && !target.trusted) {
+				mode = defaultMode(row.agent);
+				yield* Effect.logWarning("Starting a full access session in its default mode, its project is not trusted").pipe(
+					Effect.annotateLogs({ sessionId: row.id }),
+				);
+			}
 			const scope = yield* Scope.make();
 			const handle = yield* adapters[row.agent]
 				.startSession({
 					cwd: target.path,
 					model: row.model,
 					effort: row.effort,
+					mode,
 					trustProjectSettings: target.trusted,
 					auth,
 					...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
@@ -622,13 +641,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				...input,
 				nativeSessionId: null,
 				authMode,
+				mode: defaultMode(input.agent),
 				status: "idle",
 				title: null,
 				createdAt: now,
 				updatedAt: now,
 			};
 			yield* database.query((db) => db.insert(agentSession).values(row));
-			const session = new AgentSession(row);
+			const session = toSession(row);
 			yield* PubSub.publish(sessionChanges, session);
 			return session;
 		}, Effect.provide(services));
@@ -642,7 +662,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						.where(eq(agentSession.workspaceId, workspaceId))
 						.orderBy(asc(agentSession.createdAt)),
 				)
-				.pipe(Effect.map((rows) => rows.map((row) => new AgentSession(row))));
+				.pipe(Effect.map((rows) => rows.map(toSession)));
 
 		const rename = Effect.fn("SessionService.rename")(function* (sessionId: string, title: string) {
 			const session = yield* updateSession(sessionId, { title: title.trim() || null });
@@ -656,7 +676,22 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			sessionId: string,
 			settings: SessionSettings,
 		) {
-			yield* getRow(sessionId);
+			const row = yield* getRow(sessionId);
+			if (!adapters[row.agent].capabilities.modes.includes(settings.mode)) {
+				return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode });
+			}
+			if (settings.mode === "fullAccess") {
+				const [target] = yield* database.query((db) =>
+					db
+						.select({ trusted: project.trusted })
+						.from(workspace)
+						.innerJoin(project, eq(workspace.projectId, project.id))
+						.where(eq(workspace.id, row.workspaceId)),
+				);
+				if (target?.trusted !== true) {
+					return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode });
+				}
+			}
 			// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
 			const runtime = runtimes.get(sessionId);
 			if (runtime !== undefined) {
@@ -792,7 +827,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						.orderBy(asc(agentSession.createdAt)),
 				);
 				return Stream.concat(
-					Stream.fromIterable(rows.map((row) => new AgentSession(row.session))),
+					Stream.fromIterable(rows.map((row) => toSession(row.session))),
 					Stream.fromSubscription(subscription),
 				);
 			}),

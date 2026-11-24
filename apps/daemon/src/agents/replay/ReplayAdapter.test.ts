@@ -12,6 +12,7 @@ const input = {
 	cwd: "/repo",
 	model: "gpt-5",
 	effort: null,
+	mode: "ask",
 	trustProjectSettings: false,
 	auth: { mode: "subscription" },
 } as const;

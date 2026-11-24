@@ -33,7 +33,7 @@ import {
 import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
 import { Context, Effect, Exit, FiberHandle, Layer, Predicate, PubSub, Ref, Scope, Stream } from "effect";
-import type { AgentCapabilities, AgentModel } from "@repo/contracts/AgentSession";
+import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
 import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import type { LoginAccountParams } from "./generated/v2/LoginAccountParams.ts";
@@ -47,6 +47,7 @@ import type { TurnStartParams } from "./generated/v2/TurnStartParams.ts";
 import type { TurnSteerParams } from "./generated/v2/TurnSteerParams.ts";
 import type { InitializeParams } from "./generated/InitializeParams.ts";
 import packageJson from "../../../package.json" with { type: "json" };
+import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
@@ -70,6 +71,26 @@ const capabilities: AgentCapabilities = {
 	// Codex asks MCP questions through elicitation requests, which Octopus declines for now.
 	mcpApprovals: false,
 	steerWhileRunning: true,
+	// This Codex cannot switch a thread to plan mode from a client, so plan is not offered.
+	modes: ["auto", "readOnly", "ask", "fullAccess"],
+};
+
+const workspaceWrite: SandboxPolicy = {
+	type: "workspaceWrite",
+	writableRoots: [],
+	networkAccess: false,
+	excludeTmpdirEnvVar: false,
+	excludeSlashTmp: false,
+};
+
+// Sent with every turn. Modes Codex does not offer map to the nearest one it has.
+const turnPolicies: Record<AgentMode, Pick<TurnStartParams, "approvalPolicy" | "sandboxPolicy">> = {
+	readOnly: { approvalPolicy: "on-request", sandboxPolicy: { type: "readOnly", networkAccess: false } },
+	plan: { approvalPolicy: "on-request", sandboxPolicy: { type: "readOnly", networkAccess: false } },
+	ask: { approvalPolicy: "untrusted", sandboxPolicy: workspaceWrite },
+	acceptEdits: { approvalPolicy: "on-request", sandboxPolicy: workspaceWrite },
+	auto: { approvalPolicy: "on-request", sandboxPolicy: workspaceWrite },
+	fullAccess: { approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } },
 };
 
 const approvalChoices = ["allowOnce", "allowForSession", "deny"] as const;
@@ -472,7 +493,11 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const session = yield* makeAgentSession(capabilities);
 				const currentTurn = yield* Ref.make(idle);
 				// Sent with every turn, so a change applies from the next one.
-				const settings = yield* Ref.make<SessionSettings>({ model: input.model, effort: input.effort });
+				const settings = yield* Ref.make<SessionSettings>({
+					model: input.model,
+					effort: input.effort,
+					mode: input.mode,
+				});
 				const client = yield* makeCodexRpcClient(
 					appServer(
 						executable,
@@ -527,13 +552,14 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					startTurn: (message) =>
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
-							const { model, effort } = yield* Ref.get(settings);
+							const { model, effort, mode } = yield* Ref.get(settings);
 							yield* Ref.set(currentTurn, { _tag: "starting", interruptRequested: false });
 							const { turn } = yield* client
 								.request("turn/start", {
 									threadId,
 									model,
 									effort,
+									...turnPolicies[mode],
 									input: toInput(message),
 								} satisfies TurnStartParams)
 								.pipe(

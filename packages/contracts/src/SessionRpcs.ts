@@ -1,6 +1,7 @@
 import {
 	AgentAuthMode,
 	AgentInfo,
+	AgentMode,
 	AgentKind,
 	AgentLoginResult,
 	AttachmentNotFoundError,
@@ -8,6 +9,7 @@ import {
 	ImageData,
 	ImagesNotSupportedError,
 	LoginNotPendingError,
+	ModeNotAllowedError,
 	MAX_IMAGES_PER_MESSAGE,
 	AgentSession,
 	AgentUnavailableError,
@@ -80,11 +82,16 @@ export class SessionRpcs extends RpcGroup.make(
 		success: AgentSession,
 		error: Schema.Union([SessionNotFoundError, DaemonInternalError]),
 	}),
-	// Takes effect from the next turn.
+	// Model and effort take effect from the next turn. A mode change reaches a running Claude turn at once.
 	Rpc.make("updateSessionSettings", {
-		payload: { sessionId: Schema.String, model: Schema.String, effort: Schema.NullOr(Schema.String) },
+		payload: {
+			sessionId: Schema.String,
+			model: Schema.String,
+			effort: Schema.NullOr(Schema.String),
+			mode: AgentMode,
+		},
 		success: AgentSession,
-		error: Schema.Union([SessionNotFoundError, DaemonInternalError]),
+		error: Schema.Union([SessionNotFoundError, ModeNotAllowedError, DaemonInternalError]),
 	}),
 	// steer sends the text into the running turn when the agent supports it, otherwise it queues.
 	Rpc.make("sendMessage", {

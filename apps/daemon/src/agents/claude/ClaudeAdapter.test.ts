@@ -19,6 +19,7 @@ const newSession: StartSessionInput = {
 	cwd: "/repo",
 	model: "claude-opus-4-5",
 	effort: null,
+	mode: "ask",
 	trustProjectSettings: false,
 	auth: { mode: "subscription" },
 };
@@ -112,6 +113,9 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						parent_tool_use_id: null,
 						message: { id: "msg_1", content: [{ type: "text", text: "Hi" }] },
 					};
+					if (text.includes("leave plan mode")) {
+						yield { type: "system", subtype: "status", status: null, permissionMode: "default" };
+					}
 					if (text.includes("usage")) {
 						yield {
 							type: "assistant",
@@ -246,6 +250,7 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 				interrupt: async () => resolveInterrupt(),
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
+				setPermissionMode: async (permissionMode) => void settingsChanges.push({ permissionMode }),
 				close: () => {},
 			};
 		},
@@ -634,11 +639,33 @@ describe("sessionAllowRules", () => {
 	});
 
 	test("passes the effort at start and changes model and effort for later turns", async () => {
-		await runSession((handle) => handle.updateSettings({ model: "claude-haiku-5-5", effort: "low" }), {
+		await runSession((handle) => handle.updateSettings({ model: "claude-haiku-5-5", effort: "low", mode: "plan" }), {
 			input: { ...newSession, effort: "high" },
 		});
 		expect(startedWith.at(-1)?.effort).toBe("high");
-		expect(settingsChanges.slice(-2)).toEqual([{ model: "claude-haiku-5-5" }, { effort: "low" }]);
+		expect(settingsChanges.slice(-3)).toEqual([
+			{ model: "claude-haiku-5-5" },
+			{ effort: "low" },
+			{ permissionMode: "plan" },
+		]);
+	});
+
+	test.each([
+		["ask", "default"],
+		["acceptEdits", "acceptEdits"],
+		["plan", "plan"],
+		["auto", "auto"],
+		["fullAccess", "bypassPermissions"],
+	] as const)("starts %s mode as Claude's %s permission mode", async (mode, permissionMode) => {
+		await runSession(() => Effect.void, { input: { ...newSession, mode } });
+		expect(startedWith.at(-1)?.permissionMode).toBe(permissionMode);
+	});
+
+	test("reports the mode Claude switches to by itself, as after an approved plan", async () => {
+		const events = await runSession((handle) =>
+			handle.sendMessage(userMessage("leave plan mode")).pipe(Effect.andThen(takeUntil(handle, "turn.completed"))),
+		);
+		expect(events).toContainEqual({ type: "mode.changed", mode: "ask" });
 	});
 
 	test("sends images as image blocks before the text", async () => {

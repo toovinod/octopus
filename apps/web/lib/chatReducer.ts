@@ -171,7 +171,9 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 				rateLimit = limit;
 				break;
 			}
+			// The session itself carries these, through watchSessions.
 			case "session.started":
+			case "mode.changed":
 				break;
 		}
 	}

@@ -1,4 +1,10 @@
-import { type EffortLevel, type Options, query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+	type EffortLevel,
+	type Options,
+	type PermissionMode,
+	query,
+	type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { Context, Layer } from "effect";
 
 // One running query. Messages are left unknown on purpose: the adapter decodes the fields it
@@ -8,6 +14,7 @@ export interface ClaudeQueryRun {
 	interrupt(): Promise<unknown>;
 	setModel(model: string): Promise<void>;
 	setEffort(effort: EffortLevel | null): Promise<void>;
+	setPermissionMode(mode: PermissionMode): Promise<void>;
 	close(): void;
 }
 
@@ -27,6 +34,7 @@ export class ClaudeQuery extends Context.Service<
 					interrupt: () => run.interrupt(),
 					setModel: (model) => run.setModel(model),
 					setEffort: (effortLevel) => run.applyFlagSettings({ effortLevel }),
+					setPermissionMode: (mode) => run.setPermissionMode(mode),
 					close: () => run.close(),
 				};
 			},
