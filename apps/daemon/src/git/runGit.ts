@@ -18,13 +18,14 @@ const NETWORK_COMMANDS = new Set(["push", "fetch", "pull", "clone", "ls-remote"]
 
 // Leading whitespace is kept because `git status --porcelain` lines start with a space.
 export const runGit = Effect.fn("runGit")(
-	function* (cwd: string, args: ReadonlyArray<string>) {
+	function* (cwd: string, args: ReadonlyArray<string>, env?: Readonly<Record<string, string>>) {
 		const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 		// Git must never wait for a password on a terminal nobody sees.
 		const handle = yield* spawner.spawn(
 			ChildProcess.make("git", args, {
 				cwd,
-				env: { GIT_TERMINAL_PROMPT: "0" },
+				// Extra variables, such as GIT_INDEX_FILE for a temporary index.
+				env: { ...env, GIT_TERMINAL_PROMPT: "0" },
 				extendEnv: true,
 				// After a timeout, a process that ignores SIGTERM must not hold the request either.
 				forceKillAfter: "2 seconds",
@@ -48,7 +49,7 @@ export const runGit = Effect.fn("runGit")(
 		return stdout.trimEnd();
 	},
 	Effect.scoped,
-	(effect, _cwd, args) =>
+	(effect, _cwd, args, _env?) =>
 		effect.pipe(
 			withGitDeadline(`git ${args[0] ?? ""}`, NETWORK_COMMANDS.has(args[0] ?? "") ? "network" : "local"),
 			Effect.catchTag("PlatformError", (cause) => Effect.fail(new GitSpawnError({ args: [...args], cause }))),

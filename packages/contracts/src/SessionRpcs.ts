@@ -19,10 +19,12 @@ import {
 	SessionBusyError,
 	SessionNotFoundError,
 } from "./AgentSession.ts";
+import { CheckpointChange, CheckpointNotFoundError, WorkspaceAgentsBusyError } from "./Checkpoint.ts";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "./Workspace.ts";
 import { DaemonInternalError } from "./DaemonInternalError.ts";
 import { ApprovalDecision } from "./AgentEvent.ts";
 import { SessionEvent } from "./SessionEvent.ts";
+import { GitTimeoutError } from "./Git.ts";
 import { Rpc, RpcGroup } from "effect/rpc";
 import { Schema } from "effect";
 
@@ -108,6 +110,31 @@ export class SessionRpcs extends RpcGroup.make(
 			AgentUnavailableError,
 			ImagesNotSupportedError,
 			WorkspaceArchivedError,
+			DaemonInternalError,
+		]),
+	}),
+	// What reverting to the checkpoint saved before a message would undo.
+	Rpc.make("previewRevert", {
+		payload: { sessionId: Schema.String, messageId: Schema.String },
+		success: Schema.Array(CheckpointChange),
+		error: Schema.Union([
+			SessionNotFoundError,
+			CheckpointNotFoundError,
+			WorkspaceArchivedError,
+			GitTimeoutError,
+			DaemonInternalError,
+		]),
+	}),
+	// Puts the workspace's files back as they were just before the message was sent. Returns what it undid.
+	Rpc.make("revertToMessage", {
+		payload: { sessionId: Schema.String, messageId: Schema.String },
+		success: Schema.Array(CheckpointChange),
+		error: Schema.Union([
+			SessionNotFoundError,
+			CheckpointNotFoundError,
+			WorkspaceAgentsBusyError,
+			WorkspaceArchivedError,
+			GitTimeoutError,
 			DaemonInternalError,
 		]),
 	}),

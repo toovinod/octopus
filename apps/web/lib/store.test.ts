@@ -33,6 +33,7 @@ const daemon = {
 	},
 	loadSessionHistory: () => [],
 	removeProject: () => undefined,
+	revertToMessage: () => [{ path: "README.md", change: "modified" }],
 	sendMessage: ({ text }: { readonly text: string }) => {
 		sent.push(text);
 		return outcomes.shift() === "busy"
@@ -69,6 +70,7 @@ const {
 	reconnectDelay,
 	removeProject,
 	retryFailedSend,
+	revertToMessage,
 	sendMessage,
 } = await import("./store.ts");
 
@@ -148,6 +150,15 @@ describe("reconnecting", () => {
 		expect(listCalls).toBe(1);
 		expect(getState().connection.status).toBe("ready");
 		expect(watchCount()).toBe(watches);
+	});
+});
+
+describe("reverting to a message", () => {
+	test("bumps the workspace's revert count so its diff reloads", async () => {
+		await boot();
+		const before = getState().reverts.w ?? 0;
+		expect(await revertToMessage("s", "m")).toBe(true);
+		expect(getState().reverts.w).toBe(before + 1);
 	});
 });
 

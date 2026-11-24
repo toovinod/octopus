@@ -487,6 +487,51 @@ describe("SessionService", () => {
 		expect(statuses).toEqual(["interrupted", "interrupted", "idle"]);
 	});
 
+	test("reverting to a message puts the files back as they were before it, but not while an agent works", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const repo = join(tempDir, "repo");
+				yield* fs.writeFileString(join(repo, "notes.txt"), "before\n");
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				const events = yield* eventsUntil(session.id, -1, "user.message");
+				const message = events.find((stored) => stored.event.type === "user.message")?.event;
+				if (message?.type !== "user.message") return yield* Effect.die("no message");
+				const messageId = message.itemId;
+
+				// What the agent's turn changed.
+				yield* fs.writeFileString(join(repo, "notes.txt"), "after\n");
+				yield* fs.writeFileString(join(repo, "made-by-agent.ts"), "new\n");
+				const preview = yield* sessions.previewRevert(session.id, messageId);
+				const busy = yield* sessions.revertToMessage(session.id, messageId).pipe(Effect.flip);
+				yield* sessions.respondToApproval(session.id, "0", "allowOnce");
+				yield* waitForStatus(session.id, "idle");
+
+				const reverted = yield* sessions.revertToMessage(session.id, messageId);
+				return {
+					preview,
+					busy: busy._tag,
+					reverted,
+					notes: yield* fs.readFileString(join(repo, "notes.txt")),
+					agentFileGone: !(yield* fs.exists(join(repo, "made-by-agent.ts"))),
+					missing: (yield* sessions.previewRevert(session.id, "never-sent").pipe(Effect.flip))._tag,
+				};
+			}),
+		);
+		expect(result.preview).toEqual([
+			{ path: "made-by-agent.ts", change: "added" },
+			{ path: "notes.txt", change: "modified" },
+		]);
+		expect(result.busy).toBe("WorkspaceAgentsBusyError");
+		expect(result.reverted).toEqual(result.preview);
+		expect(result.notes).toBe("before\n");
+		expect(result.agentFileGone).toBe(true);
+		expect(result.missing).toBe("CheckpointNotFoundError");
+	});
+
 	test("moves through running, awaitingApproval, running and idle during an approved turn", async () => {
 		const statuses = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

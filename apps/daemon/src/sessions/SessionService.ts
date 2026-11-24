@@ -51,8 +51,17 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
+import {
+	beforeRevertRef,
+	changesSince,
+	checkpointRef,
+	findCheckpoint,
+	restoreCheckpoint,
+	saveCheckpoint,
+} from "../checkpoints/workspaceCheckpoints.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
 import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
+import { CheckpointNotFoundError, WorkspaceAgentsBusyError } from "@repo/contracts/Checkpoint";
 import { AgentEvent, type ApprovalDecision, isLiveOnly } from "@repo/contracts/AgentEvent";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "@repo/contracts/Workspace";
 import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
@@ -62,10 +71,12 @@ import { CredentialStore } from "../agents/CredentialStore.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { SessionEvent } from "@repo/contracts/SessionEvent";
+import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import type { SecureRandom } from "effect/crypto";
 import { nowIso } from "../database/nowIso.ts";
 import { newId } from "../database/newId.ts";
+import { runGit } from "../git/runGit.ts";
 import { Base64 } from "effect/encoding";
 import { join } from "node:path";
 
@@ -153,7 +164,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const claude = yield* ClaudeAdapter;
 		const codex = yield* CodexAdapter;
 		const adapters: Record<AgentKind, AgentAdapter> = { claude, codex };
-		const services = yield* Effect.context<SecureRandom.SecureRandom>();
+		const services = yield* Effect.context<
+			SecureRandom.SecureRandom | ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
+		>();
 		const fs = yield* FileSystem.FileSystem;
 		const { dataDir } = yield* DaemonConfig;
 		const attachmentsDir = (sessionId: string) => join(dataDir, "attachments", sessionId);
@@ -519,6 +532,18 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			);
 		}, Effect.provide(services));
 
+		// Saved before the agent sees the message, so "Revert to here" can undo everything from it on.
+		// A failure only costs that checkpoint, so the message still goes.
+		const saveTurnCheckpoint = Effect.fnUntraced(
+			function* (sessionId: string, messageId: string) {
+				const row = yield* getRow(sessionId);
+				const { path } = yield* workspaceTrust(row.workspaceId);
+				yield* saveCheckpoint(path, checkpointRef(row.workspaceId, sessionId, messageId));
+			},
+			Effect.provide(services),
+			Effect.catch((cause) => Effect.logWarning("Could not save a checkpoint before the message", cause)),
+		);
+
 		const sendMessage = Effect.fn("SessionService.sendMessage")(
 			function* (sessionId: string, text: string, images: ReadonlyArray<ImageData>, steer: boolean) {
 				if (images.length > 0) yield* checkImagesSupported(sessionId);
@@ -528,6 +553,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					text,
 					images: yield* storeImages(sessionId, images),
 				};
+				yield* saveTurnCheckpoint(sessionId, message.id);
 				// Counted before sending, so the turn's own completion can never arrive first.
 				runtime.outstanding++;
 				yield* refreshStatus(runtime);
@@ -560,6 +586,51 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			},
 			(effect, sessionId) => withProcessLock(sessionId, effect),
 		);
+
+		const findMessageCheckpoint = Effect.fnUntraced(function* (sessionId: string, messageId: string) {
+			const row = yield* getRow(sessionId);
+			const target = yield* workspaceTrust(row.workspaceId);
+			if (target.status === "archived") {
+				return yield* new WorkspaceArchivedError({ workspaceId: row.workspaceId });
+			}
+			const checkpoint = yield* findCheckpoint(target.path, checkpointRef(row.workspaceId, sessionId, messageId));
+			if (checkpoint === null) return yield* new CheckpointNotFoundError({ sessionId, messageId });
+			return { row, path: target.path, checkpoint };
+		});
+
+		const previewRevert = Effect.fn("SessionService.previewRevert")(function* (sessionId: string, messageId: string) {
+			const { path, checkpoint } = yield* findMessageCheckpoint(sessionId, messageId);
+			return (yield* changesSince(path, checkpoint)).files;
+		}, Effect.provide(services));
+
+		// Every chat in the workspace shares its folder, so none may be writing files while they change.
+		const revertToMessage = Effect.fn("SessionService.revertToMessage")(function* (
+			sessionId: string,
+			messageId: string,
+		) {
+			const { row, path, checkpoint } = yield* findMessageCheckpoint(sessionId, messageId);
+			const working = yield* database.query((db) =>
+				db
+					.select({ id: agentSession.id })
+					.from(agentSession)
+					.where(
+						and(
+							eq(agentSession.workspaceId, row.workspaceId),
+							inArray(agentSession.status, ["running", "awaitingApproval"]),
+						),
+					)
+					.limit(1),
+			);
+			if (working.length > 0) return yield* new WorkspaceAgentsBusyError({ workspaceId: row.workspaceId });
+			const { now, files } = yield* changesSince(path, checkpoint);
+			// Kept so the revert itself can be undone with git.
+			yield* runGit(path, ["update-ref", beforeRevertRef(row.workspaceId, sessionId), now]);
+			yield* restoreCheckpoint(path, checkpoint);
+			yield* Effect.logInfo("Reverted a workspace to a checkpoint").pipe(
+				Effect.annotateLogs({ sessionId, messageId, files: files.length }),
+			);
+			return files;
+		}, Effect.provide(services));
 
 		const respondToApproval = Effect.fn("SessionService.respondToApproval")(function* (
 			sessionId: string,
@@ -969,6 +1040,12 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			// It can start the agent, so like sendMessage it may not race an archive.
 			listCommands: (sessionId: string) =>
 				Effect.flatMap(getRow(sessionId), (row) => workspaceLock.starting(row.workspaceId, listCommands(sessionId))),
+			previewRevert,
+			// It rewrites the workspace's files, so it may not race an archive of it.
+			revertToMessage: (sessionId: string, messageId: string) =>
+				Effect.flatMap(getRow(sessionId), (row) =>
+					workspaceLock.starting(row.workspaceId, revertToMessage(sessionId, messageId)),
+				),
 			respondToApproval,
 			interrupt,
 			stop,

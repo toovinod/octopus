@@ -17,6 +17,10 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 				sessions.rename(sessionId, title).pipe(orInternalError("rename the chat")),
 			sendMessage: ({ sessionId, text, images, steer }) =>
 				sessions.sendMessage(sessionId, text, images, steer).pipe(orInternalError("send the message")),
+			previewRevert: ({ sessionId, messageId }) =>
+				sessions.previewRevert(sessionId, messageId).pipe(orInternalError("read the checkpoint")),
+			revertToMessage: ({ sessionId, messageId }) =>
+				sessions.revertToMessage(sessionId, messageId).pipe(orInternalError("revert the files")),
 			listSessionCommands: ({ sessionId }) =>
 				sessions.listCommands(sessionId).pipe(orInternalError("list the commands")),
 			respondToApproval: ({ sessionId, requestId, decision }) =>
