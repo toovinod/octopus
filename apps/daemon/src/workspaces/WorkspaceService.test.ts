@@ -492,6 +492,33 @@ describe("WorkspaceService", () => {
 		expect(result.runs).toMatchObject([{ kind: "run", status: "failed", lastError: "Stopped." }]);
 	});
 
+	test("finds the port a run script's child process listens on", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				// The server is a child of the script's shell, as a dev server started by a package script is.
+				const serve = `"${process.execPath}" -e 'const s = Bun.serve({ port: 0, fetch: () => new Response() }); console.log(s.port)'`;
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: `${serve}; echo stopped` });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const started = yield* workspaces.startRunScript(created.id);
+				const [printed] = yield* workspaces.followScriptRunOutput(started.id).pipe(Stream.take(1), Stream.runCollect);
+				const ports = yield* workspaces.watchRunScriptPorts(created.id).pipe(
+					Stream.filter((found) => found.length > 0),
+					Stream.take(1),
+					Stream.runCollect,
+					Effect.timeout("10 seconds"),
+				);
+				yield* workspaces.stopRunScript(created.id);
+				const afterStop = yield* workspaces.watchRunScriptPorts(created.id).pipe(Stream.take(1), Stream.runCollect);
+				return { printed: Number(printed), ports: ports[0], afterStop: afterStop[0] };
+			}),
+		);
+		expect(result.ports).toEqual([result.printed]);
+		expect(result.afterStop).toEqual([]);
+	});
+
 	test("a run script that exits records its exit code", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

@@ -159,6 +159,13 @@ export class WorkspaceRpcs extends RpcGroup.make(
 		success: ScriptRun,
 		stream: true,
 	}),
+	// The TCP ports the running run script's processes listen on, now and each time they change.
+	Rpc.make("watchRunScriptPorts", {
+		payload: { workspaceId: Schema.String },
+		success: Schema.Array(Schema.Int),
+		error: DaemonInternalError,
+		stream: true,
+	}),
 	// The kept output first, then new lines as the script prints them. Ends when the run ends.
 	Rpc.make("followScriptRunOutput", {
 		payload: { scriptRunId: Schema.String },

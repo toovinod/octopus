@@ -2,9 +2,9 @@ import type { AgentError, ApprovalChoiceError } from "../agents/AgentAdapter.ts"
 import { DaemonInternalError } from "@repo/contracts/DaemonInternalError";
 import type { IllegalJobTransitionError } from "../jobs/transitionJob.ts";
 import type { CredentialStoreError } from "../agents/CredentialStore.ts";
+import { Effect, type PlatformError, Predicate, Stream } from "effect";
 import type { GitCommandError, GitSpawnError } from "../git/runGit.ts";
 import type { LocalDatabaseError } from "../database/LocalDatabase.ts";
-import { Effect, type PlatformError, Predicate } from "effect";
 import type { EncodingError } from "effect/encoding";
 
 type InternalFailure =
@@ -50,5 +50,24 @@ export const orInternalError =
 					),
 				// Passing the other errors on explicitly keeps their types precise.
 				Effect.fail,
+			),
+		);
+
+// The same for a streaming RPC: an internal failure ends the stream with DaemonInternalError.
+export const orInternalErrorStream =
+	(operation: string) =>
+	<A, E, R>(
+		self: Stream.Stream<A, E | InternalFailure, R>,
+	): Stream.Stream<A, Exclude<E, InternalFailure> | DaemonInternalError, R> =>
+		self.pipe(
+			Stream.catchIf(
+				isInternalFailure,
+				(cause) =>
+					Stream.fromEffect(
+						Effect.logError(`Could not ${operation}`, cause).pipe(
+							Effect.andThen(Effect.fail(new DaemonInternalError({ operation }))),
+						),
+					),
+				Stream.fail,
 			),
 		);

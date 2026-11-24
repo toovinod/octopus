@@ -12,7 +12,7 @@ import {
 	removeWorktree,
 	restoreArchiveStash,
 } from "./removeWorktree.ts";
-import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Semaphore, Stream } from "effect";
+import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contracts/ScriptRun";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
@@ -26,6 +26,7 @@ import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import type { ScriptRunKind } from "@repo/contracts/ScriptRun";
+import { listListeningPorts } from "./listListeningPorts.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
@@ -61,6 +62,8 @@ interface ScriptOutput {
 	finished: boolean;
 }
 
+const RUN_SCRIPT_PORT_POLL = "2 seconds";
+
 // A slow follower loses old lines rather than growing the daemon's memory.
 const LIVE_LINES = 1000;
 
@@ -89,6 +92,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			// Two quick clicks on Run must not start the run script twice.
 			const runScriptLock = yield* Semaphore.make(1);
 			const outputs = new Map<string, ScriptOutput>();
+			// The process group of each running run script, by script run id, to find the ports it listens on.
+			const runScriptGroups = new Map<string, number>();
 
 			const startScript = Effect.fn("WorkspaceService.startScript")(function* (
 				scriptRunId: string,
@@ -592,7 +597,15 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							updatedAt: now,
 						}),
 					);
-					yield* startScript(scriptRunId, (onLine) => runRunScript({ scriptRunId, script, cwd: current.path, onLine }));
+					yield* startScript(scriptRunId, (onLine) =>
+						runRunScript({
+							scriptRunId,
+							script,
+							cwd: current.path,
+							onLine,
+							onSpawn: (pid) => runScriptGroups.set(scriptRunId, pid),
+						}).pipe(Effect.ensuring(Effect.sync(() => runScriptGroups.delete(scriptRunId)))),
+					);
 					yield* Effect.logInfo("Started run script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
 					return new ScriptRun({
 						id: scriptRunId,
@@ -613,6 +626,19 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),
 				Effect.provide(services),
 			);
+
+			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
+				const running = yield* findRunningRunScript(workspaceId);
+				const group = running === null ? undefined : runScriptGroups.get(running.id);
+				return group === undefined ? [] : yield* listListeningPorts(group);
+			}, Effect.provide(services));
+
+			// The ports the workspace's run script listens on, sent again each time they change. A dev server
+			// takes a moment to bind, and can move ports when one is taken, so this keeps looking.
+			const watchRunScriptPorts = (workspaceId: string) =>
+				Stream.fromEffectSchedule(readRunScriptPorts(workspaceId), Schedule.spaced(RUN_SCRIPT_PORT_POLL)).pipe(
+					Stream.changesWith((a, b) => a.join() === b.join()),
+				);
 
 			const watchScriptRuns = (workspaceId: string): Stream.Stream<ScriptRun> =>
 				Stream.fromPubSub(scriptRunChanges).pipe(Stream.filter((run) => run.workspaceId === workspaceId));
@@ -702,6 +728,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				startRunScript,
 				stopRunScript,
 				watchScriptRuns,
+				watchRunScriptPorts,
 				setPullRequestUrl,
 			};
 		}),

@@ -1,6 +1,6 @@
+import { orInternalError, orInternalErrorStream } from "./orInternalError.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { WorkspaceRpcs } from "@repo/contracts/WorkspaceRpcs";
-import { orInternalError } from "./orInternalError.ts";
 import { Effect } from "effect";
 
 export const WorkspaceRpcHandlers = WorkspaceRpcs.toLayer(
@@ -25,6 +25,8 @@ export const WorkspaceRpcHandlers = WorkspaceRpcs.toLayer(
 			stopRunScript: ({ workspaceId }) =>
 				workspaces.stopRunScript(workspaceId).pipe(orInternalError("stop the run script")),
 			watchScriptRuns: ({ workspaceId }) => workspaces.watchScriptRuns(workspaceId),
+			watchRunScriptPorts: ({ workspaceId }) =>
+				workspaces.watchRunScriptPorts(workspaceId).pipe(orInternalErrorStream("list the run script's ports")),
 			followScriptRunOutput: ({ scriptRunId }) => workspaces.followScriptRunOutput(scriptRunId),
 		});
 	}),
