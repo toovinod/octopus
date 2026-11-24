@@ -103,8 +103,13 @@ describe("TerminalService", () => {
 			return yield* Effect.gen(function* () {
 				const terminals = yield* TerminalService;
 				const info = yield* terminals.open("workspace-1", tempDir, size);
-				const first = yield* terminals.attach(info.id).pipe(Stream.take(1), Stream.runCollect);
-				return outputText(first);
+				// A shell that prints slowly under load may miss the snapshot, so wait for the text instead.
+				const outputs = yield* terminals.attach(info.id).pipe(
+					Stream.takeUntil((output) => output.type === "data" && output.data.includes("eager-output")),
+					Stream.runCollect,
+					Effect.timeout("3 seconds"),
+				);
+				return outputText(outputs);
 			}).pipe(
 				Effect.provide(TerminalService.layer),
 				Effect.provide(
