@@ -770,6 +770,23 @@ describe("WorkspaceService.unarchive", () => {
 		]);
 	});
 
+	test("does not start a setup script on restore where none ran before", async () => {
+		const runs = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const projects = yield* ProjectService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* workspaces.archive(created.id, { force: false });
+				// The script was added after the workspace was made, as for a fork's pull request it was skipped.
+				yield* projects.updateScripts(project.id, { setupScript: "true", runScript: null });
+				yield* workspaces.unarchive(created.id);
+				return yield* workspaces.listScriptRuns(created.id);
+			}),
+		);
+		expect(runs).toEqual([]);
+	});
+
 	test("refuses when the branch is gone, and leaves the workspace archived", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

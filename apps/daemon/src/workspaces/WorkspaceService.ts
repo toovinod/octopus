@@ -460,8 +460,12 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							worktreePath: current.path,
 							branch: current.branch,
 						});
-						// Ignored files such as installed dependencies were not kept, so setup runs again.
-						setupRun = yield* newSetupRun(owner, workspaceId);
+						// Ignored files such as installed dependencies were not kept, so setup runs again. Only where it ran
+						// before: a fork's pull request never ran it, and restoring must not start it on that code either.
+						const setupBefore = yield* database.query((db) =>
+							db.$count(scriptRun, and(eq(scriptRun.workspaceId, workspaceId), eq(scriptRun.kind, "setup"))),
+						);
+						setupRun = setupBefore > 0 ? yield* newSetupRun(owner, workspaceId) : null;
 					}
 					const restored = yield* database.query((db) =>
 						db.transaction((tx) =>
