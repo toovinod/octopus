@@ -22,6 +22,7 @@ import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
+import { isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
@@ -177,7 +178,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.name,
 							baseBranch,
 							ownsBranch: true,
-							fromFork: false,
+							// A new branch from a fork's branch starts with the fork's code.
+							fromFork: yield* isForkBranch(owner.path, baseBranch),
 							add: (worktreePath: string) =>
 								createWorktree({ repositoryPath: owner.path, worktreePath, branch: input.name, baseBranch }),
 						};
@@ -187,7 +189,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.branch,
 							baseBranch: owner.defaultBranch,
 							ownsBranch: false,
-							fromFork: false,
+							fromFork: yield* isForkBranch(owner.path, input.branch),
 							add: (worktreePath: string) =>
 								addBranchWorktree({ repositoryPath: owner.path, worktreePath, branch: input.branch }),
 						};
@@ -263,6 +265,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					}
 					yield* makeWorktreesDir;
 					yield* plan.add(path);
+					if (plan.fromFork) yield* markForkBranch(owner.path, plan.branch);
 					row = {
 						...base,
 						name: plan.branch,

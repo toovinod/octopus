@@ -162,6 +162,40 @@ esac`,
 		expect(result.fromFork).toBe(true);
 	});
 
+	test("a fork's branch stays a fork after its workspace is archived, and so does a branch made from it", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const project = yield* addProject(tempDir);
+				const executable = yield* fakeGh(
+					tempDir,
+					`case "$1 $2" in
+"pr view") echo '{"headRefName":"main","baseRefName":"main","isCrossRepository":true}' ;;
+"pr checkout") git checkout -q -b "$5" ;;
+esac`,
+				);
+				const workspaces = yield* WorkspaceService;
+				const fork = yield* workspaces
+					.create({ kind: "pullRequest", projectId: project.id, number: 9 })
+					.pipe(Effect.provideService(GhSettings, { executable }));
+				yield* workspaces.archive(fork.id, { force: true });
+				const reused = yield* workspaces.create({ kind: "branch", projectId: project.id, branch: "pr-9-main" });
+				const derived = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "from-fork",
+					baseBranch: "pr-9-main",
+				});
+				const own = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "own" });
+				const rows = yield* Effect.flatMap(LocalDatabase, (database) =>
+					database.query((db) => db.select({ id: workspace.id, fromFork: workspace.fromFork }).from(workspace)),
+				);
+				const fromFork = (id: string) => rows.find((row) => row.id === id)?.fromFork;
+				return { reused: fromFork(reused.id), derived: fromFork(derived.id), own: fromFork(own.id) };
+			}),
+		);
+		expect(result).toEqual({ reused: true, derived: true, own: false });
+	});
+
 	test("removes the worktree when gh cannot check out the pull request", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
