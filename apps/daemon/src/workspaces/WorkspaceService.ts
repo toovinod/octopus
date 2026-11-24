@@ -18,6 +18,7 @@ import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contrac
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
+import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
 import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
@@ -435,6 +436,13 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						db.update(workspace).set({ status: "archived", archivedAt }).where(eq(workspace.id, workspaceId)),
 					);
 					yield* sessions.deleteWorkspaceAttachments(workspaceId);
+					// Checkpoints keep old copies of files alive in git, so they go with the workspace.
+					const { path: repository } = yield* projects
+						.get(current.projectId)
+						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
+					yield* deleteCheckpoints(repository, workspaceId).pipe(
+						Effect.catch((cause) => Effect.logWarning("Could not delete the workspace's checkpoints", cause)),
+					);
 					const runs = yield* listScriptRuns(workspaceId);
 					for (const run of runs) {
 						outputs.delete(run.id);

@@ -9,11 +9,12 @@ import {
 	PlugIcon,
 	TerminalIcon,
 	TriangleAlertIcon,
+	Undo2Icon,
 	WrenchIcon,
 	XIcon,
 } from "lucide-react";
 import type { ApprovalDecision, ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
-import { respondToApproval } from "../lib/store.ts";
+import { openDialog, respondToApproval } from "../lib/store.ts";
 import type { ChatItem } from "../lib/chatReducer.ts";
 import { callDaemon } from "../lib/daemonRuntime.ts";
 import { memo, useEffect, useRef, useState } from "react";
@@ -42,7 +43,7 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 	switch (item.kind) {
 		case "user":
 			return (
-				<div className="flex flex-col items-end gap-1.5">
+				<div className="group flex flex-col items-end gap-1.5">
 					{item.attachments.length === 0 ? null : (
 						<div className="flex flex-wrap justify-end gap-1.5">
 							{item.attachments.map((attachment) => (
@@ -53,6 +54,15 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 					{item.text === "" ? null : (
 						<div className="max-w-[85%] rounded-xl bg-muted px-3 py-2 whitespace-pre-wrap">{item.text}</div>
 					)}
+					<Button
+						variant="ghost"
+						size="xs"
+						className="text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+						onClick={() => openDialog({ kind: "revert", sessionId, messageId: item.messageId })}
+					>
+						<Undo2Icon />
+						Revert to here
+					</Button>
 				</div>
 			);
 		case "assistant":

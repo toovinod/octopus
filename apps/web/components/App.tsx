@@ -13,6 +13,7 @@ import { Button } from "@repo/ui/components/button";
 import { WorkspaceSettingsDialog } from "./WorkspaceSettingsDialog.tsx";
 import { NewWorkspaceDialog } from "./NewWorkspaceDialog.tsx";
 import { RemoveProjectDialog } from "./RemoveProjectDialog.tsx";
+import { RevertDialog } from "./RevertDialog.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
 import { CommandPalette } from "./CommandPalette.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
@@ -138,6 +139,7 @@ export const App = () => {
 				<NewProjectDialog />
 				<NewWorkspaceDialog />
 				<RemoveProjectDialog />
+				<RevertDialog />
 				<WorkspaceSettingsDialog />
 				<SettingsDialog />
 				<Toaster position="bottom-right" />

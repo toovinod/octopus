@@ -1,4 +1,5 @@
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
+import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
 import { MAX_FINISHED_OUTPUTS, WorkspaceService } from "./WorkspaceService.ts";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
@@ -11,6 +12,7 @@ import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { scriptRun, workspace } from "../database/schema.ts";
 import { LINE_MAX_LENGTH } from "./capLineLength.ts";
 import { describe, expect, test } from "bun:test";
+import { SecureRandom } from "effect/crypto";
 import { runGit } from "../git/runGit.ts";
 import { eq, sql } from "drizzle-orm";
 import { join } from "node:path";
@@ -135,6 +137,9 @@ describe("WorkspaceService", () => {
 					projectId: project.id,
 					name: "feature",
 				});
+				yield* saveCheckpoint(created.path, checkpointRef(created.id, "session", "message")).pipe(
+					Effect.provide(SecureRandom.layerWebCrypto),
+				);
 				const archived = yield* workspaces.archive(created.id, {
 					force: false,
 				});
@@ -142,6 +147,7 @@ describe("WorkspaceService", () => {
 					archived,
 					folderExists: yield* fs.exists(created.path),
 					branchExists: yield* branchExists(project.path, "feature"),
+					checkpoints: yield* runGit(project.path, ["for-each-ref", "refs/octopus/"]),
 				};
 			}),
 		);
@@ -149,6 +155,7 @@ describe("WorkspaceService", () => {
 		expect(result.archived.archivedAt).not.toBeNull();
 		expect(result.folderExists).toBe(false);
 		expect(result.branchExists).toBe(true);
+		expect(result.checkpoints).toBe("");
 	});
 
 	test("refuses to archive unsaved work, then stashes it with force", async () => {

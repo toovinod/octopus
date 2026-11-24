@@ -8,6 +8,7 @@ export type ChatItem =
 	| {
 			readonly kind: "user";
 			readonly key: string;
+			readonly messageId: string;
 			readonly text: string;
 			readonly attachments: ReadonlyArray<{ readonly id: string; readonly mediaType: string }>;
 	  }
@@ -91,7 +92,13 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 		}
 		switch (event.type) {
 			case "user.message":
-				put({ kind: "user", key: `user:${event.itemId}`, text: event.text, attachments: event.attachments });
+				put({
+					kind: "user",
+					key: `user:${event.itemId}`,
+					messageId: event.itemId,
+					text: event.text,
+					attachments: event.attachments,
+				});
 				break;
 			case "message.delta": {
 				const key = `message:${event.itemId}`;

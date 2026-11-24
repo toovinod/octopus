@@ -28,6 +28,7 @@ export type DialogState =
 	| { readonly kind: "newProject" }
 	| { readonly kind: "newWorkspace"; readonly projectId: string }
 	| { readonly kind: "removeProject"; readonly projectId: string }
+	| { readonly kind: "revert"; readonly sessionId: string; readonly messageId: string }
 	| { readonly kind: "settings"; readonly tab: "accounts" | "appearance" | "notifications" }
 	| { readonly kind: "workspaceSettings"; readonly workspaceId: string };
 
@@ -55,6 +56,8 @@ export interface AppState {
 	readonly attention: Readonly<Record<string, Attention>>;
 	// Keyed by session id, oldest first.
 	readonly failedSends: Readonly<Record<string, ReadonlyArray<FailedSend>>>;
+	// Keyed by workspace id: how many reverts rewrote its files, so views of them reload.
+	readonly reverts: Readonly<Record<string, number>>;
 	readonly selectedWorkspaceId: string | null;
 	readonly selectedSessionId: string | null;
 	// Only the visible chat's events are in memory.
@@ -73,6 +76,7 @@ let state: AppState = {
 	closedTabs: new Set(),
 	attention: {},
 	failedSends: {},
+	reverts: {},
 	selectedWorkspaceId: null,
 	selectedSessionId: null,
 	chat: null,
@@ -572,6 +576,22 @@ export const discardFailedSend = (sessionId: string, id: number) => {
 	if (failed === undefined) return;
 	releaseImages(failed.images);
 	setFailedSends(sessionId, (sends) => sends.filter((send) => send.id !== id));
+};
+
+export const previewRevert = (sessionId: string, messageId: string) =>
+	attempt(() => callDaemon((daemon) => daemon.previewRevert({ sessionId, messageId })));
+
+export const revertToMessage = async (sessionId: string, messageId: string) => {
+	const undone = await attempt(() => callDaemon((daemon) => daemon.revertToMessage({ sessionId, messageId })));
+	if (undone === null) return false;
+	toast(undone.length === 1 ? "Reverted 1 file." : `Reverted ${undone.length} files.`, "info");
+	const workspaceId = state.sessions[sessionId]?.workspaceId;
+	if (workspaceId !== undefined) {
+		setState((current) => ({
+			reverts: { ...current.reverts, [workspaceId]: (current.reverts[workspaceId] ?? 0) + 1 },
+		}));
+	}
+	return true;
 };
 
 export const interruptSession = (sessionId: string) =>

@@ -64,6 +64,7 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [toggled, setToggled] = useState<ReadonlyMap<string, boolean>>(new Map());
 	const mode = useAppState((current) => current.settings.diffMode);
 	const finished = useTurnsFinished(workspace.id);
+	const reverts = useAppState((current) => current.reverts[workspace.id] ?? 0);
 	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
 	const [picked, setPicked] = useState<LineRange | null>(null);
 
@@ -100,10 +101,10 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		setLoading(false);
 	}, [workspace.id]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: finished is the reload signal.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: finished and reverts are the reload signals.
 	useEffect(() => {
 		void load();
-	}, [load, finished]);
+	}, [load, finished, reverts]);
 
 	const loadFullFile = async (path: string) => {
 		const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
