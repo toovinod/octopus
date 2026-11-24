@@ -106,6 +106,19 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						};
 						continue;
 					}
+					if (text.includes("flood")) {
+						// With the four events above, these fill the session's 256-event buffer exactly, so the
+						// reader takes the result and then blocks delivering turn.completed.
+						for (let index = 0; index < 252; index++) {
+							yield {
+								type: "stream_event",
+								parent_tool_use_id: null,
+								event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "." } },
+							};
+						}
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("abort")) {
 						// The SDK aborts a permission request it no longer needs, for example when the turn ends.
 						const controller = new AbortController();
@@ -341,6 +354,22 @@ describe("ClaudeAdapter", () => {
 			},
 		]);
 		expect(permissions).toMatchObject([{ behavior: "deny", interrupt: true }]);
+	});
+
+	test("an interrupt that lands after a turn ended does not mark the next turn interrupted", async () => {
+		const results = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("flood"));
+				// Claude has sent its result, but the session is still delivering the turn's events.
+				yield* Effect.sleep("100 millis");
+				yield* handle.interrupt;
+				const first = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi again"));
+				const second = yield* takeUntil(handle, "turn.completed");
+				return [...first, ...second].flatMap((event) => (event.type === "turn.completed" ? [event.result] : []));
+			}),
+		);
+		expect(results).toEqual([{ status: "completed" }, { status: "completed" }]);
 	});
 
 	test("an aborted permission request resolves as cancelled, so the session stops awaiting it", async () => {
