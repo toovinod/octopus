@@ -1,6 +1,7 @@
 "use client";
 
 import {
+	BrainIcon,
 	CheckIcon,
 	ChevronRightIcon,
 	FileDiffIcon,
@@ -19,7 +20,8 @@ import { memo, useEffect, useRef, useState } from "react";
 import { ExternalLink } from "./ExternalLink.tsx";
 import { Predicate } from "effect";
 import { Button } from "@repo/ui/components/button";
-import Markdown, { type Components } from "react-markdown";
+import Markdown, { type Components, type ExtraProps } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { cn } from "@repo/ui/lib/utils";
 
 const DECISION_LABELS: Record<ApprovalDecision, string> = {
@@ -55,6 +57,8 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 			);
 		case "assistant":
 			return <AssistantMessage text={item.text} streaming={item.streaming} />;
+		case "reasoning":
+			return <ThinkingBlock text={item.text} streaming={item.streaming} />;
 		case "tool":
 			return <ToolCard item={item} />;
 		case "approval":
@@ -74,15 +78,67 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 	}
 });
 
+// Fenced code arrives as <pre><code class="language-x">, with the text as the code element's children.
+const fencedCode = (node: ExtraProps["node"]) => {
+	const code = node?.children[0];
+	if (code?.type !== "element" || code.tagName !== "code") return null;
+	const className = code.properties.className;
+	const language = Array.isArray(className)
+		? (className.find((name) => Predicate.isString(name) && name.startsWith("language-")) ?? "")
+		: "";
+	const text = code.children.map((child) => (child.type === "text" ? child.value : "")).join("");
+	return { language: String(language).slice("language-".length), text: text.replace(/\n$/, "") };
+};
+
 const markdownComponents: Components = {
 	a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+	pre: ({ node, children }) => {
+		const code = fencedCode(node);
+		return code === null ? <pre>{children}</pre> : <CodeBlock code={code.text} language={code.language} />;
+	},
 	// A remote image would load as soon as it renders, so a prompt-injected agent could leak data through its URL.
 	img: ({ src, alt }) => (Predicate.isString(src) ? <ExternalLink href={src}>{alt || src}</ExternalLink> : null),
 };
 
+const remarkPlugins = [remarkGfm];
+
+// Shows the plain code at once, then the highlighted version when Shiki has loaded and finished.
+const CodeBlock = ({ code, language }: { readonly code: string; readonly language: string }) => {
+	const [html, setHtml] = useState<string | null>(null);
+	useEffect(() => {
+		let live = true;
+		import("../lib/highlightCode.ts")
+			.then(({ highlightCode }) => highlightCode(code, language))
+			.then(
+				(highlighted) => {
+					if (live) setHtml(highlighted);
+				},
+				// Plain code is the fallback, and it is already on screen.
+				() => undefined,
+			);
+		return () => {
+			live = false;
+		};
+	}, [code, language]);
+	return html === null ? (
+		<pre>
+			<code>{code}</code>
+		</pre>
+	) : (
+		// Shiki escapes the code it renders, so its HTML holds no markup from the agent.
+		// biome-ignore lint/security/noDangerouslySetInnerHtml: Shiki output, see above.
+		<div dangerouslySetInnerHTML={{ __html: html }} />
+	);
+};
+
 const MarkdownText = memo(({ text }: { readonly text: string }) => (
-	<Markdown components={markdownComponents}>{text}</Markdown>
+	<Markdown components={markdownComponents} remarkPlugins={remarkPlugins}>
+		{text}
+	</Markdown>
 ));
+
+const PROSE =
+	"prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-headings:my-2 prose-headings:text-sm prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-a:text-running prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:font-normal prose-code:before:content-none prose-code:after:content-none prose-pre:my-2 prose-pre:border prose-pre:bg-sidebar prose-pre:text-foreground prose-table:my-2 prose-th:px-2 prose-td:px-2 [&_.contains-task-list]:list-none [&_.contains-task-list]:pl-1 [&_pre]:[tab-size:2] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_.shiki_span]:text-(--shiki-light) dark:[&_.shiki_span]:text-(--shiki-dark) [overflow-wrap:anywhere]";
 
 // How often a streaming message is parsed again. Parsing the whole message on every frame is the slowest part
 // of streaming a long reply.
@@ -107,8 +163,33 @@ const useThrottledText = (text: string) => {
 const AssistantMessage = ({ text, streaming }: { readonly text: string; readonly streaming: boolean }) => {
 	const throttled = useThrottledText(text);
 	return (
-		<div className="prose prose-sm max-w-none text-foreground dark:prose-invert prose-p:my-2 prose-headings:my-2 prose-headings:text-sm prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-a:text-running prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:font-normal prose-code:before:content-none prose-code:after:content-none prose-pre:my-2 prose-pre:border prose-pre:bg-sidebar prose-pre:text-foreground [&_pre_code]:bg-transparent [&_pre_code]:p-0 [overflow-wrap:anywhere]">
+		<div className={cn(PROSE, "text-foreground")}>
 			<MarkdownText text={streaming ? throttled : text} />
+		</div>
+	);
+};
+
+// Collapsed by default: the thinking is there for whoever wants it, and the reply stays the focus.
+const ThinkingBlock = ({ text, streaming }: { readonly text: string; readonly streaming: boolean }) => {
+	const [open, setOpen] = useState(false);
+	const throttled = useThrottledText(text);
+	return (
+		<div className="flex flex-col gap-1.5 text-xs text-muted-foreground">
+			<button
+				type="button"
+				onClick={() => setOpen(!open)}
+				className="flex items-center gap-1.5 self-start hover:text-foreground"
+				aria-expanded={open}
+			>
+				<BrainIcon className="size-3.5 shrink-0" />
+				<span className={cn(streaming && "animate-pulse")}>Thinking</span>
+				<ChevronRightIcon className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")} />
+			</button>
+			{open ? (
+				<div className={cn(PROSE, "border-l-2 border-border pl-3 text-xs text-muted-foreground")}>
+					<MarkdownText text={streaming ? throttled : text} />
+				</div>
+			) : null}
 		</div>
 	);
 };
