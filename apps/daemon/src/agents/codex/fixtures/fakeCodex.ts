@@ -24,11 +24,25 @@ const waiting = new Map<number, (answer: Answer) => void>();
 
 const notify = (method: string, params: object) => send({ method, params });
 
-const completeTurn = (status: string) =>
+const completeTurn = (status: string, error: object | null = null) =>
 	notify("turn/completed", {
 		threadId,
-		turn: { id: turnId, status, error: null, items: [] },
+		turn: { id: turnId, status, error, items: [] },
 	});
+
+// Failed turns, the way Codex reports them. All but "overloaded" are refused credentials.
+const failures: Record<string, object> = {
+	unauthorized: { message: "unexpected status 401 Unauthorized", codexErrorInfo: "unauthorized" },
+	"stream 401": {
+		message: "stream disconnected",
+		codexErrorInfo: { responseStreamConnectionFailed: { httpStatusCode: 401 } },
+	},
+	overloaded: { message: "Codex is overloaded", codexErrorInfo: "serverOverloaded" },
+	"log in": {
+		message: "Your access token could not be refreshed. Please log in again.",
+		codexErrorInfo: null,
+	},
+};
 
 const command = {
 	type: "commandExecution",
@@ -49,6 +63,8 @@ const runTurn = async (
 	text: string,
 	params: { model?: string; effort?: string | null; input: Array<{ type: string; path?: string }> },
 ) => {
+	const failure = failures[text];
+	if (failure !== undefined) return completeTurn("failed", { additionalDetails: null, ...failure });
 	if (text.includes("images")) {
 		notify("item/completed", {
 			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(params.input.slice(1)) },

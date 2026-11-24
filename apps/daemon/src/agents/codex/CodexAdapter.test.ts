@@ -208,6 +208,26 @@ describe("CodexAdapter", () => {
 		expect(second).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
+	test.each(["unauthorized", "stream 401", "log in"])(
+		"a refused credential (%s) ends the session with an auth error",
+		async (text) => {
+			const error = await runSession((handle) =>
+				handle.sendMessage(userMessage(text)).pipe(Effect.andThen(Effect.flip(Stream.runDrain(handle.events)))),
+			);
+			expect(error).toMatchObject({ _tag: "AgentAuthError", agent: "codex" });
+		},
+	);
+
+	test("a turn that fails for another reason keeps the session", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("overloaded"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toMatchObject({ result: { status: "failed", message: "Codex is overloaded" } });
+	});
+
 	test("a control request Codex never answers fails at its deadline", async () => {
 		const error = await runSession((handle) =>
 			Effect.gen(function* () {

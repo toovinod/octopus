@@ -1,5 +1,6 @@
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	AgentNotInstalledError,
 	AgentProtocolError,
 	type StartSessionInput,
@@ -717,6 +718,44 @@ describe("SessionService", () => {
 		expect(result.failed._tag).toBe("WorktreeRemoveError");
 		expect(result.status).toBe("active");
 		expect(result.served).toEqual(image);
+	});
+
+	test("a refused credential fails the session and says to fix the credential", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-auth");
+					return yield* session.start({
+						startTurn: () => session.fail(new AgentAuthError({ agent: "codex", cause: "401 Unauthorized" })),
+						steerTurn: () => Effect.void,
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+					});
+				}),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "first", [], false);
+					yield* waitForStatus(session.id, "failed");
+					return (yield* storedEvents(session.id)).at(-1)?.payload;
+				}),
+			),
+		);
+		expect(result).toEqual({
+			type: "error",
+			message:
+				"Codex refused its credential. Update the API key or sign in again in Settings, then send your message again.",
+			willRetry: false,
+		});
 	});
 
 	test("a steer the agent rejects leaves no message in history and no image on disk", async () => {

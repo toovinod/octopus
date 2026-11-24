@@ -106,6 +106,25 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						};
 						continue;
 					}
+					if (text.includes("bad key")) {
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							error: "authentication_failed",
+							message: { id: "msg_2", content: [{ type: "text", text: "Invalid API key · Please run /login" }] },
+						};
+						yield { type: "result", subtype: "success", is_error: true, uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("revoked")) {
+						yield {
+							type: "result",
+							subtype: "error_during_execution",
+							uuid: `result-${turn}`,
+							errors: ['API Error: 401 {"type":"error","error":{"type":"authentication_error"}}'],
+						};
+						continue;
+					}
 					if (text.includes("flood")) {
 						// With the four events above, these fill the session's 256-event buffer exactly, so the
 						// reader takes the result and then blocks delivering turn.completed.
@@ -409,6 +428,18 @@ describe("ClaudeAdapter", () => {
 		});
 		const { UNRELATED_SECRET: _, ...passed } = env;
 		expect(startedWith.at(-1)?.env).toEqual({ ...passed, ANTHROPIC_API_KEY: "sk-test" });
+	});
+
+	test.each(["bad key", "revoked"])("a refused credential (%s) ends the session with an auth error", async (text) => {
+		const error = await runSession((handle) =>
+			handle.sendMessage(userMessage(text)).pipe(Effect.andThen(Effect.flip(Stream.runDrain(handle.events)))),
+		);
+		expect(error).toMatchObject({
+			_tag: "AgentAuthError",
+			agent: "claude",
+			message:
+				"Claude Code refused its credential. Update the API key or sign in again in Settings, then send your message again.",
+		});
 	});
 
 	test("resumes an existing session", async () => {

@@ -95,7 +95,13 @@ export const TurnCompleted = Schema.Struct({
 	turn: Schema.Struct({
 		id: Schema.String,
 		status: Schema.Literals(["completed", "interrupted", "failed", "inProgress"]),
-		error: Schema.NullOr(Schema.Struct({ message: Schema.String })),
+		error: Schema.NullOr(
+			Schema.Struct({
+				message: Schema.String,
+				// A string or a tagged object, and Codex adds variants over time, so only the auth cases are read.
+				codexErrorInfo: Schema.optionalKey(Schema.NullOr(Schema.Unknown)),
+			}),
+		),
 	}),
 });
 

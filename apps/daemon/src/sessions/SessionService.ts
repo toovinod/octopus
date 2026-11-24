@@ -119,6 +119,9 @@ const toAvailability = (error: AgentError): AgentAvailability => {
 		case "AgentProcessError":
 		case "AgentProtocolError":
 			return { status: "unknown", message: error.message };
+		// The provider refused the stored key or sign-in, which the user fixes like a missing one.
+		case "AgentAuthError":
+			return { status: "loggedOut" };
 	}
 };
 
@@ -264,7 +267,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						Effect.annotateLogs({ sessionId: runtime.sessionId }),
 					);
 					const message =
-						error._tag === "AgentProcessError" || error._tag === "AgentProtocolError"
+						// An auth error's own message says to fix the credential, which the session cannot do itself.
+						error._tag === "AgentProcessError" || error._tag === "AgentProtocolError" || error._tag === "AgentAuthError"
 							? error.message
 							: toUnavailable(runtime.agent)(error).message;
 					yield* record(runtime, { type: "error", message, willRetry: false });

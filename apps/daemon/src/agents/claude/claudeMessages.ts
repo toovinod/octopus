@@ -75,6 +75,8 @@ export const ClaudeMessage = Schema.Union([
 	Schema.Struct({
 		type: Schema.Literal("assistant"),
 		parent_tool_use_id: parentToolUseId,
+		// The SDK's reason when the API call failed, such as "authentication_failed".
+		error: Schema.optionalKey(Schema.String),
 		message: Schema.Struct({
 			id: Schema.String,
 			model: Schema.optionalKey(Schema.String),
@@ -93,6 +95,8 @@ export const ClaudeMessage = Schema.Union([
 		type: Schema.Literal("result"),
 		subtype: Schema.String,
 		uuid: Schema.String,
+		is_error: Schema.optionalKey(Schema.Boolean),
+		result: Schema.optionalKey(Schema.String),
 		errors: Schema.optionalKey(Schema.Array(Schema.String)),
 		modelUsage: Schema.optionalKey(Schema.Record(Schema.String, Schema.Struct({ contextWindow: Schema.Int }))),
 	}),

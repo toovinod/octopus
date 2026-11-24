@@ -17,6 +17,7 @@ import {
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
@@ -28,7 +29,7 @@ import {
 } from "../AgentAdapter.ts";
 import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Ref, Scope, Stream } from "effect";
+import { Context, Effect, Exit, FiberHandle, Layer, Predicate, Ref, Scope, Stream } from "effect";
 import type { AgentCapabilities, AgentModel } from "@repo/contracts/AgentSession";
 import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
@@ -46,6 +47,7 @@ import packageJson from "../../../package.json" with { type: "json" };
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
+import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 
@@ -161,6 +163,16 @@ type TurnState =
 
 const idle: TurnState = { _tag: "idle" };
 
+// Codex names a refused credential "unauthorized", forwards an HTTP 401 inside another variant, or
+// only says so in the message, as when a ChatGPT sign-in can no longer be refreshed.
+const isAuthFailure = (error: { readonly message: string; readonly codexErrorInfo?: unknown }) =>
+	error.codexErrorInfo === "unauthorized" ||
+	(Predicate.isObject(error.codexErrorInfo) &&
+		Object.values(error.codexErrorInfo).some(
+			(detail) => Predicate.hasProperty(detail, "httpStatusCode") && detail.httpStatusCode === 401,
+		)) ||
+	isAuthFailureText(error.message);
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
 	currentTurn: Ref.Ref<TurnState>,
@@ -208,6 +220,9 @@ const handleNotification = Effect.fnUntraced(function* (
 		case "turn/completed": {
 			const { turn } = yield* decodeCodex(TurnCompleted)(params);
 			yield* Ref.set(currentTurn, idle);
+			if (turn.status === "failed" && turn.error !== null && isAuthFailure(turn.error)) {
+				return yield* new AgentAuthError({ agent: "codex", cause: turn.error });
+			}
 			return yield* session.emit({
 				type: "turn.completed",
 				turnId: turn.id,

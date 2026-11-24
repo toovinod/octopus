@@ -1,5 +1,6 @@
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	type AgentAuthStatus,
 	type AgentModels,
 	AgentNotInstalledError,
@@ -25,6 +26,7 @@ import { ProcessRegistry } from "../../processes/ProcessRegistry.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { spawnInProcessGroup } from "./spawnInProcessGroup.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
+import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
@@ -225,6 +227,9 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 			}
 			case "assistant": {
 				if (!("message" in message) || !("id" in message.message)) return;
+				if ("error" in message && message.error === "authentication_failed") {
+					return yield* new AgentAuthError({ agent: "claude", cause: message.error });
+				}
 				const { id, content, model, usage } = message.message;
 				if (usage !== undefined) {
 					const contextTokens =
@@ -279,6 +284,10 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 			}
 			case "result": {
 				if (!("uuid" in message)) return;
+				const failure = [...(message.errors ?? []), ...(message.is_error ? [message.result ?? ""] : [])].join("; ");
+				if (isAuthFailureText(failure)) {
+					return yield* new AgentAuthError({ agent: "claude", cause: failure });
+				}
 				const usage = yield* Ref.getAndSet(lastUsage, Option.none());
 				if (Option.isSome(usage)) {
 					yield* session.emit({
@@ -435,9 +444,10 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 						}),
 				);
 
-				yield* Stream.fromAsyncIterable(
-					run.messages,
-					(cause) => new AgentProcessError({ message: "Claude Code stopped.", cause }),
+				yield* Stream.fromAsyncIterable(run.messages, (cause) =>
+					isAuthFailureText(String(cause))
+						? new AgentAuthError({ agent: "claude", cause })
+						: new AgentProcessError({ message: "Claude Code stopped.", cause }),
 				).pipe(
 					Stream.mapEffect((message) =>
 						Schema.decodeUnknownEffect(ClaudeMessage)(message).pipe(
