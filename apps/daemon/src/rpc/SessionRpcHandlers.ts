@@ -40,6 +40,7 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 			setAgentAuthMode: ({ agent, mode }) =>
 				sessions.setAuthMode(agent, mode).pipe(orInternalError("save the sign-in choice")),
 			startAgentLogin: ({ agent }) => sessions.startLogin(agent).pipe(orInternalError("start the sign-in")),
+			watchAgentLogins: () => sessions.watchLogins,
 			updateSessionSettings: ({ sessionId, model, effort }) =>
 				sessions.updateSettings(sessionId, { model, effort }).pipe(orInternalError("change the model")),
 			getAttachment: ({ sessionId, attachmentId }) =>

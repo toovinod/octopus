@@ -1,11 +1,11 @@
-import type {
-	AgentAuthMode,
-	AgentCapabilities,
-	AgentInfo,
-	ImageMediaType,
+import {
+	type AgentAuthMode,
+	type AgentCapabilities,
+	type AgentInfo,
+	type ImageMediaType,
 	AgentKind,
-	ApprovalNotFoundError,
-	SessionBusyError,
+	type ApprovalNotFoundError,
+	type SessionBusyError,
 } from "@repo/contracts/AgentSession";
 import type { AgentEvent, ApprovalDecision } from "@repo/contracts/AgentEvent";
 import { type Effect, Schema, type Scope, type Stream } from "effect";
@@ -69,12 +69,29 @@ export class CodexVersionMismatchError extends Schema.TaggedError<CodexVersionMi
 	}
 }
 
+// Permanent: the provider refused the credential, a revoked or wrong API key or an expired sign-in.
+// Retrying cannot help, so the session stops and the user fixes the credential.
+export class AgentAuthError extends Schema.TaggedError<AgentAuthError>()("AgentAuthError", {
+	agent: AgentKind,
+	cause: Schema.Defect(),
+}) {
+	override get message() {
+		const name = this.agent === "claude" ? "Claude Code" : "Codex";
+		return `${name} refused its credential. Update the API key or sign in again in Settings, then send your message again.`;
+	}
+}
+
 export class ApprovalChoiceError extends Schema.TaggedError<ApprovalChoiceError>()("ApprovalChoiceError", {
 	requestId: Schema.String,
 	decision: Schema.String,
 }) {}
 
-export type AgentError = AgentProcessError | AgentNotInstalledError | AgentProtocolError | CodexVersionMismatchError;
+export type AgentError =
+	| AgentProcessError
+	| AgentNotInstalledError
+	| AgentProtocolError
+	| CodexVersionMismatchError
+	| AgentAuthError;
 
 type SendMessageError = AgentError | SessionBusyError;
 type ApprovalError = AgentError | ApprovalNotFoundError | ApprovalChoiceError;

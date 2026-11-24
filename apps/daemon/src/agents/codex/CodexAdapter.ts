@@ -6,6 +6,7 @@ import {
 	ErrorNotification,
 	FileChangeApprovalParams,
 	ItemNotification,
+	LoginCompleted,
 	LoginResponse,
 	ModelListResponse,
 	RateLimitsUpdated,
@@ -17,6 +18,7 @@ import {
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
@@ -28,7 +30,7 @@ import {
 } from "../AgentAdapter.ts";
 import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Option, Ref, Scope, Stream } from "effect";
+import { Context, Effect, Exit, FiberHandle, Layer, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { AgentCapabilities, AgentModel } from "@repo/contracts/AgentSession";
 import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
@@ -46,6 +48,7 @@ import packageJson from "../../../package.json" with { type: "json" };
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
+import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 
@@ -153,9 +156,27 @@ const describeWindow = (minutes: number) => {
 	return `${amount} ${unit}${amount === 1 ? "" : "s"}`;
 };
 
+// Codex names a turn only in its turn/start reply, and the turn may finish before that reply arrives.
+type TurnState =
+	| { readonly _tag: "idle" }
+	| { readonly _tag: "starting"; readonly interruptRequested: boolean }
+	| { readonly _tag: "running"; readonly turnId: string };
+
+const idle: TurnState = { _tag: "idle" };
+
+// Codex names a refused credential "unauthorized", forwards an HTTP 401 inside another variant, or
+// only says so in the message, as when a ChatGPT sign-in can no longer be refreshed.
+const isAuthFailure = (error: { readonly message: string; readonly codexErrorInfo?: unknown }) =>
+	error.codexErrorInfo === "unauthorized" ||
+	(Predicate.isObject(error.codexErrorInfo) &&
+		Object.values(error.codexErrorInfo).some(
+			(detail) => Predicate.hasProperty(detail, "httpStatusCode") && detail.httpStatusCode === 401,
+		)) ||
+	isAuthFailureText(error.message);
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
-	currentTurn: Ref.Ref<Option.Option<string>>,
+	currentTurn: Ref.Ref<TurnState>,
 	method: string,
 	params: unknown,
 ) {
@@ -199,7 +220,10 @@ const handleNotification = Effect.fnUntraced(function* (
 		}
 		case "turn/completed": {
 			const { turn } = yield* decodeCodex(TurnCompleted)(params);
-			yield* Ref.set(currentTurn, Option.none());
+			yield* Ref.set(currentTurn, idle);
+			if (turn.status === "failed" && turn.error !== null && isAuthFailure(turn.error)) {
+				return yield* new AgentAuthError({ agent: "codex", cause: turn.error });
+			}
 			return yield* session.emit({
 				type: "turn.completed",
 				turnId: turn.id,
@@ -302,6 +326,8 @@ const handleServerRequest = Effect.fnUntraced(function* (
 export interface CodexAgentAdapter extends AgentAdapter {
 	// Returns the URL to open. Codex stores the tokens itself when the user finishes.
 	readonly startLogin: Effect.Effect<string, AgentError>;
+	// How each sign-in ended, so the daemon can refresh the account and its models without being asked.
+	readonly loginResults: Stream.Stream<LoginCompleted>;
 }
 
 // Codex waits on its local callback server until the user finishes in the browser.
@@ -317,6 +343,8 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 			const provide = Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner);
 			// Holds the sign-in waiting for the browser. A new sign-in replaces it and stops its app-server.
 			const pendingLogin = yield* FiberHandle.make();
+			const loginResults = yield* PubSub.unbounded<LoginCompleted>();
+			yield* Effect.addFinalizer(() => PubSub.shutdown(loginResults));
 
 			// A short-lived app-server for questions outside a session. Closing the scope stops it.
 			const connect = Effect.gen(function* () {
@@ -388,10 +416,17 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				);
 				// The app-server must outlive this call, or the browser sign-in has nothing to return to.
 				yield* login.client.incoming.pipe(
-					Stream.takeUntil(
-						(message) => message._tag === "notification" && message.method === "account/login/completed",
+					Stream.filter((message) => message._tag === "notification" && message.method === "account/login/completed"),
+					Stream.take(1),
+					Stream.mapEffect((message) => decodeCodex(LoginCompleted)(message.params)),
+					Stream.runForEach((result) =>
+						Effect.gen(function* () {
+							if (!result.success) {
+								yield* Effect.logWarning("Codex sign-in failed").pipe(Effect.annotateLogs({ error: result.error }));
+							}
+							yield* PubSub.publish(loginResults, result);
+						}),
 					),
-					Stream.runDrain,
 					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.catch((error) => Effect.logWarning("Codex sign-in stopped", error)),
 					Effect.ensuring(Scope.close(scope, Exit.void)),
@@ -404,7 +439,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
-				const currentTurn = yield* Ref.make(Option.none<string>());
+				const currentTurn = yield* Ref.make(idle);
 				// Sent with every turn, so a change applies from the next one.
 				const settings = yield* Ref.make<SessionSettings>({ model: input.model, effort: input.effort });
 				const client = yield* makeCodexRpcClient(
@@ -451,11 +486,18 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					...images.map(({ path }) => ({ type: "localImage" as const, path })),
 				];
 
+				const interrupt = (turnId: string) =>
+					Effect.gen(function* () {
+						const threadId = yield* session.nativeSessionId;
+						yield* client.request("turn/interrupt", { threadId, turnId } satisfies TurnInterruptParams);
+					});
+
 				return yield* session.start({
 					startTurn: (message) =>
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
 							const { model, effort } = yield* Ref.get(settings);
+							yield* Ref.set(currentTurn, { _tag: "starting", interruptRequested: false });
 							const { turn } = yield* client
 								.request("turn/start", {
 									threadId,
@@ -463,14 +505,22 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 									effort,
 									input: toInput(message),
 								} satisfies TurnStartParams)
-								.pipe(Effect.flatMap(decodeCodex(TurnResponse)));
-							yield* Ref.set(currentTurn, Option.some(turn.id));
+								.pipe(
+									Effect.flatMap(decodeCodex(TurnResponse)),
+									Effect.onError(() => Ref.set(currentTurn, idle)),
+								);
+							// A turn that already finished stays idle, so its id is never reused.
+							const before = yield* Ref.getAndUpdate(
+								currentTurn,
+								(state): TurnState => (state._tag === "starting" ? { _tag: "running", turnId: turn.id } : state),
+							);
+							if (before._tag === "starting" && before.interruptRequested) yield* interrupt(turn.id);
 						}),
 					steerTurn: (message) =>
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
-							const turnId = yield* Ref.get(currentTurn);
-							if (Option.isNone(turnId)) {
+							const state = yield* Ref.get(currentTurn);
+							if (state._tag !== "running") {
 								return yield* new AgentProtocolError({
 									message: "Codex has not started the turn yet, so it cannot be steered.",
 									cause: null,
@@ -479,18 +529,16 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							yield* client.request("turn/steer", {
 								threadId,
 								input: toInput(message),
-								expectedTurnId: turnId.value,
+								expectedTurnId: state.turnId,
 							} satisfies TurnSteerParams);
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
+					// Before Codex names the turn, the interrupt waits for the name.
 					interruptTurn: Effect.gen(function* () {
-						const threadId = yield* session.nativeSessionId;
-						const turnId = yield* Ref.get(currentTurn);
-						if (Option.isNone(turnId)) return;
-						yield* client.request("turn/interrupt", {
-							threadId,
-							turnId: turnId.value,
-						} satisfies TurnInterruptParams);
+						const state = yield* Ref.getAndUpdate(currentTurn, (state) =>
+							state._tag === "starting" ? { ...state, interruptRequested: true } : state,
+						);
+						if (state._tag === "running") yield* interrupt(state.turnId);
 					}),
 				});
 			}, provide);
@@ -502,6 +550,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				checkAuth,
 				listModels,
 				startLogin,
+				loginResults: Stream.fromPubSub(loginResults),
 				startSession,
 			});
 		}),

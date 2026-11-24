@@ -1,5 +1,6 @@
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	type AgentAuthStatus,
 	type AgentModels,
 	AgentNotInstalledError,
@@ -25,6 +26,7 @@ import { ProcessRegistry } from "../../processes/ProcessRegistry.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { spawnInProcessGroup } from "./spawnInProcessGroup.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
+import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
@@ -75,7 +77,30 @@ const models: AgentModels = {
 
 // The SDK replaces the whole child environment when `env` is set, so API key mode passes
 // these through explicitly. Subscription mode leaves `env` unset and inherits everything.
-const inheritedVariables = ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "TERM"];
+// Proxies and extra CA certificates keep claude working on corporate networks, and the config
+// folders keep it reading the user's own settings.
+const inheritedVariables = [
+	"PATH",
+	"HOME",
+	"USER",
+	"SHELL",
+	"TMPDIR",
+	"LANG",
+	"TERM",
+	"HTTPS_PROXY",
+	"HTTP_PROXY",
+	"NO_PROXY",
+	"https_proxy",
+	"http_proxy",
+	"no_proxy",
+	"NODE_EXTRA_CA_CERTS",
+	"CLAUDE_CONFIG_DIR",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_RUNTIME_DIR",
+];
 
 const apiKeyEnvironment = Effect.fnUntraced(function* (apiKey: Redacted.Redacted<string>) {
 	const env: Record<string, string> = {};
@@ -202,6 +227,9 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 			}
 			case "assistant": {
 				if (!("message" in message) || !("id" in message.message)) return;
+				if ("error" in message && message.error === "authentication_failed") {
+					return yield* new AgentAuthError({ agent: "claude", cause: message.error });
+				}
 				const { id, content, model, usage } = message.message;
 				if (usage !== undefined) {
 					const contextTokens =
@@ -256,6 +284,10 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 			}
 			case "result": {
 				if (!("uuid" in message)) return;
+				const failure = [...(message.errors ?? []), ...(message.is_error ? [message.result ?? ""] : [])].join("; ");
+				if (isAuthFailureText(failure)) {
+					return yield* new AgentAuthError({ agent: "claude", cause: failure });
+				}
 				const usage = yield* Ref.getAndSet(lastUsage, Option.none());
 				if (Option.isSome(usage)) {
 					yield* session.emit({
@@ -359,7 +391,13 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 								},
 								(outcome) => Deferred.succeed(answered, outcome),
 							);
-							const outcome = yield* Deferred.await(answered);
+							// The SDK aborts a request it no longer needs. Withdraw it, or the session waits on it forever.
+							const withdraw = () => Effect.runForkWith(context)(session.cancelApproval(request.toolUseID));
+							if (request.signal.aborted) withdraw();
+							request.signal.addEventListener("abort", withdraw, { once: true });
+							const outcome = yield* Deferred.await(answered).pipe(
+								Effect.ensuring(Effect.sync(() => request.signal.removeEventListener("abort", withdraw))),
+							);
 							return toPermissionResult(outcome, toolInput, suggestions);
 						}),
 					);
@@ -406,9 +444,10 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 						}),
 				);
 
-				yield* Stream.fromAsyncIterable(
-					run.messages,
-					(cause) => new AgentProcessError({ message: "Claude Code stopped.", cause }),
+				yield* Stream.fromAsyncIterable(run.messages, (cause) =>
+					isAuthFailureText(String(cause))
+						? new AgentAuthError({ agent: "claude", cause })
+						: new AgentProcessError({ message: "Claude Code stopped.", cause }),
 				).pipe(
 					Stream.mapEffect((message) =>
 						Schema.decodeUnknownEffect(ClaudeMessage)(message).pipe(
@@ -449,7 +488,8 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 					);
 
 				return yield* session.start({
-					startTurn: sendMessage,
+					// An interrupt that arrived after the last turn's result must not mark this one.
+					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
 					steerTurn: sendMessage,
 					updateSettings: ({ model, effort }) =>
 						Effect.tryPromise({

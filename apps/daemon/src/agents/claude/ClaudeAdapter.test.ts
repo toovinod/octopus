@@ -8,12 +8,12 @@ import type {
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { ConfigProvider, Effect, Layer, Redacted, Stream } from "effect";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
-import { Effect, Layer, Stream } from "effect";
 
 const newSession: StartSessionInput = {
 	cwd: "/repo",
@@ -106,6 +106,53 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						};
 						continue;
 					}
+					if (text.includes("bad key")) {
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							error: "authentication_failed",
+							message: { id: "msg_2", content: [{ type: "text", text: "Invalid API key · Please run /login" }] },
+						};
+						yield { type: "result", subtype: "success", is_error: true, uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("revoked")) {
+						yield {
+							type: "result",
+							subtype: "error_during_execution",
+							uuid: `result-${turn}`,
+							errors: ['API Error: 401 {"type":"error","error":{"type":"authentication_error"}}'],
+						};
+						continue;
+					}
+					if (text.includes("flood")) {
+						// With the four events above, these fill the session's 256-event buffer exactly, so the
+						// reader takes the result and then blocks delivering turn.completed.
+						for (let index = 0; index < 252; index++) {
+							yield {
+								type: "stream_event",
+								parent_tool_use_id: null,
+								event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "." } },
+							};
+						}
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("abort")) {
+						// The SDK aborts a permission request it no longer needs, for example when the turn ends.
+						const controller = new AbortController();
+						const permission = options.canUseTool?.(
+							"Bash",
+							{ command: "bun test" },
+							{ signal: controller.signal, toolUseID: "toolu_2", requestId: "req_2" },
+						);
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						controller.abort();
+						const result = await permission;
+						if (result) permissions.push(result);
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("approve")) {
 						const input = { command: "bun test" };
 						yield {
@@ -189,13 +236,14 @@ const runSession = <A, E>(
 	options: {
 		input?: StartSessionInput;
 		permissions?: Array<PermissionResult>;
+		configProvider?: ConfigProvider.ConfigProvider;
 	} = {},
 ) =>
 	runWithClaude(
 		Effect.gen(function* () {
 			const claude = yield* ClaudeAdapter;
 			return yield* program(yield* claude.startSession(options.input ?? newSession));
-		}).pipe(Effect.scoped),
+		}).pipe(Effect.scoped, Effect.provide(ConfigProvider.layer(options.configProvider ?? ConfigProvider.fromEnv()))),
 		options.permissions,
 	);
 
@@ -326,6 +374,72 @@ describe("ClaudeAdapter", () => {
 			},
 		]);
 		expect(permissions).toMatchObject([{ behavior: "deny", interrupt: true }]);
+	});
+
+	test("an interrupt that lands after a turn ended does not mark the next turn interrupted", async () => {
+		const results = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("flood"));
+				// Claude has sent its result, but the session is still delivering the turn's events.
+				yield* Effect.sleep("100 millis");
+				yield* handle.interrupt;
+				const first = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi again"));
+				const second = yield* takeUntil(handle, "turn.completed");
+				return [...first, ...second].flatMap((event) => (event.type === "turn.completed" ? [event.result] : []));
+			}),
+		);
+		expect(results).toEqual([{ status: "completed" }, { status: "completed" }]);
+	});
+
+	test("an aborted permission request resolves as cancelled, so the session stops awaiting it", async () => {
+		const permissions: Array<PermissionResult> = [];
+		const [events, error] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("abort"));
+					const events = yield* takeUntil(handle, "turn.completed");
+					return [events, yield* Effect.flip(handle.respondToApproval("toolu_2", "allowOnce"))] as const;
+				}),
+			{ permissions },
+		);
+		expect(events.filter((event) => event.type.startsWith("approval."))).toEqual([
+			expect.objectContaining({ type: "approval.requested", requestId: "toolu_2" }),
+			{ type: "approval.resolved", requestId: "toolu_2", outcome: "cancelled" },
+		]);
+		expect(error._tag).toBe("ApprovalNotFoundError");
+		expect(permissions).toMatchObject([{ behavior: "deny" }]);
+	});
+
+	test("API key mode passes proxy, certificate and config folder variables to claude", async () => {
+		const env = {
+			PATH: "/bin",
+			HTTPS_PROXY: "http://proxy:8080",
+			HTTP_PROXY: "http://proxy:8080",
+			NO_PROXY: "localhost",
+			NODE_EXTRA_CA_CERTS: "/certs/corp.pem",
+			CLAUDE_CONFIG_DIR: "/home/dev/.claude-work",
+			XDG_CONFIG_HOME: "/home/dev/.config",
+			UNRELATED_SECRET: "keep out",
+		};
+		await runSession(() => Effect.void, {
+			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
+			configProvider: ConfigProvider.fromEnv({ env }),
+		});
+		const { UNRELATED_SECRET: _, ...passed } = env;
+		expect(startedWith.at(-1)?.env).toEqual({ ...passed, ANTHROPIC_API_KEY: "sk-test" });
+	});
+
+	test.each(["bad key", "revoked"])("a refused credential (%s) ends the session with an auth error", async (text) => {
+		const error = await runSession((handle) =>
+			handle.sendMessage(userMessage(text)).pipe(Effect.andThen(Effect.flip(Stream.runDrain(handle.events)))),
+		);
+		expect(error).toMatchObject({
+			_tag: "AgentAuthError",
+			agent: "claude",
+			message:
+				"Claude Code refused its credential. Update the API key or sign in again in Settings, then send your message again.",
+		});
 	});
 
 	test("resumes an existing session", async () => {

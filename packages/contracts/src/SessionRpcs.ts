@@ -2,6 +2,7 @@ import {
 	AgentAuthMode,
 	AgentInfo,
 	AgentKind,
+	AgentLoginResult,
 	AttachmentNotFoundError,
 	AuthModeNotAllowedError,
 	ImageData,
@@ -45,6 +46,11 @@ export class SessionRpcs extends RpcGroup.make(
 		payload: { agent: AgentKind },
 		success: Schema.Struct({ authUrl: Schema.String }),
 		error: Schema.Union([AuthModeNotAllowedError, DaemonInternalError]),
+	}),
+	// How each sign-in from startAgentLogin ended, as it ends, so the client can refresh the agents without asking.
+	Rpc.make("watchAgentLogins", {
+		success: AgentLoginResult,
+		stream: true,
 	}),
 	// The agent process starts on the first message.
 	Rpc.make("createSession", {

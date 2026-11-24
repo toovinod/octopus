@@ -4,7 +4,7 @@ import { memoryCredentialStore } from "./memoryCredentialStore.ts";
 import { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import type { AgentAdapter } from "../agents/AgentAdapter.ts";
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Layer, Schema, Stream } from "effect";
 
 export const commandWithApproval = Schema.decodeUnknownSync(Recording)(recordingJson);
 
@@ -19,6 +19,10 @@ export const testAgentServices = (
 ) =>
 	Layer.mergeAll(
 		Layer.succeed(ClaudeAdapter, adapters.claude),
-		Layer.succeed(CodexAdapter, { startLogin: Effect.succeed(TEST_LOGIN_URL), ...adapters.codex }),
+		Layer.succeed(CodexAdapter, {
+			startLogin: Effect.succeed(TEST_LOGIN_URL),
+			loginResults: Stream.empty,
+			...adapters.codex,
+		}),
 		memoryCredentialStore,
 	);

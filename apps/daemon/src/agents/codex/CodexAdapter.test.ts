@@ -4,9 +4,9 @@ import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
+import { Duration, Effect, Fiber, Stream } from "effect";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
-import { Duration, Effect, Stream } from "effect";
 
 const fakeCodex = `${import.meta.dir}/fixtures/fakeCodex.ts`;
 const newSession: StartSessionInput = {
@@ -53,6 +53,23 @@ describe("CodexAdapter", () => {
 	test("starts the ChatGPT sign-in and returns its URL", async () => {
 		const url = await runWithCodex(Effect.flatMap(CodexAdapter, (codex) => codex.startLogin));
 		expect(url).toBe("https://auth.example/login");
+	});
+
+	test.each([
+		["fakeCodex.ts", { success: true, error: null }],
+		["failedLoginCodex.ts", { success: false, error: "The sign-in was cancelled." }],
+	])("reports how the ChatGPT sign-in through %s ended", async (fixture, expected) => {
+		const result = await runWithCodex(
+			Effect.gen(function* () {
+				const codex = yield* CodexAdapter;
+				const results = yield* codex.loginResults.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+				yield* Effect.yieldNow;
+				yield* codex.startLogin;
+				return yield* Fiber.join(results);
+			}),
+			`${import.meta.dir}/fixtures/${fixture}`,
+		);
+		expect(result).toEqual([expected]);
 	});
 
 	test("lists models from every model/list page", async () => {
@@ -158,6 +175,74 @@ describe("CodexAdapter", () => {
 				result: { status: "interrupted" },
 			},
 		]);
+	});
+
+	test("an interrupt sent before Codex names the turn stops it once the name arrives", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } });
+	});
+
+	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("early"));
+				yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "interrupted" } });
+	});
+
+	test("a turn/start Codex never answers fails that turn and keeps the session", async () => {
+		const [first, second] = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("hang"));
+				const first = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				const second = yield* takeUntil(handle, "turn.completed");
+				return [first.at(-1), second.at(-1)];
+			}).pipe(Effect.scoped, Effect.provideService(CodexRequestSettings, { timeout: Duration.millis(300) })),
+		);
+		expect(first).toEqual({
+			type: "turn.completed",
+			turnId: "notStarted",
+			result: {
+				status: "failed",
+				message: "Codex did not answer turn/start in time. Try again, and stop the chat if it keeps happening.",
+			},
+		});
+		expect(second).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	test.each(["unauthorized", "stream 401", "log in"])(
+		"a refused credential (%s) ends the session with an auth error",
+		async (text) => {
+			const error = await runSession((handle) =>
+				handle.sendMessage(userMessage(text)).pipe(Effect.andThen(Effect.flip(Stream.runDrain(handle.events)))),
+			);
+			expect(error).toMatchObject({ _tag: "AgentAuthError", agent: "codex" });
+		},
+	);
+
+	test("a turn that fails for another reason keeps the session", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("overloaded"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toMatchObject({ result: { status: "failed", message: "Codex is overloaded" } });
 	});
 
 	test("a control request Codex never answers fails at its deadline", async () => {

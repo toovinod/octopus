@@ -17,16 +17,32 @@ const send = (message: object) => {
 };
 
 const threadId = "thread-new";
-const turnId = "turn-1";
+let turns = 0;
+let turnId = "";
+let interrupted = false;
 const waiting = new Map<number, (answer: Answer) => void>();
 
 const notify = (method: string, params: object) => send({ method, params });
 
-const completeTurn = (status: string) =>
+const completeTurn = (status: string, error: object | null = null) =>
 	notify("turn/completed", {
 		threadId,
-		turn: { id: turnId, status, error: null, items: [] },
+		turn: { id: turnId, status, error, items: [] },
 	});
+
+// Failed turns, the way Codex reports them. All but "overloaded" are refused credentials.
+const failures: Record<string, object> = {
+	unauthorized: { message: "unexpected status 401 Unauthorized", codexErrorInfo: "unauthorized" },
+	"stream 401": {
+		message: "stream disconnected",
+		codexErrorInfo: { responseStreamConnectionFailed: { httpStatusCode: 401 } },
+	},
+	overloaded: { message: "Codex is overloaded", codexErrorInfo: "serverOverloaded" },
+	"log in": {
+		message: "Your access token could not be refreshed. Please log in again.",
+		codexErrorInfo: null,
+	},
+};
 
 const command = {
 	type: "commandExecution",
@@ -47,6 +63,8 @@ const runTurn = async (
 	text: string,
 	params: { model?: string; effort?: string | null; input: Array<{ type: string; path?: string }> },
 ) => {
+	const failure = failures[text];
+	if (failure !== undefined) return completeTurn("failed", { additionalDetails: null, ...failure });
 	if (text.includes("images")) {
 		notify("item/completed", {
 			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(params.input.slice(1)) },
@@ -186,7 +204,16 @@ const serve = async () => {
 					id: message.id,
 					result: { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.example/login" },
 				});
-				setTimeout(() => notify("account/login/completed", { loginId: "login-1", success: true, error: null }), 50);
+				setTimeout(
+					() =>
+						notify(
+							"account/login/completed",
+							Bun.argv[1]?.endsWith("failedLoginCodex.ts")
+								? { loginId: "login-1", success: false, error: "The sign-in was cancelled." }
+								: { loginId: "login-1", success: true, error: null },
+						),
+					50,
+				);
 				break;
 			case "model/list":
 				send({
@@ -240,11 +267,34 @@ const serve = async () => {
 					result: { thread: { id: message.params.threadId } },
 				});
 				break;
-			case "turn/start":
-				send({ id: message.id, result: { turn: { id: turnId } } });
-				void runTurn(message.params.input[0].text, message.params);
+			case "turn/start": {
+				turnId = `turn-${++turns}`;
+				interrupted = false;
+				const text: string = message.params.input[0].text;
+				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
+				// Never answered, like a hung app-server.
+				if (text.includes("hang")) break;
+				if (text.includes("early")) {
+					// The turn can finish before Codex answers turn/start.
+					completeTurn("completed");
+					reply();
+					break;
+				}
+				if (text.includes("slow")) {
+					setTimeout(reply, 200);
+					setTimeout(() => interrupted || completeTurn("completed"), 400);
+					break;
+				}
+				reply();
+				void runTurn(text, message.params);
 				break;
+			}
 			case "turn/interrupt":
+				if (message.params.turnId !== turnId) {
+					send({ id: message.id, error: { code: -32602, message: `no running turn ${message.params.turnId}` } });
+					break;
+				}
+				interrupted = true;
 				send({ id: message.id, result: {} });
 				completeTurn("interrupted");
 				break;

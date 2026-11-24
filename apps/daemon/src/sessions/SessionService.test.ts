@@ -1,5 +1,6 @@
 import {
 	type AgentAdapter,
+	AgentAuthError,
 	AgentNotInstalledError,
 	AgentProtocolError,
 	type StartSessionInput,
@@ -760,6 +761,44 @@ describe("SessionService", () => {
 		expect(result.served).toEqual(image);
 	});
 
+	test("a refused credential fails the session and says to fix the credential", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-auth");
+					return yield* session.start({
+						startTurn: () => session.fail(new AgentAuthError({ agent: "codex", cause: "401 Unauthorized" })),
+						steerTurn: () => Effect.void,
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+					});
+				}),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "first", [], false);
+					yield* waitForStatus(session.id, "failed");
+					return (yield* storedEvents(session.id)).at(-1)?.payload;
+				}),
+			),
+		);
+		expect(result).toEqual({
+			type: "error",
+			message:
+				"Codex refused its credential. Update the API key or sign in again in Settings, then send your message again.",
+			willRetry: false,
+		});
+	});
+
 	test("a steer the agent rejects leaves no message in history and no image on disk", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
 		// A turn that keeps running, so the next message steers, and an agent that rejects every steer.
@@ -1040,6 +1079,43 @@ describe("SessionService", () => {
 			)(Effect.flatMap(SessionService, (sessions) => Effect.repeat(sessions.listAgents, { times: 2 }))),
 		);
 		expect(calls).toBe(1);
+	});
+
+	test("a finished Codex sign-in reaches watchers and fetches the models again", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		let calls = 0;
+		const logins = Effect.runSync(Queue.unbounded<{ success: boolean; error: string | null }>());
+		const codex = {
+			...replay,
+			listModels: Effect.andThen(
+				Effect.sync(() => calls++),
+				replay.listModels,
+			),
+			loginResults: Stream.fromQueue(logins),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					yield* sessions.listAgents;
+					const watched = yield* sessions.watchLogins.pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+					yield* Effect.sleep("20 millis");
+					yield* Queue.offer(logins, { success: false, error: "The sign-in was cancelled." });
+					yield* Queue.offer(logins, { success: true, error: null });
+					const results = yield* Fiber.join(watched);
+					yield* sessions.listAgents;
+					return { results, calls };
+				}),
+			),
+		);
+		expect(result.results).toEqual([
+			{ agent: "codex", success: false },
+			{ agent: "codex", success: true },
+		]);
+		expect(result.calls).toBe(2);
 	});
 
 	test("asks for an agent's models again after its sign-in changes", async () => {
