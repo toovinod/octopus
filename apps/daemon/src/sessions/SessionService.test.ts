@@ -652,6 +652,47 @@ describe("SessionService", () => {
 		expect(result.message._tag).toBe("WorkspaceArchivedError");
 	});
 
+	test("a forced archive keeps files an agent writes while it is being stopped", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		// An agent that saves one last file when it is interrupted, after the archive checked the folder.
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: (input) =>
+				Effect.map(replay.startSession(input), (handle) => ({
+					...handle,
+					interrupt: Effect.promise(() => Bun.write(join(input.cwd, "late.txt"), "late")).pipe(
+						Effect.andThen(handle.interrupt),
+					),
+				})),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const workspaces = yield* WorkspaceService;
+					const inPlace = yield* addWorkspace(tempDir);
+					const workspace = yield* workspaces.create({ kind: "worktree", projectId: inPlace.projectId, name: "late" });
+					const session = yield* sessions.create({
+						workspaceId: workspace.id,
+						agent: "codex",
+						model: "replay",
+						effort: null,
+					});
+					yield* sessions.sendMessage(session.id, "run the tests", [], false);
+					yield* waitForStatus(session.id, "awaitingApproval");
+					const archived = yield* workspaces.archive(workspace.id, { force: true });
+					const stashes = yield* runGit(join(tempDir, "repo"), ["stash", "list"]);
+					return { status: archived.status, stashes };
+				}),
+			),
+		);
+		expect(result.status).toBe("archived");
+		expect(result.stashes).toContain("octopus-archive/");
+	});
+
 	test("stores sent images privately, records only their ids, and deletes them on archive", async () => {
 		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
 		const result = await runServiceTest((tempDir) =>

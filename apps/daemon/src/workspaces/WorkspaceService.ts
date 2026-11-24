@@ -302,15 +302,22 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							.get(current.projectId)
 							.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
 						if (yield* fs.exists(current.path).pipe(Effect.orDie)) {
-							const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
-							const hasUnsaved = unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0;
-							if (hasUnsaved && !options.force) {
-								return yield* new WorkspaceHasUnsavedWorkError({
-									workspaceId,
-									...unsaved,
-								});
-							}
+							const refuseUnsaved = Effect.fnUntraced(function* () {
+								const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
+								const hasUnsaved = unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0;
+								if (hasUnsaved && !options.force) {
+									return yield* new WorkspaceHasUnsavedWorkError({
+										workspaceId,
+										...unsaved,
+									});
+								}
+								return unsaved;
+							});
+							// Checked before stopping, so a refused archive leaves the agents running.
+							yield* refuseUnsaved();
 							yield* stopWorkspaceProcesses(workspaceId);
+							// And again after: agents and scripts can write files until they stop.
+							const unsaved = yield* refuseUnsaved();
 							yield* removeWorktree({
 								repositoryPath: owner.path,
 								worktreePath: current.path,
