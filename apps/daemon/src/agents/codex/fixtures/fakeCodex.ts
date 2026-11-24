@@ -247,6 +247,8 @@ const serve = async () => {
 				interrupted = false;
 				const text: string = message.params.input[0].text;
 				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
+				// Never answered, like a hung app-server.
+				if (text.includes("hang")) break;
 				if (text.includes("early")) {
 					// The turn can finish before Codex answers turn/start.
 					completeTurn("completed");

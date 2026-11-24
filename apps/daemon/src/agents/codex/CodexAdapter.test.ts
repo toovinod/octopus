@@ -186,6 +186,28 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "interrupted" } });
 	});
 
+	test("a turn/start Codex never answers fails that turn and keeps the session", async () => {
+		const [first, second] = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("hang"));
+				const first = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				const second = yield* takeUntil(handle, "turn.completed");
+				return [first.at(-1), second.at(-1)];
+			}).pipe(Effect.scoped, Effect.provideService(CodexRequestSettings, { timeout: Duration.millis(300) })),
+		);
+		expect(first).toEqual({
+			type: "turn.completed",
+			turnId: "notStarted",
+			result: {
+				status: "failed",
+				message: "Codex did not answer turn/start in time. Try again, and stop the chat if it keeps happening.",
+			},
+		});
+		expect(second).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
 	test("a control request Codex never answers fails at its deadline", async () => {
 		const error = await runSession((handle) =>
 			Effect.gen(function* () {

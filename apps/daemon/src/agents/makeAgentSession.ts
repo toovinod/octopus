@@ -86,22 +86,20 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 		Effect.forEach([...approvals.keys()], cancelApproval, { discard: true }),
 	);
 
+	const failTurn = (error: AgentError) =>
+		emit({ type: "turn.completed", turnId: "notStarted", result: { status: "failed", message: error.message } });
+
 	const start = (driver: TurnDriver) =>
 		Effect.gen(function* () {
 			yield* Effect.gen(function* () {
 				const message = yield* Queue.take(inbox);
 				const done = yield* Deferred.make<void>();
 				yield* Ref.set(currentTurn, Option.some(done));
-				// A rejected turn fails only that turn. Process failures still end the session.
-				yield* driver.startTurn(message).pipe(
-					Effect.catchTag("AgentProtocolError", (error) =>
-						emit({
-							type: "turn.completed",
-							turnId: "notStarted",
-							result: { status: "failed", message: error.message },
-						}),
-					),
-				);
+				// A rejected or unanswered turn fails only that turn. A process that really died also ends the
+				// adapter's event reader, which ends the session.
+				yield* driver
+					.startTurn(message)
+					.pipe(Effect.catchTags({ AgentProtocolError: failTurn, AgentProcessError: failTurn }));
 				yield* Deferred.await(done);
 				yield* Ref.set(currentTurn, Option.none());
 			}).pipe(Effect.forever, Effect.catch(fail), Effect.forkScoped);
