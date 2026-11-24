@@ -44,13 +44,20 @@ export const removeWorktree = Effect.fn("removeWorktree")(function* (options: {
 	);
 });
 
-// Undoes createWorktree when the workspace could not be saved. The branch is new, so deleting it
-// loses nothing. Failures are logged: the save error is the one the user needs to see.
+// Undoes adding a worktree when the workspace could not be saved. A branch the worktree created is new,
+// so deleting it loses nothing; pass null for a branch that existed before, which stays.
+// Failures are logged: the save error is the one the user needs to see.
 export const discardWorktree = Effect.fn("discardWorktree")(
-	function* (options: { readonly repositoryPath: string; readonly worktreePath: string; readonly branch: string }) {
+	function* (options: {
+		readonly repositoryPath: string;
+		readonly worktreePath: string;
+		readonly branch: string | null;
+	}) {
 		const { repositoryPath, worktreePath, branch } = options;
 		yield* runGit(repositoryPath, ["worktree", "remove", "--force", worktreePath]);
-		yield* runGit(repositoryPath, ["branch", "-D", branch]);
+		if (branch !== null) {
+			yield* runGit(repositoryPath, ["branch", "-D", branch]);
+		}
 		yield* Effect.logWarning("Removed the worktree of a workspace that could not be saved").pipe(
 			Effect.annotateLogs({ worktreePath, branch }),
 		);

@@ -85,3 +85,54 @@ export class WorkspaceArchivedError extends Schema.TaggedError<WorkspaceArchived
 		return "This workspace is archived. Start a new workspace to keep working.";
 	}
 }
+
+// Branch names reach git as arguments, so one starting with "-" would read as an option.
+export const BranchName = Schema.String.check(Schema.isPattern(/^[^-\s]\S{0,254}$/));
+
+// An open pull request or issue of the project's GitHub repository, to start a workspace from.
+export class OpenPullRequest extends Schema.Class<OpenPullRequest>("OpenPullRequest")({
+	number: Schema.Int,
+	title: Schema.String,
+	branch: Schema.String,
+	author: Schema.String,
+}) {}
+
+export class OpenIssue extends Schema.Class<OpenIssue>("OpenIssue")({
+	number: Schema.Int,
+	title: Schema.String,
+	body: Schema.String,
+	url: Schema.String,
+}) {}
+
+export class BranchNotFoundError extends Schema.TaggedError<BranchNotFoundError>()("BranchNotFoundError", {
+	branch: Schema.String,
+}) {
+	override get message() {
+		return `The branch ${this.branch} does not exist here or on origin. Fetch it or pick another branch.`;
+	}
+}
+
+export class BranchCheckedOutError extends Schema.TaggedError<BranchCheckedOutError>()("BranchCheckedOutError", {
+	branch: Schema.String,
+}) {
+	override get message() {
+		return `The branch ${this.branch} is checked out in another folder. Switch that folder to another branch or archive its workspace first.`;
+	}
+}
+
+export class PullRequestCheckoutError extends Schema.TaggedError<PullRequestCheckoutError>()(
+	"PullRequestCheckoutError",
+	{ number: Schema.Int },
+) {
+	override get message() {
+		return `Octopus could not check out pull request #${this.number}. Check that it exists and that its branch is not checked out elsewhere.`;
+	}
+}
+
+export class GitHubListError extends Schema.TaggedError<GitHubListError>()("GitHubListError", {
+	subject: Schema.Literals(["pull requests", "issues"]),
+}) {
+	override get message() {
+		return `Octopus could not list the open ${this.subject}. Check that the project has a GitHub remote.`;
+	}
+}
