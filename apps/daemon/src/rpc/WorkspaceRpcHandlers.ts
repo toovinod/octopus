@@ -15,6 +15,8 @@ export const WorkspaceRpcHandlers = WorkspaceRpcs.toLayer(
 			listWorkspaces: ({ projectId }) => workspaces.list(projectId).pipe(orInternalError("list workspaces")),
 			archiveWorkspace: ({ workspaceId, force }) =>
 				workspaces.archive(workspaceId, { force }).pipe(orInternalError("archive the workspace")),
+			unarchiveWorkspace: ({ workspaceId }) =>
+				workspaces.unarchive(workspaceId).pipe(orInternalError("restore the workspace")),
 			listScriptRuns: ({ workspaceId }) =>
 				workspaces.listScriptRuns(workspaceId).pipe(orInternalError("list script runs")),
 			getScriptRunOutput: ({ scriptRunId }) => Effect.succeed(workspaces.getScriptRunOutput(scriptRunId)),

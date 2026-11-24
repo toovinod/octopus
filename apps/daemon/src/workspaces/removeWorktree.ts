@@ -11,6 +11,9 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 	return { changedFiles, unpushedCommits: Number(unpushed) };
 });
 
+// The stash a forced archive leaves, found again by this message when the workspace is restored.
+export const archiveStashMessage = (workspaceId: string) => `octopus-archive/${workspaceId}`;
+
 const restoreStash = (worktreePath: string) =>
 	runGit(worktreePath, ["stash", "pop", "--index"]).pipe(
 		Effect.catchTag("GitCommandError", (cause) =>
@@ -64,3 +67,42 @@ export const discardWorktree = Effect.fn("discardWorktree")(
 	},
 	Effect.catch((cause) => Effect.logError("Could not remove the worktree of an unsaved workspace", cause)),
 );
+
+// Puts back what a forced archive stashed, then drops the stash. Found by message and applied by sha, since
+// other worktrees share the stash list and can shift its indexes meanwhile. If the changes do not apply
+// cleanly, git leaves the conflicts in the folder and the stash stays, so nothing is lost.
+export const restoreArchiveStash = Effect.fn("restoreArchiveStash")(function* (
+	worktreePath: string,
+	workspaceId: string,
+) {
+	const message = archiveStashMessage(workspaceId);
+	const stashFor = (format: string) =>
+		runGit(worktreePath, ["stash", "list", `--format=%H ${format}`]).pipe(
+			Effect.map((list) => list.split("\n").map((line) => line.split(" "))),
+		);
+	// A stash subject reads "On <branch>: <message>".
+	const entry = (yield* stashFor("%s")).find((fields) => fields.slice(1).join(" ").endsWith(`: ${message}`));
+	const sha = entry?.[0];
+	if (sha === undefined) {
+		return;
+	}
+	const applied = yield* runGit(worktreePath, ["stash", "apply", "--index", sha]).pipe(
+		Effect.as(true),
+		Effect.catchTag("GitCommandError", (cause) =>
+			Effect.logError("The archived changes did not apply cleanly, they are still in git stash", cause).pipe(
+				Effect.annotateLogs({ worktreePath, message }),
+				Effect.as(false),
+			),
+		),
+	);
+	if (!applied) {
+		return;
+	}
+	const ref = (yield* stashFor("%gd")).find((fields) => fields[0] === sha)?.[1];
+	if (ref !== undefined) {
+		yield* runGit(worktreePath, ["stash", "drop", ref]);
+	}
+	yield* Effect.logInfo("Restored the changes stashed by the archive").pipe(
+		Effect.annotateLogs({ worktreePath, message }),
+	);
+});

@@ -114,6 +114,20 @@ export class WorkspaceRpcs extends RpcGroup.make(
 			DaemonInternalError,
 		]),
 	}),
+	// Brings an archived workspace back: its folder from the kept branch, and any changes the archive stashed.
+	Rpc.make("unarchiveWorkspace", {
+		payload: { workspaceId: Schema.String },
+		success: Workspace,
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			WorkspacePathInUseError,
+			BranchNotFoundError,
+			BranchCheckedOutError,
+			WorktreeCreateError,
+			GitTimeoutError,
+			DaemonInternalError,
+		]),
+	}),
 	Rpc.make("listScriptRuns", {
 		payload: { workspaceId: Schema.String },
 		success: Schema.Array(ScriptRun),

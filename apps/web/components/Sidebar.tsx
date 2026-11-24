@@ -37,6 +37,7 @@ import {
 	GitPullRequestIcon,
 	MoreHorizontalIcon,
 	PlusIcon,
+	RotateCcwIcon,
 	SearchIcon,
 	SettingsIcon,
 	SquarePenIcon,
@@ -48,6 +49,7 @@ import {
 	selectSession,
 	selectWorkspace,
 	sessionTitle,
+	unarchiveWorkspace,
 	useAppState,
 } from "../lib/store.ts";
 import type { AgentSession, AgentSessionStatus } from "@repo/contracts/AgentSession";
@@ -88,6 +90,10 @@ const useTree = (projects: AppState["projects"], workspaces: AppState["workspace
 			.sort(byCreated)
 			.map((project) => ({
 				project,
+				archived: Object.values(workspaces)
+					.filter((workspace) => workspace.projectId === project.id && workspace.status === "archived")
+					// Most recently archived first: that is usually the one to bring back.
+					.sort((a, b) => (b.archivedAt ?? "").localeCompare(a.archivedAt ?? "")),
 				workspaces: Object.values(workspaces)
 					.filter((workspace) => workspace.projectId === project.id && workspace.status === "active")
 					.sort(byCreated)
@@ -191,9 +197,11 @@ const ProjectMenuItems = ({
 const ProjectNode = ({
 	project,
 	workspaces,
+	archived,
 }: {
 	readonly project: Project;
 	readonly workspaces: ReadonlyArray<{ readonly workspace: Workspace; readonly sessions: ReadonlyArray<AgentSession> }>;
+	readonly archived: ReadonlyArray<Workspace>;
 }) => {
 	const [open, setOpen] = useState(true);
 	return (
@@ -247,9 +255,69 @@ const ProjectNode = ({
 					) : (
 						workspaces.map((node) => <WorkspaceNode key={node.workspace.id} {...node} />)
 					)}
+					{archived.length === 0 ? null : <ArchivedNode archived={archived} />}
 				</SidebarMenuSub>
 			) : null}
 		</SidebarMenuItem>
+	);
+};
+
+const workspaceLabel = (workspace: Workspace) => (workspace.kind === "inPlace" ? "Project folder" : workspace.name);
+
+// Archived workspaces stay out of the way, collapsed under their project, until one is restored.
+const ArchivedNode = ({ archived }: { readonly archived: ReadonlyArray<Workspace> }) => {
+	const [open, setOpen] = useState(false);
+	const [restoring, setRestoring] = useState<string | null>(null);
+	const restore = async (workspaceId: string) => {
+		setRestoring(workspaceId);
+		await unarchiveWorkspace(workspaceId);
+		setRestoring(null);
+	};
+	return (
+		<SidebarMenuSubItem>
+			<SidebarMenuSubButton asChild size="sm" className="w-full text-muted-foreground">
+				<button type="button" onClick={() => setOpen(!open)} aria-expanded={open}>
+					<ChevronRightIcon className={cn("transition-transform", open && "rotate-90")} />
+					<span>Archived ({archived.length})</span>
+				</button>
+			</SidebarMenuSubButton>
+			{open ? (
+				<SidebarMenuSub className="mr-0 gap-0.5 pr-0">
+					{archived.map((workspace) => (
+						<SidebarMenuSubItem key={workspace.id}>
+							<ContextMenu>
+								<ContextMenuTrigger asChild>
+									<SidebarMenuSubButton asChild size="sm" className="w-full pr-7 text-muted-foreground">
+										<button
+											type="button"
+											disabled={restoring !== null}
+											onClick={() => void restore(workspace.id)}
+											title="Restore this workspace"
+										>
+											<span className="truncate">{workspaceLabel(workspace)}</span>
+										</button>
+									</SidebarMenuSubButton>
+								</ContextMenuTrigger>
+								<ContextMenuContent>
+									<ContextMenuItem onSelect={() => void restore(workspace.id)}>Restore</ContextMenuItem>
+								</ContextMenuContent>
+							</ContextMenu>
+							<Hint label="Restore">
+								<SidebarMenuAction
+									showOnHover
+									className="top-0.5"
+									aria-label={`Restore ${workspaceLabel(workspace)}`}
+									disabled={restoring !== null}
+									onClick={() => void restore(workspace.id)}
+								>
+									<RotateCcwIcon className={cn(restoring === workspace.id && "animate-spin")} />
+								</SidebarMenuAction>
+							</Hint>
+						</SidebarMenuSubItem>
+					))}
+				</SidebarMenuSub>
+			) : null}
+		</SidebarMenuSubItem>
 	);
 };
 
@@ -280,7 +348,7 @@ const WorkspaceNode = ({
 								attention={anyAttention === undefined ? undefined : attention[anyAttention.id]}
 							/>
 							{workspace.pullRequestUrl === null ? null : <GitPullRequestIcon className="text-muted-foreground" />}
-							<span>{workspace.kind === "inPlace" ? "Project folder" : workspace.name}</span>
+							<span>{workspaceLabel(workspace)}</span>
 						</button>
 					</SidebarMenuSubButton>
 				</ContextMenuTrigger>

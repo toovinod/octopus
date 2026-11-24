@@ -5,11 +5,17 @@ import {
 	WorkspaceNotFoundError,
 	WorkspacePathInUseError,
 } from "@repo/contracts/Workspace";
+import {
+	archiveStashMessage,
+	discardWorktree,
+	findUnsavedWork,
+	removeWorktree,
+	restoreArchiveStash,
+} from "./removeWorktree.ts";
 import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contracts/ScriptRun";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
-import { discardWorktree, findUnsavedWork, removeWorktree } from "./removeWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
 import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
@@ -398,7 +404,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							yield* removeWorktree({
 								repositoryPath: owner.path,
 								worktreePath: current.path,
-								stashMessage: unsaved.changedFiles.length > 0 ? `octopus-archive/${workspaceId}` : null,
+								stashMessage: unsaved.changedFiles.length > 0 ? archiveStashMessage(workspaceId) : null,
 							});
 						} else {
 							// Someone deleted the folder already. Forget it in git and carry on.
@@ -426,6 +432,74 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					return yield* get(workspaceId);
 				},
 				(effect, workspaceId) => workspaceLock.archiving(workspaceId, effect),
+				Semaphore.withPermit(archiveLock),
+				Effect.provide(services),
+			);
+
+			// Undoes an archive. A worktree comes back from its kept branch, with the changes a forced archive
+			// stashed. Another active workspace may have taken the folder meanwhile, which the partial unique index
+			// on active paths forbids, so that is checked first and again when the row flips.
+			const unarchive = Effect.fn("WorkspaceService.unarchive")(
+				function* (workspaceId: string) {
+					const current = yield* get(workspaceId);
+					if (current.status === "active") {
+						return current;
+					}
+					if (yield* isPathActive(current.path)) {
+						return yield* new WorkspacePathInUseError({ path: current.path });
+					}
+					// The foreign key keeps the project while it has workspaces.
+					const owner = yield* projects
+						.get(current.projectId)
+						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
+					let setupRun: ScriptRunRow | null = null;
+					if (current.kind === "worktree") {
+						yield* makeWorktreesDir;
+						yield* addBranchWorktree({
+							repositoryPath: owner.path,
+							worktreePath: current.path,
+							branch: current.branch,
+						});
+						// Ignored files such as installed dependencies were not kept, so setup runs again.
+						setupRun = yield* newSetupRun(owner, workspaceId);
+					}
+					const restored = yield* database.query((db) =>
+						db.transaction((tx) =>
+							Effect.gen(function* () {
+								const taken = yield* tx.$count(
+									workspace,
+									and(eq(workspace.path, current.path), eq(workspace.status, "active")),
+								);
+								if (taken > 0) {
+									return false;
+								}
+								yield* tx
+									.update(workspace)
+									.set({ status: "active", archivedAt: null })
+									.where(eq(workspace.id, workspaceId));
+								if (setupRun !== null) {
+									yield* tx.insert(scriptRun).values(setupRun);
+								}
+								return true;
+							}),
+						),
+					);
+					if (!restored) {
+						if (current.kind === "worktree") {
+							yield* discardWorktree({ repositoryPath: owner.path, worktreePath: current.path, branch: null });
+						}
+						return yield* new WorkspacePathInUseError({ path: current.path });
+					}
+					if (current.kind === "worktree") {
+						yield* restoreArchiveStash(current.path, workspaceId);
+					}
+					yield* Effect.logInfo("Restored workspace").pipe(Effect.annotateLogs({ workspaceId }));
+					if (setupRun !== null && owner.setupScript !== null) {
+						yield* startSetupScript(setupRun.id, owner.setupScript, current.path);
+					}
+					return yield* get(workspaceId);
+				},
+				(effect, workspaceId) => workspaceLock.restoring(workspaceId, effect),
 				Semaphore.withPermit(archiveLock),
 				Effect.provide(services),
 			);
@@ -617,6 +691,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				listProjectPullRequests,
 				listProjectIssues,
 				archive,
+				unarchive,
 				listScriptRuns,
 				getScriptRunOutput,
 				followScriptRunOutput,
