@@ -304,10 +304,9 @@ const Conversation = ({
 		// With no chat open here, start one so the click still delivers the feedback. newChat explains a failure.
 		const target = sessionId ?? (await newChat(workspace.id));
 		if (target === null) return;
-		await sendMessage(target, message, [], false).then(
-			() => toast("Sent the review feedback to the agent.", "info"),
-			(error: unknown) => toast(errorMessage(error)),
-		);
+		// A refused send waits in that chat's composer with the daemon's reason and a Retry button.
+		if (await sendMessage(target, message, [], false)) toast("Sent the review feedback to the agent.", "info");
+		else toast("The agent did not take the review feedback. Retry it from the chat.");
 	};
 
 	return (

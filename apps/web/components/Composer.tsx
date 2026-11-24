@@ -22,7 +22,7 @@ import {
 	useAppState,
 } from "../lib/store.ts";
 import { type DraftImage, MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
-import { memo, useEffect, useRef, useState, useTransition } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
 import { formatClockTime, formatTokens } from "../lib/format.ts";
@@ -53,7 +53,6 @@ export const Composer = memo(
 	}) => {
 		const [draft, setDraft] = useState<Draft>(() => drafts.get(session.id) ?? { text: "", images: [] });
 		const [dragging, setDragging] = useState(false);
-		const [, startTransition] = useTransition();
 		const textRef = useRef<HTMLTextAreaElement>(null);
 		const fileRef = useRef<HTMLInputElement>(null);
 		const model = agent?.models.find((item) => item.id === session.model);
@@ -144,8 +143,9 @@ export const Composer = memo(
 							busy ? (steer ? "Steer the agent" : "Queue a message for when the turn ends") : "Ask for a change"
 						}
 						onChange={(event) => {
+							// Never in a transition: a controlled field that updates late drops keys and moves the caret.
 							const text = event.target.value;
-							startTransition(() => setDraft((current) => ({ ...current, text })));
+							setDraft((current) => ({ ...current, text }));
 						}}
 						onPaste={(event) => {
 							const files = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));

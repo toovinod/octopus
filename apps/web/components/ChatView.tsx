@@ -85,7 +85,8 @@ export const ChatView = () => {
 			{session === undefined || chatSessionId !== session.id ? (
 				<EmptyWorkspace name={workspace.kind === "inPlace" ? project.name : workspace.name} />
 			) : (
-				<OpenChat session={session} workspacePath={workspace.path} />
+				// Keyed so each chat gets its own timeline (scroll position, measurements, stick-to-end) and composer.
+				<OpenChat key={session.id} session={session} workspacePath={workspace.path} />
 			)}
 		</section>
 	);
@@ -110,7 +111,7 @@ const OpenChat = ({ session, workspacePath }: { readonly session: AgentSession; 
 					) : null
 				}
 			/>
-			<Composer key={session.id} session={session} agent={agent} usage={chat.usage} rateLimit={chat.rateLimit} />
+			<Composer session={session} agent={agent} usage={chat.usage} rateLimit={chat.rateLimit} />
 		</>
 	);
 };

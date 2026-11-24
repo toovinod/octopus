@@ -27,6 +27,7 @@ export type DialogState =
 	| { readonly kind: "palette" }
 	| { readonly kind: "newProject" }
 	| { readonly kind: "newWorkspace"; readonly projectId: string }
+	| { readonly kind: "removeProject"; readonly projectId: string }
 	| { readonly kind: "settings"; readonly tab: "accounts" | "appearance" | "notifications" }
 	| { readonly kind: "workspaceSettings"; readonly workspaceId: string };
 
@@ -42,7 +43,7 @@ export interface FailedSend {
 
 export interface AppState {
 	readonly connection:
-		| { readonly status: "connecting" | "ready" }
+		| { readonly status: "connecting" | "ready" | "reconnecting" }
 		| { readonly status: "failed"; readonly message: string };
 	// One record per entity, keyed by id. Lists are derived where they are shown.
 	readonly projects: Readonly<Record<string, Project>>;
@@ -144,21 +145,26 @@ export const refreshAgents = async () => {
 	if (agents !== null) setState(() => ({ agents }));
 };
 
+const loadProjects = async () => {
+	const projects = await callDaemon((daemon) => daemon.listProjects());
+	setState(() => ({ projects: byId(projects) }));
+	await Promise.all(projects.map((project) => loadWorkspaces(project.id)));
+};
+
 export const boot = async () => {
 	const settings = loadSettings();
 	applyFontSize(settings);
 	setState(() => ({ settings }));
-	const loaded = await callDaemon((daemon) => daemon.listProjects())
-		.then(async (projects) => {
-			setState(() => ({ projects: byId(projects) }));
-			await Promise.all(projects.map((project) => loadWorkspaces(project.id)));
+	const loaded = await loadProjects().then(
+		() => {
 			setState(() => ({ connection: { status: "ready" } }));
 			return true;
-		})
-		.catch((error: unknown) => {
+		},
+		(error: unknown) => {
 			setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
 			return false;
-		});
+		},
+	);
 	if (!loaded) return;
 	// Checking the agents starts their CLIs and reads the keychain, so it never holds up files, terminals or history.
 	void refreshAgents();
@@ -168,6 +174,16 @@ export const boot = async () => {
 	const start = active.find((workspace) => workspace.id === remembered) ?? active[0];
 	if (start !== undefined) selectWorkspace(start.id);
 };
+
+// Only a dropped socket is worth retrying. A daemon error would fail the same way again.
+export const isConnectionDrop = (error: unknown) => errorTag(error) === "RpcClientError";
+
+// Exponential from half a second, capped at 30 s. The jitter keeps windows from retrying in lockstep.
+export const reconnectDelay = (attempt: number, random: () => number = Math.random) =>
+	Math.min(30_000, 500 * 2 ** attempt) * (0.5 + random() / 2);
+
+// One toast for the whole outage. Sonner replaces a toast that has the same id.
+const CONNECTION_TOAST = "daemon-connection";
 
 // Session changes from every workspace. They drive status dots, tab badges and notifications.
 const watchSessions = () => {
@@ -180,17 +196,42 @@ const watchSessions = () => {
 			setState((current) => ({ sessions: { ...current.sessions, [session.id]: session } }));
 			if (before !== undefined) noticeChange(before, session);
 		},
-		// The socket dropped. Watch again, then reload the lists the stream was keeping fresh. While the daemon
-		// is still away the reload fails with a toast, and the next drop of the new watch tries again.
-		onEnd: () => {
-			setTimeout(() => {
-				watchSessions();
-				for (const project of Object.values(state.projects)) {
-					loadWorkspaces(project.id).catch(() => toast("Lost the connection to the daemon. Reconnecting."));
-				}
-			}, 1000);
+		onEnd: (error) => {
+			// The daemon ended the watch itself, which only happens when it shuts down.
+			if (error === null) return;
+			if (!isConnectionDrop(error)) {
+				toast("Chat status stopped updating. Restart Octopus to see it again.");
+				return;
+			}
+			setState(() => ({ connection: { status: "reconnecting" } }));
+			showToast.loading("Lost the connection to the daemon. Reconnecting.", {
+				id: CONNECTION_TOAST,
+				duration: Number.POSITIVE_INFINITY,
+			});
+			reconnect(0);
 		},
 	});
+};
+
+// Reloads the lists the watch kept fresh, then watches again. The reload is what proves the daemon is back.
+const reconnect = (attempt: number) => {
+	setTimeout(() => {
+		loadProjects().then(
+			() => {
+				setState(() => ({ connection: { status: "ready" } }));
+				showToast.success("Reconnected to the daemon.", { id: CONNECTION_TOAST, duration: 4000 });
+				watchSessions();
+			},
+			(error: unknown) => {
+				if (isConnectionDrop(error)) {
+					reconnect(attempt + 1);
+					return;
+				}
+				setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
+				showToast.dismiss(CONNECTION_TOAST);
+			},
+		);
+	}, reconnectDelay(attempt));
 };
 
 const noticeChange = (before: AgentSession, after: AgentSession) => {
@@ -245,15 +286,32 @@ export const createProject = async (parentPath: string, name: string) => {
 	return project;
 };
 
+// The daemon refuses while the project has active workspaces, so only archived ones and their chats remain here.
 export const removeProject = async (projectId: string) => {
 	const done = await attempt(() => callDaemon((daemon) => daemon.removeProject({ projectId })));
-	if (done === null) return;
+	if (done === null) return false;
+	const removed = new Set(
+		Object.values(state.workspaces)
+			.filter((workspace) => workspace.projectId === projectId)
+			.map((workspace) => workspace.id),
+	);
+	const kept = <A>(record: Readonly<Record<string, A>>, workspaceOf: (key: string) => string | undefined) =>
+		Object.fromEntries(Object.entries(record).filter(([key]) => !removed.has(workspaceOf(key) ?? "")));
+	const sessionWorkspace = (sessionId: string) => state.sessions[sessionId]?.workspaceId;
+	const selectionRemoved = state.selectedWorkspaceId !== null && removed.has(state.selectedWorkspaceId);
+	for (const [sessionId, sends] of Object.entries(state.failedSends)) {
+		if (removed.has(sessionWorkspace(sessionId) ?? "")) releaseImages(sends.flatMap((send) => send.images));
+	}
 	setState((current) => ({
 		projects: without(current.projects, projectId),
-		workspaces: Object.fromEntries(
-			Object.entries(current.workspaces).filter(([, workspace]) => workspace.projectId !== projectId),
-		),
+		workspaces: kept(current.workspaces, (workspaceId) => workspaceId),
+		sessions: kept(current.sessions, sessionWorkspace),
+		attention: kept(current.attention, sessionWorkspace),
+		failedSends: kept(current.failedSends, sessionWorkspace),
+		...(selectionRemoved ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
+	if (selectionRemoved) closeChat();
+	return true;
 };
 
 export const setProjectTrust = async (projectId: string, trusted: boolean) => {
@@ -441,25 +499,30 @@ const releaseImages = (images: ReadonlyArray<DraftImage>) => {
 };
 
 // A refused message is kept with the daemon's reason, for the composer to offer Retry and Discard.
-export const sendMessage = async (
+// Resolves to whether the daemon took the message.
+export const sendMessage = (
 	sessionId: string,
 	text: string,
 	images: ReadonlyArray<DraftImage>,
 	steer: boolean,
-) => {
+): Promise<boolean> => {
 	const payload = images.map(({ mediaType, base64 }) => ({ mediaType, base64 }));
-	await callDaemon((daemon) => daemon.sendMessage({ sessionId, text, images: payload, steer })).then(
-		() => releaseImages(images),
+	return callDaemon((daemon) => daemon.sendMessage({ sessionId, text, images: payload, steer })).then(
+		() => {
+			releaseImages(images);
+			return true;
+		},
 		(error: unknown) => {
 			const failed = { id: nextFailedSend++, text, images, error: errorMessage(error) };
 			setFailedSends(sessionId, (sends) => [...sends, failed]);
+			return false;
 		},
 	);
 };
 
 export const retryFailedSend = (sessionId: string, id: number, steer: boolean) => {
 	const failed = failedSendsOf(state, sessionId).find((send) => send.id === id);
-	if (failed === undefined) return Promise.resolve();
+	if (failed === undefined) return Promise.resolve(false);
 	setFailedSends(sessionId, (sends) => sends.filter((send) => send.id !== id));
 	return sendMessage(sessionId, failed.text, failed.images, steer);
 };

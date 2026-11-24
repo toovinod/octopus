@@ -4,12 +4,15 @@ import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@repo/ui/components/resizable";
 import { onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
+import { quitWarning } from "../lib/quitWarning.ts";
+import { setQuitWarning } from "../lib/desktop.ts";
 import { SidebarProvider } from "@repo/ui/components/sidebar";
 import { TooltipProvider } from "@repo/ui/components/tooltip";
 import { Toaster } from "@repo/ui/components/sonner";
 import { Button } from "@repo/ui/components/button";
 import { WorkspaceSettingsDialog } from "./WorkspaceSettingsDialog.tsx";
 import { NewWorkspaceDialog } from "./NewWorkspaceDialog.tsx";
+import { RemoveProjectDialog } from "./RemoveProjectDialog.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
 import { CommandPalette } from "./CommandPalette.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
@@ -49,6 +52,14 @@ const useShortcuts = () =>
 		};
 	}, []);
 
+// Keeps the shell's quit warning current, so quitting asks first while turns run or approvals wait.
+const useQuitWarning = () => {
+	const warning = useAppState((current) => quitWarning(Object.values(current.sessions)));
+	useEffect(() => {
+		void setQuitWarning(warning);
+	}, [warning]);
+};
+
 const useDaemonStopped = () => {
 	const [stopped, setStopped] = useState(false);
 	useEffect(() => onDaemonStopped(() => setStopped(true)), []);
@@ -84,13 +95,14 @@ export const App = () => {
 	const hasWorkspace = useAppState((current) => current.selectedWorkspaceId !== null);
 	const daemonStopped = useDaemonStopped();
 	useShortcuts();
+	useQuitWarning();
 	useEffect(() => {
 		void boot();
 	}, []);
 
 	if (daemonStopped) return <DaemonStopped />;
 
-	if (connection.status !== "ready") {
+	if (connection.status === "connecting" || connection.status === "failed") {
 		return (
 			<main className="flex h-full flex-col items-center justify-center gap-2 text-center">
 				<OctopusLogo className="size-10" />
@@ -125,6 +137,7 @@ export const App = () => {
 				<CommandPalette />
 				<NewProjectDialog />
 				<NewWorkspaceDialog />
+				<RemoveProjectDialog />
 				<WorkspaceSettingsDialog />
 				<SettingsDialog />
 				<Toaster position="bottom-right" />

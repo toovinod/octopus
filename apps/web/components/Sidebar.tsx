@@ -45,7 +45,6 @@ import {
 	type AppState,
 	newChat,
 	openDialog,
-	removeProject,
 	selectSession,
 	selectWorkspace,
 	sessionTitle,
@@ -183,7 +182,7 @@ const ProjectMenuItems = ({
 	<>
 		<Item onSelect={() => openDialog({ kind: "newWorkspace", projectId: project.id })}>New workspace</Item>
 		<Separator />
-		<Item variant="destructive" onSelect={() => void removeProject(project.id)}>
+		<Item variant="destructive" onSelect={() => openDialog({ kind: "removeProject", projectId: project.id })}>
 			Remove from Octopus
 		</Item>
 	</>
