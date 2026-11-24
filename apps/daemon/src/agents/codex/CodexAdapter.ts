@@ -6,6 +6,7 @@ import {
 	ErrorNotification,
 	FileChangeApprovalParams,
 	ItemNotification,
+	LoginCompleted,
 	LoginResponse,
 	ModelListResponse,
 	RateLimitsUpdated,
@@ -29,7 +30,7 @@ import {
 } from "../AgentAdapter.ts";
 import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Predicate, Ref, Scope, Stream } from "effect";
+import { Context, Effect, Exit, FiberHandle, Layer, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { AgentCapabilities, AgentModel } from "@repo/contracts/AgentSession";
 import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
@@ -325,6 +326,8 @@ const handleServerRequest = Effect.fnUntraced(function* (
 export interface CodexAgentAdapter extends AgentAdapter {
 	// Returns the URL to open. Codex stores the tokens itself when the user finishes.
 	readonly startLogin: Effect.Effect<string, AgentError>;
+	// How each sign-in ended, so the daemon can refresh the account and its models without being asked.
+	readonly loginResults: Stream.Stream<LoginCompleted>;
 }
 
 // Codex waits on its local callback server until the user finishes in the browser.
@@ -340,6 +343,8 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 			const provide = Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner);
 			// Holds the sign-in waiting for the browser. A new sign-in replaces it and stops its app-server.
 			const pendingLogin = yield* FiberHandle.make();
+			const loginResults = yield* PubSub.unbounded<LoginCompleted>();
+			yield* Effect.addFinalizer(() => PubSub.shutdown(loginResults));
 
 			// A short-lived app-server for questions outside a session. Closing the scope stops it.
 			const connect = Effect.gen(function* () {
@@ -411,10 +416,17 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				);
 				// The app-server must outlive this call, or the browser sign-in has nothing to return to.
 				yield* login.client.incoming.pipe(
-					Stream.takeUntil(
-						(message) => message._tag === "notification" && message.method === "account/login/completed",
+					Stream.filter((message) => message._tag === "notification" && message.method === "account/login/completed"),
+					Stream.take(1),
+					Stream.mapEffect((message) => decodeCodex(LoginCompleted)(message.params)),
+					Stream.runForEach((result) =>
+						Effect.gen(function* () {
+							if (!result.success) {
+								yield* Effect.logWarning("Codex sign-in failed").pipe(Effect.annotateLogs({ error: result.error }));
+							}
+							yield* PubSub.publish(loginResults, result);
+						}),
 					),
-					Stream.runDrain,
 					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.catch((error) => Effect.logWarning("Codex sign-in stopped", error)),
 					Effect.ensuring(Scope.close(scope, Exit.void)),
@@ -538,6 +550,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				checkAuth,
 				listModels,
 				startLogin,
+				loginResults: Stream.fromPubSub(loginResults),
 				startSession,
 			});
 		}),

@@ -3,6 +3,7 @@ import {
 	type AgentAvailability,
 	AgentInfo,
 	type AgentKind,
+	type AgentLoginResult,
 	AgentSession,
 	type AgentSessionStatus,
 	AgentUnavailableError,
@@ -171,6 +172,18 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		// The account decides which models an agent offers, so a new key or auth mode fetches it again.
 		const modelCache = new Map<AgentKind, AgentModels>();
 		const forgetModels = (agent: AgentKind) => void modelCache.delete(agent);
+		// A finished sign-in changes the account, and with it the models Codex offers. Clients hear about it
+		// here instead of asking again.
+		const agentLogins = yield* PubSub.unbounded<AgentLoginResult>();
+		yield* codex.loginResults.pipe(
+			Stream.runForEach(({ success }) =>
+				Effect.gen(function* () {
+					if (success) forgetModels("codex");
+					yield* PubSub.publish(agentLogins, { agent: "codex", success } satisfies AgentLoginResult);
+				}),
+			),
+			Effect.forkScoped,
+		);
 
 		const getRow = Effect.fn("SessionService.getRow")(function* (sessionId: string) {
 			const [row] = yield* database.query((db) => db.select().from(agentSession).where(eq(agentSession.id, sessionId)));
@@ -897,6 +910,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			history,
 			subscribe,
 			watch,
+			watchLogins: Stream.fromPubSub(agentLogins),
 		};
 	}),
 }) {

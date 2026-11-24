@@ -4,9 +4,9 @@ import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
+import { Duration, Effect, Fiber, Stream } from "effect";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
-import { Duration, Effect, Stream } from "effect";
 
 const fakeCodex = `${import.meta.dir}/fixtures/fakeCodex.ts`;
 const newSession: StartSessionInput = {
@@ -53,6 +53,23 @@ describe("CodexAdapter", () => {
 	test("starts the ChatGPT sign-in and returns its URL", async () => {
 		const url = await runWithCodex(Effect.flatMap(CodexAdapter, (codex) => codex.startLogin));
 		expect(url).toBe("https://auth.example/login");
+	});
+
+	test.each([
+		["fakeCodex.ts", { success: true, error: null }],
+		["failedLoginCodex.ts", { success: false, error: "The sign-in was cancelled." }],
+	])("reports how the ChatGPT sign-in through %s ended", async (fixture, expected) => {
+		const result = await runWithCodex(
+			Effect.gen(function* () {
+				const codex = yield* CodexAdapter;
+				const results = yield* codex.loginResults.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+				yield* Effect.yieldNow;
+				yield* codex.startLogin;
+				return yield* Fiber.join(results);
+			}),
+			`${import.meta.dir}/fixtures/${fixture}`,
+		);
+		expect(result).toEqual([expected]);
 	});
 
 	test("lists models from every model/list page", async () => {

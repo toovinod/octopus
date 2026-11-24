@@ -42,6 +42,9 @@ export const ModelListResponse = Schema.Struct({
 
 export const LoginResponse = Schema.Struct({ authUrl: Schema.String });
 
+export const LoginCompleted = Schema.Struct({ success: Schema.Boolean, error: Schema.NullOr(Schema.String) });
+export type LoginCompleted = typeof LoginCompleted.Type;
+
 export const AgentMessageDelta = Schema.Struct({
 	itemId: Schema.String,
 	delta: Schema.String,

@@ -55,6 +55,10 @@ export const AgentAvailability = Schema.Union([
 ]);
 export type AgentAvailability = typeof AgentAvailability.Type;
 
+// How an agent's own sign-in ended. Why one failed stays in the daemon's logs.
+export const AgentLoginResult = Schema.Struct({ agent: AgentKind, success: Schema.Boolean });
+export type AgentLoginResult = typeof AgentLoginResult.Type;
+
 export class AgentInfo extends Schema.Class<AgentInfo>("AgentInfo")({
 	kind: AgentKind,
 	availability: AgentAvailability,
