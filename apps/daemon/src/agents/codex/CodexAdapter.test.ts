@@ -160,6 +160,32 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test("an interrupt sent before Codex names the turn stops it once the name arrives", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } });
+	});
+
+	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("early"));
+				yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "interrupted" } });
+	});
+
 	test("a control request Codex never answers fails at its deadline", async () => {
 		const error = await runSession((handle) =>
 			Effect.gen(function* () {

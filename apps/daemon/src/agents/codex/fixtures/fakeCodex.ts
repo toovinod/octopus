@@ -17,7 +17,9 @@ const send = (message: object) => {
 };
 
 const threadId = "thread-new";
-const turnId = "turn-1";
+let turns = 0;
+let turnId = "";
+let interrupted = false;
 const waiting = new Map<number, (answer: Answer) => void>();
 
 const notify = (method: string, params: object) => send({ method, params });
@@ -240,11 +242,32 @@ const serve = async () => {
 					result: { thread: { id: message.params.threadId } },
 				});
 				break;
-			case "turn/start":
-				send({ id: message.id, result: { turn: { id: turnId } } });
-				void runTurn(message.params.input[0].text, message.params);
+			case "turn/start": {
+				turnId = `turn-${++turns}`;
+				interrupted = false;
+				const text: string = message.params.input[0].text;
+				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
+				if (text.includes("early")) {
+					// The turn can finish before Codex answers turn/start.
+					completeTurn("completed");
+					reply();
+					break;
+				}
+				if (text.includes("slow")) {
+					setTimeout(reply, 200);
+					setTimeout(() => interrupted || completeTurn("completed"), 400);
+					break;
+				}
+				reply();
+				void runTurn(text, message.params);
 				break;
+			}
 			case "turn/interrupt":
+				if (message.params.turnId !== turnId) {
+					send({ id: message.id, error: { code: -32602, message: `no running turn ${message.params.turnId}` } });
+					break;
+				}
+				interrupted = true;
 				send({ id: message.id, result: {} });
 				completeTurn("interrupted");
 				break;
