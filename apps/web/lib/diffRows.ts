@@ -31,12 +31,14 @@ export type DiffRow =
 	| {
 			readonly type: "line";
 			readonly key: string;
+			readonly path: string;
 			readonly line: DiffLine;
 			readonly segments: ReadonlyArray<Segment> | null;
 	  }
 	| {
 			readonly type: "pair";
 			readonly key: string;
+			readonly path: string;
 			readonly left: DiffLine | null;
 			readonly right: DiffLine | null;
 			readonly leftSegments: ReadonlyArray<Segment> | null;
@@ -101,7 +103,7 @@ export const diffRows = (
 			};
 			if (mode === "unified") {
 				for (const [index, line] of hunk.lines.entries()) {
-					rows.push({ type: "line", key: `${prefix}:${index}`, line, segments: segmentsOf(index) });
+					rows.push({ type: "line", key: `${prefix}:${index}`, path: file.path, line, segments: segmentsOf(index) });
 				}
 				continue;
 			}
@@ -111,6 +113,7 @@ export const diffRows = (
 					rows.push({
 						type: "pair",
 						key: `${prefix}:${index}`,
+						path: file.path,
 						left: line,
 						right: line,
 						leftSegments: null,
@@ -121,6 +124,7 @@ export const diffRows = (
 					rows.push({
 						type: "pair",
 						key: `${prefix}:${index}`,
+						path: file.path,
 						left: line,
 						right,
 						leftSegments: segmentsOf(index),
@@ -131,6 +135,7 @@ export const diffRows = (
 					rows.push({
 						type: "pair",
 						key: `${prefix}:${index}`,
+						path: file.path,
 						left: null,
 						right: line,
 						leftSegments: null,
