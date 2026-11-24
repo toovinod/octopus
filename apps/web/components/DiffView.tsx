@@ -2,9 +2,22 @@
 
 import { type DiffRow, diffRows, type Segment, startsOpen } from "../lib/diffRows.ts";
 import type { DiffFile, DiffLine, WorkspaceDiff } from "@repo/contracts/Git";
-import { ChevronRightIcon, GitCommitIcon, RefreshCwIcon, UploadIcon } from "lucide-react";
+import { ChevronRightIcon, GitCommitIcon, RefreshCwIcon, SendIcon, UploadIcon, XIcon } from "lucide-react";
+import {
+	codeIn,
+	covers,
+	type DiffComment,
+	type DiffSide,
+	diffCommentsMessage,
+	type LineRange,
+	numberOn,
+	pickLines,
+	rangeLabel,
+	sideOf,
+} from "../lib/diffComments.ts";
+import { Textarea } from "@repo/ui/components/textarea";
 import { callDaemon, errorMessage } from "../lib/daemonRuntime.ts";
-import { toast, updateSettings, useAppState } from "../lib/store.ts";
+import { newChat, sendMessage, toast, updateSettings, useAppState } from "../lib/store.ts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -34,6 +47,15 @@ const useTurnsFinished = (workspaceId: string) =>
 			.at(-1),
 	);
 
+// Comments outlive the panel, so switching tabs and back keeps them until they are sent.
+const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
+
+// Says whether a line number is picked or has a comment, and picks it on click.
+interface LinePicking {
+	readonly onPick: (range: LineRange, extend: boolean) => void;
+	readonly marked: (path: string, side: DiffSide, line: number | null) => boolean;
+}
+
 export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [diff, setDiff] = useState<WorkspaceDiff | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -42,6 +64,29 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [toggled, setToggled] = useState<ReadonlyMap<string, boolean>>(new Map());
 	const mode = useAppState((current) => current.settings.diffMode);
 	const finished = useTurnsFinished(workspace.id);
+	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
+	const [picked, setPicked] = useState<LineRange | null>(null);
+
+	useEffect(() => {
+		commentsByWorkspace.set(workspace.id, comments);
+	}, [workspace.id, comments]);
+
+	const picking = useMemo<LinePicking>(
+		() => ({
+			onPick: (range, extend) => setPicked((current) => pickLines(current, range, extend)),
+			marked: (path, side, line) =>
+				(picked !== null && covers(picked, path, side, line)) ||
+				comments.some((comment) => covers(comment, path, side, line)),
+		}),
+		[picked, comments],
+	);
+
+	const addComment = (text: string) => {
+		const file = diff?.files.find((item) => item.path === picked?.path);
+		if (picked === null || file === undefined) return;
+		setComments((current) => [...current, { ...picked, id: crypto.randomUUID(), code: codeIn(file, picked), text }]);
+		setPicked(null);
+	};
 
 	const load = useCallback(async () => {
 		setLoading(true);
@@ -129,10 +174,20 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 				<DiffRows
 					rows={rows}
 					mode={mode}
+					picking={picking}
 					onToggle={(file) => setToggled((current) => new Map(current).set(file.path, !isOpen(file)))}
 					onLoadFull={(path) => void loadFullFile(path)}
 				/>
 			)}
+			<CommentTray
+				workspace={workspace}
+				picked={picked}
+				comments={comments}
+				onAdd={addComment}
+				onCancel={() => setPicked(null)}
+				onRemove={(id) => setComments((current) => current.filter((comment) => comment.id !== id))}
+				onSent={() => setComments([])}
+			/>
 		</div>
 	);
 };
@@ -202,16 +257,120 @@ const CommitBar = ({
 	);
 };
 
+const CommentTray = ({
+	workspace,
+	picked,
+	comments,
+	onAdd,
+	onCancel,
+	onRemove,
+	onSent,
+}: {
+	readonly workspace: Workspace;
+	readonly picked: LineRange | null;
+	readonly comments: ReadonlyArray<DiffComment>;
+	readonly onAdd: (text: string) => void;
+	readonly onCancel: () => void;
+	readonly onRemove: (id: string) => void;
+	readonly onSent: () => void;
+}) => {
+	const [text, setText] = useState("");
+	const [sending, setSending] = useState(false);
+	const sessionId = useAppState((current) =>
+		current.selectedSessionId !== null && current.sessions[current.selectedSessionId]?.workspaceId === workspace.id
+			? current.selectedSessionId
+			: null,
+	);
+	if (picked === null && comments.length === 0) return null;
+
+	const add = () => {
+		if (text.trim() === "") return;
+		onAdd(text);
+		setText("");
+	};
+	const send = async () => {
+		setSending(true);
+		// With no chat open here, start one so the comments still reach an agent. newChat explains a failure.
+		const target = sessionId ?? (await newChat(workspace.id));
+		// A refused send waits in that chat's composer with the daemon's reason, so the comments are not lost.
+		if (target !== null && (await sendMessage(target, diffCommentsMessage(comments), [], false))) {
+			toast("Sent the comments to the agent.", "info");
+			onSent();
+		}
+		setSending(false);
+	};
+
+	return (
+		<div className="flex max-h-[45%] shrink-0 flex-col gap-2 overflow-y-auto border-t border-border bg-card p-3 text-xs">
+			{comments.map((comment) => (
+				<div key={comment.id} className="flex items-start gap-2">
+					<div className="min-w-0 flex-1">
+						<p className="truncate font-mono text-muted-foreground">{rangeLabel(comment)}</p>
+						<p className="whitespace-pre-wrap">{comment.text}</p>
+					</div>
+					<Button variant="ghost" size="icon-xs" aria-label="Remove comment" onClick={() => onRemove(comment.id)}>
+						<XIcon />
+					</Button>
+				</div>
+			))}
+			{picked === null ? null : (
+				<form
+					className="flex flex-col gap-1.5"
+					onSubmit={(event) => {
+						event.preventDefault();
+						add();
+					}}
+				>
+					<p className="font-mono text-muted-foreground">
+						{rangeLabel(picked)} <span className="font-sans">(shift-click another line for a range)</span>
+					</p>
+					<Textarea
+						autoFocus
+						value={text}
+						onChange={(event) => setText(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+								event.preventDefault();
+								add();
+							}
+							if (event.key === "Escape") onCancel();
+						}}
+						placeholder="Comment for the agent"
+						aria-label="Comment for the agent"
+						className="min-h-14 text-xs md:text-xs"
+					/>
+					<div className="flex gap-1.5">
+						<Button type="submit" size="xs" disabled={text.trim() === ""}>
+							Add comment
+						</Button>
+						<Button type="button" size="xs" variant="ghost" onClick={onCancel}>
+							Cancel
+						</Button>
+					</div>
+				</form>
+			)}
+			{comments.length === 0 ? null : (
+				<Button variant="secondary" size="sm" className="self-start" disabled={sending} onClick={() => void send()}>
+					<SendIcon />
+					Send {comments.length === 1 ? "1 comment" : `${comments.length} comments`} to the agent
+				</Button>
+			)}
+		</div>
+	);
+};
+
 const ROW_HEIGHTS: Record<DiffRow["type"], number> = { file: 32, hunk: 24, line: 20, pair: 20, notice: 36 };
 
 const DiffRows = ({
 	rows,
 	mode,
+	picking,
 	onToggle,
 	onLoadFull,
 }: {
 	readonly rows: ReadonlyArray<DiffRow>;
 	readonly mode: "unified" | "split";
+	readonly picking?: LinePicking;
 	readonly onToggle?: (file: DiffFile) => void;
 	readonly onLoadFull?: (path: string) => void;
 }) => {
@@ -239,7 +398,7 @@ const DiffRows = ({
 							className="absolute inset-x-0"
 							style={{ transform: `translateY(${virtualRow.start}px)` }}
 						>
-							<RowView row={row} mode={mode} onToggle={onToggle} onLoadFull={onLoadFull} />
+							<RowView row={row} mode={mode} picking={picking} onToggle={onToggle} onLoadFull={onLoadFull} />
 						</div>
 					);
 				})}
@@ -251,11 +410,13 @@ const DiffRows = ({
 const RowView = ({
 	row,
 	mode,
+	picking,
 	onToggle,
 	onLoadFull,
 }: {
 	readonly row: DiffRow;
 	readonly mode: "unified" | "split";
+	readonly picking: LinePicking | undefined;
 	readonly onToggle: ((file: DiffFile) => void) | undefined;
 	readonly onLoadFull: ((path: string) => void) | undefined;
 }) => {
@@ -303,22 +464,35 @@ const RowView = ({
 					)}
 				</div>
 			);
-		case "line":
+		case "line": {
+			const side = sideOf(row.line);
+			const pick = { path: row.path, side, line: numberOn(row.line, side), picking };
 			return (
 				<div className={cn("flex min-h-5", lineTone(row.line))}>
-					<LineNumber value={row.line.oldLine} />
-					<LineNumber value={row.line.newLine} />
+					<LineNumber value={row.line.oldLine} pick={pick} />
+					<LineNumber value={row.line.newLine} pick={pick} />
 					<span className="w-4 shrink-0 text-center text-muted-foreground/60 select-none">
 						{MARKERS[row.line.kind]}
 					</span>
 					<LineText line={row.line} segments={row.segments} />
 				</div>
 			);
+		}
 		case "pair":
 			return mode === "split" ? (
 				<div className="grid min-h-5 grid-cols-2">
-					<Half line={row.left} number={row.left?.oldLine ?? null} segments={row.leftSegments} />
-					<Half line={row.right} number={row.right?.newLine ?? null} segments={row.rightSegments} />
+					<Half
+						line={row.left}
+						number={row.left?.oldLine ?? null}
+						segments={row.leftSegments}
+						pick={{ path: row.path, side: "old", line: row.left?.oldLine ?? null, picking }}
+					/>
+					<Half
+						line={row.right}
+						number={row.right?.newLine ?? null}
+						segments={row.rightSegments}
+						pick={{ path: row.path, side: "new", line: row.right?.newLine ?? null, picking }}
+					/>
 				</div>
 			) : null;
 	}
@@ -329,9 +503,33 @@ const MARKERS = { add: "+", delete: "-", context: " " } as const;
 const lineTone = (line: DiffLine) =>
 	line.kind === "add" ? "bg-diff-add" : line.kind === "delete" ? "bg-diff-delete" : "";
 
-const LineNumber = ({ value }: { readonly value: number | null }) => (
-	<span className="w-10 shrink-0 pr-2 text-right text-muted-foreground/60 select-none">{value ?? ""}</span>
-);
+// The line a number stands for when clicked: in unified view both numbers pick the line's own side.
+interface PickTarget {
+	readonly path: string;
+	readonly side: DiffSide;
+	readonly line: number | null;
+	readonly picking: LinePicking | undefined;
+}
+
+const LineNumber = ({ value, pick }: { readonly value: number | null; readonly pick: PickTarget }) => {
+	const { path, side, line, picking } = pick;
+	const className = "w-10 shrink-0 pr-2 text-right text-muted-foreground/60 select-none";
+	if (picking === undefined || line === null || value === null) return <span className={className}>{value ?? ""}</span>;
+	return (
+		<button
+			type="button"
+			aria-label={`Comment on line ${line}`}
+			onClick={(event) => picking.onPick({ path, side, start: line, end: line }, event.shiftKey)}
+			className={cn(
+				className,
+				"cursor-pointer hover:bg-running/20 hover:text-foreground",
+				picking.marked(path, side, line) && "bg-running/30 text-foreground",
+			)}
+		>
+			{value}
+		</button>
+	);
+};
 
 const LineText = ({
 	line,
@@ -362,16 +560,18 @@ const Half = ({
 	line,
 	number,
 	segments,
+	pick,
 }: {
 	readonly line: DiffLine | null;
 	readonly number: number | null;
 	readonly segments: ReadonlyArray<Segment> | null;
+	readonly pick: PickTarget;
 }) =>
 	line === null ? (
 		<div className="bg-muted/40" />
 	) : (
 		<div className={cn("flex min-w-0 border-r border-border last:border-r-0", lineTone(line))}>
-			<LineNumber value={number} />
+			<LineNumber value={number} pick={pick} />
 			<LineText line={line} segments={segments} />
 		</div>
 	);
