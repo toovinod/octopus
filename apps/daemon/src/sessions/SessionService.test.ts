@@ -766,6 +766,36 @@ describe("SessionService", () => {
 		expect(result.files).toEqual([]);
 	});
 
+	test("a send cancelled before the agent takes it leaves the session idle and no image on disk", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		// An agent that never accepts the message, like a client that disconnects mid-send.
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: (input) =>
+				Effect.map(replay.startSession(input), (handle) => ({ ...handle, sendMessage: () => Effect.never })),
+		};
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const fs = yield* FileSystem.FileSystem;
+					const session = yield* addSession(tempDir);
+					const send = yield* Effect.forkChild(sessions.sendMessage(session.id, "hello", [image], false));
+					yield* waitForStatus(session.id, "running");
+					yield* Fiber.interrupt(send);
+					yield* waitForStatus(session.id, "idle");
+					const directory = join(tempDir, "data", "attachments", session.id);
+					return (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [];
+				}),
+			),
+		);
+		expect(result).toEqual([]);
+	});
+
 	test("refuses images for a model that cannot read them", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
 		const { models } = await Effect.runPromise(replay.listModels);

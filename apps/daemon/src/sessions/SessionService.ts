@@ -477,13 +477,16 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* refreshStatus(runtime);
 				const sent = yield* runtime.handle.sendMessage(message, { steer }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
-					Effect.tapError(() =>
-						Effect.gen(function* () {
-							runtime.outstanding--;
-							yield* refreshStatus(runtime);
-							// The message was not stored, so nothing will ever ask for its images.
-							yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
-						}),
+					// Also on interruption, for example when the client disconnects mid-send.
+					Effect.onExit((exit) =>
+						Exit.isSuccess(exit)
+							? Effect.void
+							: Effect.gen(function* () {
+									runtime.outstanding--;
+									yield* refreshStatus(runtime);
+									// The message was not stored, so nothing will ever ask for its images.
+									yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
+								}),
 					),
 				);
 				if (sent === "steered") {
