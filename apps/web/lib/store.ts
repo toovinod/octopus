@@ -27,6 +27,7 @@ export type DialogState =
 	| { readonly kind: "palette" }
 	| { readonly kind: "newProject" }
 	| { readonly kind: "newWorkspace"; readonly projectId: string }
+	| { readonly kind: "removeProject"; readonly projectId: string }
 	| { readonly kind: "settings"; readonly tab: "accounts" | "appearance" | "notifications" }
 	| { readonly kind: "workspaceSettings"; readonly workspaceId: string };
 
@@ -245,15 +246,32 @@ export const createProject = async (parentPath: string, name: string) => {
 	return project;
 };
 
+// The daemon refuses while the project has active workspaces, so only archived ones and their chats remain here.
 export const removeProject = async (projectId: string) => {
 	const done = await attempt(() => callDaemon((daemon) => daemon.removeProject({ projectId })));
-	if (done === null) return;
+	if (done === null) return false;
+	const removed = new Set(
+		Object.values(state.workspaces)
+			.filter((workspace) => workspace.projectId === projectId)
+			.map((workspace) => workspace.id),
+	);
+	const kept = <A>(record: Readonly<Record<string, A>>, workspaceOf: (key: string) => string | undefined) =>
+		Object.fromEntries(Object.entries(record).filter(([key]) => !removed.has(workspaceOf(key) ?? "")));
+	const sessionWorkspace = (sessionId: string) => state.sessions[sessionId]?.workspaceId;
+	const selectionRemoved = state.selectedWorkspaceId !== null && removed.has(state.selectedWorkspaceId);
+	for (const [sessionId, sends] of Object.entries(state.failedSends)) {
+		if (removed.has(sessionWorkspace(sessionId) ?? "")) releaseImages(sends.flatMap((send) => send.images));
+	}
 	setState((current) => ({
 		projects: without(current.projects, projectId),
-		workspaces: Object.fromEntries(
-			Object.entries(current.workspaces).filter(([, workspace]) => workspace.projectId !== projectId),
-		),
+		workspaces: kept(current.workspaces, (workspaceId) => workspaceId),
+		sessions: kept(current.sessions, sessionWorkspace),
+		attention: kept(current.attention, sessionWorkspace),
+		failedSends: kept(current.failedSends, sessionWorkspace),
+		...(selectionRemoved ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
+	if (selectionRemoved) closeChat();
+	return true;
 };
 
 export const setProjectTrust = async (projectId: string, trusted: boolean) => {

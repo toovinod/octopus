@@ -12,6 +12,7 @@ import { Toaster } from "@repo/ui/components/sonner";
 import { Button } from "@repo/ui/components/button";
 import { WorkspaceSettingsDialog } from "./WorkspaceSettingsDialog.tsx";
 import { NewWorkspaceDialog } from "./NewWorkspaceDialog.tsx";
+import { RemoveProjectDialog } from "./RemoveProjectDialog.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
 import { CommandPalette } from "./CommandPalette.tsx";
 import { SettingsDialog } from "./SettingsDialog.tsx";
@@ -136,6 +137,7 @@ export const App = () => {
 				<CommandPalette />
 				<NewProjectDialog />
 				<NewWorkspaceDialog />
+				<RemoveProjectDialog />
 				<WorkspaceSettingsDialog />
 				<SettingsDialog />
 				<Toaster position="bottom-right" />
