@@ -28,8 +28,8 @@ const { discardFailedSend, failedSendsOf, getState, retryFailedSend, sendMessage
 describe("failed sends", () => {
 	test("keep a refused message per chat until it is retried or discarded", async () => {
 		outcomes.push("busy", "busy", "ok");
-		await sendMessage("a", "first", [], false);
-		await sendMessage("a", "second", [], false);
+		expect(await sendMessage("a", "first", [], false)).toBe(false);
+		expect(await sendMessage("a", "second", [], false)).toBe(false);
 		expect(failedSendsOf(getState(), "a").map(({ text, error }) => [text, error])).toEqual([
 			["first", "The agent is busy. Try again."],
 			["second", "The agent is busy. Try again."],
@@ -37,7 +37,7 @@ describe("failed sends", () => {
 		expect(failedSendsOf(getState(), "b")).toEqual([]);
 
 		const [first, second] = failedSendsOf(getState(), "a");
-		await retryFailedSend("a", first?.id ?? -1, false);
+		expect(await retryFailedSend("a", first?.id ?? -1, false)).toBe(true);
 		expect(failedSendsOf(getState(), "a").map(({ text }) => text)).toEqual(["second"]);
 
 		discardFailedSend("a", second?.id ?? -1);
@@ -49,7 +49,7 @@ describe("failed sends", () => {
 		outcomes.push("busy", "busy");
 		await sendMessage("c", "hello", [], true);
 		const [failed] = failedSendsOf(getState(), "c");
-		await retryFailedSend("c", failed?.id ?? -1, true);
+		expect(await retryFailedSend("c", failed?.id ?? -1, true)).toBe(false);
 		expect(failedSendsOf(getState(), "c").map(({ text }) => text)).toEqual(["hello"]);
 	});
 });

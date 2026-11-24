@@ -441,25 +441,30 @@ const releaseImages = (images: ReadonlyArray<DraftImage>) => {
 };
 
 // A refused message is kept with the daemon's reason, for the composer to offer Retry and Discard.
-export const sendMessage = async (
+// Resolves to whether the daemon took the message.
+export const sendMessage = (
 	sessionId: string,
 	text: string,
 	images: ReadonlyArray<DraftImage>,
 	steer: boolean,
-) => {
+): Promise<boolean> => {
 	const payload = images.map(({ mediaType, base64 }) => ({ mediaType, base64 }));
-	await callDaemon((daemon) => daemon.sendMessage({ sessionId, text, images: payload, steer })).then(
-		() => releaseImages(images),
+	return callDaemon((daemon) => daemon.sendMessage({ sessionId, text, images: payload, steer })).then(
+		() => {
+			releaseImages(images);
+			return true;
+		},
 		(error: unknown) => {
 			const failed = { id: nextFailedSend++, text, images, error: errorMessage(error) };
 			setFailedSends(sessionId, (sends) => [...sends, failed]);
+			return false;
 		},
 	);
 };
 
 export const retryFailedSend = (sessionId: string, id: number, steer: boolean) => {
 	const failed = failedSendsOf(state, sessionId).find((send) => send.id === id);
-	if (failed === undefined) return Promise.resolve();
+	if (failed === undefined) return Promise.resolve(false);
 	setFailedSends(sessionId, (sends) => sends.filter((send) => send.id !== id));
 	return sendMessage(sessionId, failed.text, failed.images, steer);
 };
