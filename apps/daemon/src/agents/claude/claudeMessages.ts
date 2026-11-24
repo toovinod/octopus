@@ -18,6 +18,10 @@ const StreamEvent = Schema.Union([
 				type: Schema.Literal("text_delta"),
 				text: Schema.String,
 			}),
+			Schema.Struct({
+				type: Schema.Literal("thinking_delta"),
+				thinking: Schema.String,
+			}),
 			Other,
 		]),
 	}),
@@ -26,6 +30,7 @@ const StreamEvent = Schema.Union([
 
 const AssistantBlock = Schema.Union([
 	Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
+	Schema.Struct({ type: Schema.Literal("thinking"), thinking: Schema.String }),
 	Schema.Struct({
 		type: Schema.Literal("tool_use"),
 		id: Schema.String,

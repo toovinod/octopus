@@ -50,6 +50,16 @@ export const AgentMessageDelta = Schema.Struct({
 	delta: Schema.String,
 });
 
+export const ReasoningSummaryDelta = Schema.Struct({
+	itemId: Schema.String,
+	delta: Schema.String,
+});
+
+export const ReasoningSummaryPartAdded = Schema.Struct({
+	itemId: Schema.String,
+	summaryIndex: Schema.Int,
+});
+
 const Status = Schema.Literals(["inProgress", "completed", "failed", "declined"]);
 
 export const ThreadItem = Schema.Union([
@@ -87,6 +97,12 @@ export const ThreadItem = Schema.Union([
 		tool: Schema.String,
 		status: Status,
 		error: Schema.NullOr(Schema.Struct({ message: Schema.String })),
+	}),
+	// Codex shows a summary of the model's reasoning. The raw content is only for open models.
+	Schema.Struct({
+		type: Schema.Literal("reasoning"),
+		id: Schema.String,
+		summary: Schema.Array(Schema.String),
 	}),
 	Schema.Struct({ type: Schema.String, id: Schema.String }),
 ]);

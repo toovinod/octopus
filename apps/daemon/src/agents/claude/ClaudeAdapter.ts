@@ -223,6 +223,14 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 						text: event.delta.text,
 					});
 				}
+				if ("delta" in event && "thinking" in event.delta) {
+					const messageId = yield* Ref.get(streamingMessageId);
+					return yield* session.emit({
+						type: "reasoning.delta",
+						itemId: `${messageId}:${event.index}`,
+						text: event.delta.thinking,
+					});
+				}
 				return;
 			}
 			case "assistant": {
@@ -249,6 +257,15 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 							itemId,
 							text: block.text,
 						});
+					} else if ("thinking" in block) {
+						// With display "omitted" the block arrives empty, and there is nothing to show.
+						if (block.thinking !== "") {
+							yield* session.emit({
+								type: "reasoning.completed",
+								itemId,
+								text: block.thinking,
+							});
+						}
 					} else if ("name" in block) {
 						const tool = toToolCall(block.name, block.input);
 						tools.set(block.id, tool);
@@ -406,6 +423,8 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 					cwd: input.cwd,
 					model: input.model,
 					includePartialMessages: true,
+					// Claude Code omits thinking text unless asked, and Octopus shows it.
+					thinking: { type: "adaptive", display: "summarized" },
 					canUseTool,
 					// Never inherit a mode such as bypassPermissions from a settings file.
 					permissionMode: "default",

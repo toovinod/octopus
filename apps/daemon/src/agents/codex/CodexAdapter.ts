@@ -1,6 +1,8 @@
 import {
 	AccountResponse,
 	AgentMessageDelta,
+	ReasoningSummaryDelta,
+	ReasoningSummaryPartAdded,
 	CommandApprovalParams,
 	decodeCodex,
 	ErrorNotification,
@@ -174,6 +176,8 @@ const isAuthFailure = (error: { readonly message: string; readonly codexErrorInf
 		)) ||
 	isAuthFailureText(error.message);
 
+const reasoningPartSeparator = "\n\n";
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
 	currentTurn: Ref.Ref<TurnState>,
@@ -187,6 +191,24 @@ const handleNotification = Effect.fnUntraced(function* (
 				type: "message.delta",
 				itemId,
 				text: delta,
+			});
+		}
+		case "item/reasoning/summaryTextDelta": {
+			const { itemId, delta } = yield* decodeCodex(ReasoningSummaryDelta)(params);
+			return yield* session.emit({
+				type: "reasoning.delta",
+				itemId,
+				text: delta,
+			});
+		}
+		// Each summary part is its own paragraph, the way the completed item joins them.
+		case "item/reasoning/summaryPartAdded": {
+			const { itemId, summaryIndex } = yield* decodeCodex(ReasoningSummaryPartAdded)(params);
+			if (summaryIndex === 0) return;
+			return yield* session.emit({
+				type: "reasoning.delta",
+				itemId,
+				text: reasoningPartSeparator,
 			});
 		}
 		case "item/started": {
@@ -206,6 +228,15 @@ const handleNotification = Effect.fnUntraced(function* (
 					type: "message.completed",
 					itemId: item.id,
 					text: item.text,
+				});
+			}
+			if (item.type === "reasoning" && "summary" in item) {
+				const text = item.summary.join(reasoningPartSeparator);
+				if (text === "") return;
+				return yield* session.emit({
+					type: "reasoning.completed",
+					itemId: item.id,
+					text,
 				});
 			}
 			const tool = toToolCall(item);

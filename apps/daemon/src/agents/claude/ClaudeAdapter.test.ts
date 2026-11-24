@@ -54,6 +54,45 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							session_id: options.resume ?? "claude-new",
 						};
 					}
+					if (text.includes("think")) {
+						// Recorded from claude 2.1.331 with summarized thinking: the thinking block and the
+						// reply share a message id, and each arrives as its own assistant message.
+						const delta = (index: number, delta: object) => ({
+							type: "stream_event",
+							parent_tool_use_id: null,
+							event: { type: "content_block_delta", index, delta },
+						});
+						yield {
+							type: "stream_event",
+							parent_tool_use_id: null,
+							event: { type: "message_start", message: { id: "msg_t" } },
+						};
+						yield delta(0, { type: "thinking_delta", thinking: "Split 17 by 23", estimated_tokens: null });
+						yield delta(0, { type: "thinking_delta", thinking: " into parts.", estimated_tokens: null });
+						yield delta(0, { type: "signature_delta", signature: "sig" });
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: {
+								id: "msg_t",
+								content: [{ type: "thinking", thinking: "Split 17 by 23 into parts.", signature: "sig" }],
+							},
+						};
+						yield delta(1, { type: "text_delta", text: "391" });
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_t", content: [{ type: "text", text: "391" }] },
+						};
+						// With display "omitted" a thinking block has no text.
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_u", content: [{ type: "thinking", thinking: "", signature: "sig" }] },
+						};
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					yield {
 						type: "stream_event",
 						parent_tool_use_id: null,
@@ -283,6 +322,24 @@ describe("ClaudeAdapter", () => {
 				turnId: "result-1",
 				result: { status: "completed" },
 			},
+		]);
+	});
+
+	test("streams summarized thinking and stores it under the block's own item id", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("think"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(startedWith.at(-1)?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(events.filter((event) => event.type !== "user.message" && event.type !== "session.started")).toEqual([
+			{ type: "reasoning.delta", itemId: "msg_t:0", text: "Split 17 by 23" },
+			{ type: "reasoning.delta", itemId: "msg_t:0", text: " into parts." },
+			{ type: "reasoning.completed", itemId: "msg_t:0", text: "Split 17 by 23 into parts." },
+			{ type: "message.delta", itemId: "msg_t:1", text: "391" },
+			{ type: "message.completed", itemId: "msg_t:1", text: "391" },
+			{ type: "turn.completed", turnId: "result-1", result: { status: "completed" } },
 		]);
 	});
 

@@ -110,6 +110,24 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("think")) {
+		const reasoning = { threadId, turnId, itemId: "rs-1" };
+		notify("item/started", { item: { type: "reasoning", id: "rs-1", summary: [], content: [] }, threadId, turnId });
+		notify("item/reasoning/summaryPartAdded", { ...reasoning, summaryIndex: 0 });
+		notify("item/reasoning/summaryTextDelta", { ...reasoning, delta: "Read the ", summaryIndex: 0 });
+		notify("item/reasoning/summaryTextDelta", { ...reasoning, delta: "tests", summaryIndex: 0 });
+		notify("item/reasoning/summaryPartAdded", { ...reasoning, summaryIndex: 1 });
+		notify("item/reasoning/summaryTextDelta", { ...reasoning, delta: "Then run them", summaryIndex: 1 });
+		notify("item/completed", {
+			item: { type: "reasoning", id: "rs-1", summary: ["Read the tests", "Then run them"], content: [] },
+			threadId,
+			turnId,
+		});
+		// Reasoning with no summary has nothing to show.
+		notify("item/completed", { item: { type: "reasoning", id: "rs-2", summary: [], content: [] }, threadId, turnId });
+		notify("item/completed", { item: { type: "agentMessage", id: "msg-1", text: "Done" }, threadId, turnId });
+		return completeTurn("completed");
+	}
 	if (text.includes("settings")) {
 		notify("item/completed", {
 			item: { type: "agentMessage", id: "msg-1", text: `${params.model}/${params.effort}` },
