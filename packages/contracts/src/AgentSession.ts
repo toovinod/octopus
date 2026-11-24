@@ -184,14 +184,19 @@ export class AuthModeNotAllowedError extends Schema.TaggedError<AuthModeNotAllow
 }
 
 // Full access runs commands and edits without asking, so a project's own files must not be able to start it.
+const modeRefusals = {
+	notOffered: "This agent does not offer that mode.",
+	untrustedProject: "Full access runs commands without asking. Trust the project first, then choose it again.",
+	fork: "Full access is off for a pull request from a fork, since anyone can write its code. Pick another mode.",
+} as const;
+
 export class ModeNotAllowedError extends Schema.TaggedError<ModeNotAllowedError>()("ModeNotAllowedError", {
 	agent: AgentKind,
 	mode: AgentMode,
+	reason: Schema.Literals(["notOffered", "untrustedProject", "fork"]),
 }) {
 	override get message() {
-		return this.mode === "fullAccess"
-			? "Full access runs commands without asking. Trust the project first, then choose it again."
-			: "This agent does not offer that mode.";
+		return modeRefusals[this.reason];
 	}
 }
 

@@ -36,6 +36,8 @@ export const workspace = sqliteTable(
 		baseBranch: text().notNull(),
 		status: text({ enum: WorkspaceStatus.literals }).notNull(),
 		pullRequestUrl: text(),
+		// A pull request from a fork: anyone on GitHub can write its code, so it never gets the project's trust.
+		fromFork: integer({ mode: "boolean" }).notNull().default(false),
 		createdAt: text().notNull(),
 		archivedAt: text(),
 	},

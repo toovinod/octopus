@@ -401,16 +401,27 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return { mode: "apiKey", apiKey: apiKey.value } satisfies StartSessionInput["auth"];
 		});
 
-		const startRuntime = Effect.fnUntraced(function* (row: SessionRow) {
+		// A workspace's code is trusted when its project is, unless it is a fork's pull request.
+		const workspaceTrust = Effect.fnUntraced(function* (workspaceId: string) {
 			const [target] = yield* database.query((db) =>
 				db
-					.select({ path: workspace.path, status: workspace.status, trusted: project.trusted })
+					.select({
+						path: workspace.path,
+						status: workspace.status,
+						projectTrusted: project.trusted,
+						fromFork: workspace.fromFork,
+					})
 					.from(workspace)
 					.innerJoin(project, eq(workspace.projectId, project.id))
-					.where(eq(workspace.id, row.workspaceId)),
+					.where(eq(workspace.id, workspaceId)),
 			);
-			// The foreign key keeps the workspace while the session exists.
+			// The foreign key keeps the workspace while a session in it exists.
 			if (target === undefined) return yield* Effect.die("The session's workspace is missing");
+			return { ...target, trusted: target.projectTrusted && !target.fromFork };
+		});
+
+		const startRuntime = Effect.fnUntraced(function* (row: SessionRow) {
+			const target = yield* workspaceTrust(row.workspaceId);
 			// An archived worktree folder is gone, and an archived in-place workspace should stay quiet.
 			if (target.status === "archived") {
 				return yield* new WorkspaceArchivedError({ workspaceId: row.workspaceId });
@@ -420,7 +431,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			// The project may have lost its trust since full access was chosen.
 			if (mode === "fullAccess" && !target.trusted) {
 				mode = defaultMode(row.agent);
-				yield* Effect.logWarning("Starting a full access session in its default mode, its project is not trusted").pipe(
+				yield* Effect.logWarning("Starting a full access session in its default mode, its code is not trusted").pipe(
 					Effect.annotateLogs({ sessionId: row.id }),
 				);
 			}
@@ -686,18 +697,16 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		) {
 			const row = yield* getRow(sessionId);
 			if (!adapters[row.agent].capabilities.modes.includes(settings.mode)) {
-				return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode });
+				return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode, reason: "notOffered" });
 			}
 			if (settings.mode === "fullAccess") {
-				const [target] = yield* database.query((db) =>
-					db
-						.select({ trusted: project.trusted })
-						.from(workspace)
-						.innerJoin(project, eq(workspace.projectId, project.id))
-						.where(eq(workspace.id, row.workspaceId)),
-				);
-				if (target?.trusted !== true) {
-					return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode });
+				const target = yield* workspaceTrust(row.workspaceId);
+				if (!target.trusted) {
+					return yield* new ModeNotAllowedError({
+						agent: row.agent,
+						mode: settings.mode,
+						reason: target.fromFork ? "fork" : "untrustedProject",
+					});
 				}
 			}
 			// Applied before it is stored, so a change the agent refuses never shows as the session's settings.

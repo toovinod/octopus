@@ -1,0 +1,1 @@
+ALTER TABLE `workspace` ADD `fromFork` integer DEFAULT false NOT NULL;

@@ -163,8 +163,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 
 			// Where a worktree workspace's code comes from: a new branch, one that exists, or a pull request.
 			// `ownsBranch` says whether the branch was made for the workspace, so undoing the worktree may delete it.
-			// `runSetup` is false for a fork's pull request: the setup script (an install, say) would run code
-			// that anyone on GitHub can write, so the user starts it once they have read the change.
+			// `fromFork` marks a fork's pull request. Its setup script (an install, say) would run code that anyone
+			// on GitHub can write, so the user starts it once they have read the change, and its agents never get
+			// the project's trust.
 			const planWorktree = Effect.fn("WorkspaceService.planWorktree")(function* (
 				owner: Project,
 				input: Exclude<CreateWorkspaceInput, { readonly kind: "inPlace" }>,
@@ -176,7 +177,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.name,
 							baseBranch,
 							ownsBranch: true,
-							runSetup: true,
+							fromFork: false,
 							add: (worktreePath: string) =>
 								createWorktree({ repositoryPath: owner.path, worktreePath, branch: input.name, baseBranch }),
 						};
@@ -186,7 +187,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.branch,
 							baseBranch: owner.defaultBranch,
 							ownsBranch: false,
-							runSetup: true,
+							fromFork: false,
 							add: (worktreePath: string) =>
 								addBranchWorktree({ repositoryPath: owner.path, worktreePath, branch: input.branch }),
 						};
@@ -196,7 +197,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: head.branch,
 							baseBranch: head.baseBranch,
 							ownsBranch: false,
-							runSetup: !head.fromFork,
+							fromFork: head.fromFork,
 							add: (worktreePath: string) =>
 								checkoutPullRequest({
 									repositoryPath: owner.path,
@@ -243,6 +244,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					projectId: owner.id,
 					status: "active",
 					pullRequestUrl: null,
+					fromFork: false,
 					createdAt: now,
 					archivedAt: null,
 				} as const;
@@ -268,8 +270,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						path,
 						branch: plan.branch,
 						baseBranch: plan.baseBranch,
+						fromFork: plan.fromFork,
 					};
-					setupRun = plan.runSetup ? yield* newSetupRun(owner, id) : null;
+					setupRun = plan.fromFork ? null : yield* newSetupRun(owner, id);
 				} else {
 					const current = yield* runGit(owner.path, ["branch", "--show-current"]);
 					row = {

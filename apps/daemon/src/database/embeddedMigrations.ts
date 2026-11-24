@@ -1,3 +1,4 @@
+import workspaceFromFork from "./migrations/20261124201152_workspaceFromFork/migration.sql" with { type: "text" };
 import sessionEffort from "./migrations/20261107172147_sessionEffort/migration.sql" with { type: "text" };
 import projectTrust from "./migrations/20261107165335_projectTrust/migration.sql" with { type: "text" };
 import sessionMode from "./migrations/20261124194508_sessionMode/migration.sql" with { type: "text" };
@@ -12,6 +13,7 @@ const migrationFiles = [
 	{ name: "20261107165335_projectTrust", sql: projectTrust },
 	{ name: "20261107172147_sessionEffort", sql: sessionEffort },
 	{ name: "20261124194508_sessionMode", sql: sessionMode },
+	{ name: "20261124201152_workspaceFromFork", sql: workspaceFromFork },
 ] as const;
 
 // Mirrors drizzle's readMigrationFiles so hashes match migrations applied from the folder.
