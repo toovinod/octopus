@@ -359,7 +359,13 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 								},
 								(outcome) => Deferred.succeed(answered, outcome),
 							);
-							const outcome = yield* Deferred.await(answered);
+							// The SDK aborts a request it no longer needs. Withdraw it, or the session waits on it forever.
+							const withdraw = () => Effect.runForkWith(context)(session.cancelApproval(request.toolUseID));
+							if (request.signal.aborted) withdraw();
+							request.signal.addEventListener("abort", withdraw, { once: true });
+							const outcome = yield* Deferred.await(answered).pipe(
+								Effect.ensuring(Effect.sync(() => request.signal.removeEventListener("abort", withdraw))),
+							);
 							return toPermissionResult(outcome, toolInput, suggestions);
 						}),
 					);

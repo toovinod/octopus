@@ -106,6 +106,21 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						};
 						continue;
 					}
+					if (text.includes("abort")) {
+						// The SDK aborts a permission request it no longer needs, for example when the turn ends.
+						const controller = new AbortController();
+						const permission = options.canUseTool?.(
+							"Bash",
+							{ command: "bun test" },
+							{ signal: controller.signal, toolUseID: "toolu_2", requestId: "req_2" },
+						);
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						controller.abort();
+						const result = await permission;
+						if (result) permissions.push(result);
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("approve")) {
 						const input = { command: "bun test" };
 						yield {
@@ -326,6 +341,25 @@ describe("ClaudeAdapter", () => {
 			},
 		]);
 		expect(permissions).toMatchObject([{ behavior: "deny", interrupt: true }]);
+	});
+
+	test("an aborted permission request resolves as cancelled, so the session stops awaiting it", async () => {
+		const permissions: Array<PermissionResult> = [];
+		const [events, error] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("abort"));
+					const events = yield* takeUntil(handle, "turn.completed");
+					return [events, yield* Effect.flip(handle.respondToApproval("toolu_2", "allowOnce"))] as const;
+				}),
+			{ permissions },
+		);
+		expect(events.filter((event) => event.type.startsWith("approval."))).toEqual([
+			expect.objectContaining({ type: "approval.requested", requestId: "toolu_2" }),
+			{ type: "approval.resolved", requestId: "toolu_2", outcome: "cancelled" },
+		]);
+		expect(error._tag).toBe("ApprovalNotFoundError");
+		expect(permissions).toMatchObject([{ behavior: "deny" }]);
 	});
 
 	test("resumes an existing session", async () => {

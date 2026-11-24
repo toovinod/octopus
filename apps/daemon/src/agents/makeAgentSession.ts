@@ -30,6 +30,8 @@ export interface TurnDriver {
 export interface AgentSession {
 	emit(event: AgentEvent): Effect.Effect<void>;
 	requestApproval(request: ApprovalRequest, respond: RespondToAgent): Effect.Effect<void>;
+	// For an agent that withdraws its own request. Does nothing once the request is answered.
+	cancelApproval(requestId: string): Effect.Effect<void, AgentError>;
 	setNativeSessionId(id: string): Effect.Effect<void>;
 	readonly nativeSessionId: Effect.Effect<string, AgentError>;
 	fail(error: AgentError): Effect.Effect<void>;
@@ -71,14 +73,18 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	const resolve = (requestId: string, outcome: ApprovalOutcome) =>
 		emit({ type: "approval.resolved", requestId, outcome });
 
-	const cancelApprovals = Effect.gen(function* () {
-		const pending = [...approvals.entries()];
-		approvals.clear();
-		for (const [requestId, approval] of pending) {
+	const cancelApproval = (requestId: string) =>
+		Effect.gen(function* () {
+			const approval = approvals.get(requestId);
+			if (approval === undefined) return;
+			approvals.delete(requestId);
 			yield* resolve(requestId, "cancelled");
 			yield* approval.respond("cancelled");
-		}
-	});
+		});
+
+	const cancelApprovals = Effect.suspend(() =>
+		Effect.forEach([...approvals.keys()], cancelApproval, { discard: true }),
+	);
 
 	const start = (driver: TurnDriver) =>
 		Effect.gen(function* () {
@@ -158,6 +164,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				approvals.set(request.requestId, { choices: request.choices, respond });
 				yield* emit({ type: "approval.requested", ...request });
 			}),
+		cancelApproval,
 		nativeSessionId: Deferred.await(nativeId),
 		setNativeSessionId: (id) =>
 			Effect.gen(function* () {
