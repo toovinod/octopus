@@ -26,13 +26,13 @@ import {
 	testAgentServices,
 } from "../testing/testAgentServices.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
+import { agentSession, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
 import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/AgentSession";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
-import { agentSession, sessionEvent } from "../database/schema.ts";
 import { makeAgentSession } from "../agents/makeAgentSession.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
@@ -1017,9 +1017,57 @@ describe("SessionService", () => {
 				return { notOffered, untrusted, trusted };
 			}),
 		);
-		expect(result.notOffered).toMatchObject({ _tag: "ModeNotAllowedError", mode: "auto" });
-		expect(result.untrusted).toMatchObject({ _tag: "ModeNotAllowedError", mode: "fullAccess" });
+		expect(result.notOffered).toMatchObject({ _tag: "ModeNotAllowedError", mode: "auto", reason: "notOffered" });
+		expect(result.untrusted).toMatchObject({
+			_tag: "ModeNotAllowedError",
+			mode: "fullAccess",
+			reason: "untrustedProject",
+		});
 		expect(result.trusted.mode).toBe("fullAccess");
+	});
+
+	test("never trusts a fork's pull request, even in a trusted project", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const inputs: Array<StartSessionInput> = [];
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: (input) => Effect.tap(replay.startSession(input), () => Effect.sync(() => void inputs.push(input))),
+		};
+		const refused = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const workspace = yield* addWorkspace(tempDir);
+					yield* Effect.flatMap(ProjectService, (projects) => projects.setTrust(workspace.projectId, true));
+					const start = (fromFork: boolean) =>
+						Effect.gen(function* () {
+							yield* Effect.flatMap(LocalDatabase, (database) =>
+								database.query((db) =>
+									db.update(workspaceTable).set({ fromFork }).where(eq(workspaceTable.id, workspace.id)),
+								),
+							);
+							const session = yield* sessions.create({
+								workspaceId: workspace.id,
+								agent: "codex",
+								model: "replay",
+								effort: null,
+							});
+							yield* sessions.sendMessage(session.id, "run the tests", [], false);
+							return session;
+						});
+					yield* start(false);
+					const fork = yield* start(true);
+					return yield* Effect.flip(
+						sessions.updateSettings(fork.id, { model: "replay", effort: null, mode: "fullAccess" }),
+					);
+				}),
+			),
+		);
+		expect(inputs.map((input) => input.trustProjectSettings)).toEqual([true, false]);
+		expect(refused).toMatchObject({ _tag: "ModeNotAllowedError", mode: "fullAccess", reason: "fork" });
 	});
 
 	test("keeps the mode the agent switches to by itself", async () => {

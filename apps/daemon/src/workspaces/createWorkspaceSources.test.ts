@@ -1,12 +1,15 @@
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { runServiceTest } from "../testing/runServiceTest.ts";
+import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { WorkspaceService } from "./WorkspaceService.ts";
 import { describe, expect, test } from "bun:test";
+import { workspace } from "../database/schema.ts";
 import { fakeGh } from "../testing/fakeGh.ts";
 import { GhSettings } from "../git/runGh.ts";
 import { Effect, FileSystem } from "effect";
 import { runGit } from "../git/runGit.ts";
+import { eq } from "drizzle-orm";
 import { join } from "node:path";
 
 const addProject = Effect.fn("addProject")(function* (tempDir: string) {
@@ -127,7 +130,7 @@ esac`,
 		expect(result.ghLog).toContain("pr checkout 7 --branch fix-bug");
 	});
 
-	test("names a fork's pull request branch after its number and skips the setup script", async () => {
+	test("names a fork's pull request branch after its number, skips the setup script and marks it a fork", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const project = yield* Effect.flatMap(ProjectService, (projects) =>
@@ -146,11 +149,17 @@ esac`,
 					workspaces.create({ kind: "pullRequest", projectId: project.id, number: 9 }),
 				).pipe(Effect.provideService(GhSettings, { executable }));
 				const runs = yield* Effect.flatMap(WorkspaceService, (workspaces) => workspaces.listScriptRuns(created.id));
-				return { branch: created.branch, runs };
+				const [row] = yield* Effect.flatMap(LocalDatabase, (database) =>
+					database.query((db) =>
+						db.select({ fromFork: workspace.fromFork }).from(workspace).where(eq(workspace.id, created.id)),
+					),
+				);
+				return { branch: created.branch, runs, fromFork: row?.fromFork };
 			}),
 		);
 		expect(result.branch).toBe("pr-9-main");
 		expect(result.runs).toEqual([]);
+		expect(result.fromFork).toBe(true);
 	});
 
 	test("removes the worktree when gh cannot check out the pull request", async () => {
