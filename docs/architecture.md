@@ -41,20 +41,21 @@ It never authenticates Claude or Codex, and Octopus never sends agent credential
 
 ### 2.1 What each provider permits (checked 2026-11-07)
 
-- **Claude.** Anthropic's Agent SDK docs say that, unless previously approved, third-party developers may not offer claude.ai login or subscription rate limits in their products, and should use API keys (or Bedrock, Vertex AI, Azure).
+- **Claude.** Octopus offers claude.ai sign-in (decided 2026-11-25). It runs the user's own `claude` CLI with the login the user made in it, the same way Codex runs with its own ChatGPT login.
 - **Codex.** `codex app-server` is OpenAI's interface for rich clients. It has its own ChatGPT login flow (`account/login/start` with `chatgpt`, then `account/login/completed`), and Codex stores the resulting tokens itself. We found no official OpenAI statement on third-party use of ChatGPT plans. **Open:** confirm with OpenAI before we advertise ChatGPT plan support.
 
 ### 2.2 Auth modes
 
-| Mode               | Claude                                                                                                                                                                                          | Codex                                                                                                                                                                           |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiKey` (default) | User pastes an Anthropic key. Stored in the OS keychain. Passed only as `ANTHROPIC_API_KEY` to the child process.                                                                               | User pastes an OpenAI key. Stored in the OS keychain. Passed only as `OPENAI_API_KEY` to the child process.                                                                     |
-| `nativeLogin`      | Off until Anthropic approves it in writing. If enabled, Octopus spawns the user's own `claude` CLI, which uses the login the user created with `claude` itself. Octopus never reads that login. | The user signs in through `codex app-server` (`account/login/start`), which opens the browser and stores tokens in Codex's own files. Octopus only reads `account/read` status. |
+| Mode               | Claude                                                                                                                                                                                                                                                                                                                                                   | Codex                                                                                                                                                                           |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apiKey` (default) | User pastes an Anthropic key. Stored in the OS keychain. Passed only as `ANTHROPIC_API_KEY` to the child process.                                                                                                                                                                                                                                        | User pastes an OpenAI key. Stored in the OS keychain. Passed only as `OPENAI_API_KEY` to the child process.                                                                     |
+| `subscription`     | The user signs in with `claude auth login --claudeai`, which the daemon runs on a PTY. It returns the printed link, claude opens the browser, and a code claude.ai shows can be pasted back. claude stores the tokens. Sessions get no `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` from the daemon's environment, so a shell key never bills silently. | The user signs in through `codex app-server` (`account/login/start`), which opens the browser and stores tokens in Codex's own files. Octopus only reads `account/read` status. |
 
 - Octopus never reads, copies, refreshes or proxies OAuth tokens for either provider. We do not use the Codex "external tokens" login mode.
+- Without a stored choice, an agent uses `apiKey` when a key is stored and `subscription` otherwise.
 - `checkAuth` reports `loggedIn`, `loggedOut` or `unknown`, plus an account label when the CLI prints one.
 - **Account switching.** Credentials are keyed by provider and account label in the keychain. A session records which credential it started with. Switching the active credential affects new sessions only; running sessions keep theirs until they end.
-- **Expiry and revocation.** API keys do not expire, but they can be revoked. A provider auth failure is a permanent error (`AgentAuthError`), which stops the turn and asks the user to fix the credential. Native logins refresh inside the CLI; Octopus only sees the result through `checkAuth`.
+- **Expiry and revocation.** API keys do not expire, but they can be revoked. A provider auth failure is a permanent error (`AgentAuthError`), which stops the turn and asks the user to fix the credential. Subscription logins refresh inside the CLI; Octopus only sees the result through `checkAuth`.
 
 ### 2.3 Cloud workspaces
 
@@ -255,7 +256,6 @@ It changed these decisions:
 
 ## 15. Open decisions
 
-- Claude `nativeLogin`: needs written approval from Anthropic.
 - Codex with ChatGPT plans in third-party clients: confirm with OpenAI.
 - A backend secret service for cloud workspaces that restart while everyone is offline.
 - Sandbox idle, runtime and resource limits.
