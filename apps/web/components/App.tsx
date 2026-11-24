@@ -102,7 +102,7 @@ export const App = () => {
 
 	if (daemonStopped) return <DaemonStopped />;
 
-	if (connection.status !== "ready") {
+	if (connection.status === "connecting" || connection.status === "failed") {
 		return (
 			<main className="flex h-full flex-col items-center justify-center gap-2 text-center">
 				<OctopusLogo className="size-10" />

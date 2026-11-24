@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Follow } from "./daemonRuntime.ts";
 import { Predicate } from "effect";
 
@@ -6,14 +6,24 @@ const project = { id: "p", name: "app", path: "/app", defaultBranch: "main", tru
 const workspace = { id: "w", projectId: "p", status: "active", kind: "worktree", name: "fix", path: "/app-fix" };
 const session = { id: "s", workspaceId: "w", agent: "claude", status: "idle", createdAt: "1", updatedAt: "1" };
 
+const drop = { _tag: "RpcClientError", message: "SocketCloseError: closed" };
+const internal = { _tag: "DaemonInternalError", message: "Octopus could not list chats." };
+
 // The daemon answers each sendMessage with the next of these outcomes.
 const outcomes: Array<"ok" | "busy"> = [];
 const sent: Array<string> = [];
+// Each listProjects call takes the next of these, and succeeds once they run out.
+const listFailures: Array<unknown> = [];
+let listCalls = 0;
 // Every stream the store follows, newest last.
 const follows: Array<{ readonly name: string; readonly handlers: Follow<unknown> }> = [];
 
 const daemon = {
-	listProjects: () => [project],
+	listProjects: () => {
+		listCalls++;
+		const failure = listFailures.shift();
+		return failure === undefined ? [project] : Promise.reject(failure);
+	},
 	listWorkspaces: () => [workspace],
 	listSessions: () => [session],
 	listAgents: () => [],
@@ -47,6 +57,8 @@ const {
 	discardFailedSend,
 	failedSendsOf,
 	getState,
+	isConnectionDrop,
+	reconnectDelay,
 	removeProject,
 	retryFailedSend,
 	sendMessage,
@@ -57,6 +69,10 @@ const {
 Object.assign(globalThis, {
 	document: { documentElement: { style: {} }, visibilityState: "visible", hasFocus: () => true },
 });
+
+const lastWatch = () => follows.filter((follow) => follow.name === "watchSessions").at(-1)?.handlers;
+const watchCount = () => follows.filter((follow) => follow.name === "watchSessions").length;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("failed sends", () => {
 	test("keep a refused message per chat until it is retried or discarded", async () => {
@@ -84,6 +100,46 @@ describe("failed sends", () => {
 		const [failed] = failedSendsOf(getState(), "c");
 		expect(await retryFailedSend("c", failed?.id ?? -1, true)).toBe(false);
 		expect(failedSendsOf(getState(), "c").map(({ text }) => text)).toEqual(["hello"]);
+	});
+});
+
+describe("reconnecting", () => {
+	test("waits longer after each failed attempt, with jitter, up to 30 s", () => {
+		expect(reconnectDelay(0, () => 1)).toBe(500);
+		expect(reconnectDelay(0, () => 0)).toBe(250);
+		expect(reconnectDelay(3, () => 1)).toBe(4000);
+		expect(reconnectDelay(20, () => 1)).toBe(30_000);
+		expect(isConnectionDrop(drop)).toBe(true);
+		expect(isConnectionDrop(internal)).toBe(false);
+	});
+
+	beforeEach(async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		listCalls = 0;
+		await boot();
+		expect(getState().connection.status).toBe("ready");
+	});
+
+	test("a dropped watch reloads the projects, then watches again", async () => {
+		const watches = watchCount();
+		listFailures.push(drop);
+		lastWatch()?.onEnd?.(drop);
+		expect(getState().connection.status).toBe("reconnecting");
+		// 250 ms for the failed reload, 500 ms for the one that works.
+		await sleep(900);
+		expect(listCalls).toBe(3);
+		expect(getState().connection.status).toBe("ready");
+		expect(watchCount()).toBe(watches + 1);
+	});
+
+	test("a watch the daemon ends, or a daemon error, is not retried", async () => {
+		const watches = watchCount();
+		lastWatch()?.onEnd?.(null);
+		lastWatch()?.onEnd?.(internal);
+		await sleep(400);
+		expect(listCalls).toBe(1);
+		expect(getState().connection.status).toBe("ready");
+		expect(watchCount()).toBe(watches);
 	});
 });
 
