@@ -1,6 +1,7 @@
 import { ConfigProvider, Effect, FileSystem, Layer, Stream } from "effect";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { SCROLLBACK_MAX_LINES, Scrollback } from "./Scrollback.ts";
+import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
 import { TerminalService } from "./TerminalService.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
@@ -86,6 +87,36 @@ describe("TerminalService", () => {
 		expect(result.closed).toEqual([]);
 		expect(result.kept).toEqual([result.other]);
 		expect(result.writeError._tag).toBe("TerminalNotFoundError");
+	});
+
+	test("keeps output the shell prints while its process group is still being recorded", async () => {
+		const text = await Effect.gen(function* () {
+			const fs = yield* FileSystem.FileSystem;
+			const tempDir = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+			const shell = `${tempDir}/eager.sh`;
+			yield* fs.writeFileString(shell, "#!/bin/sh\necho eager-output\nexec /bin/sh\n", { mode: 0o755 });
+			// Recording the group writes a file, so a shell can print before it finishes.
+			const slowRegistry = Layer.succeed(
+				ProcessRegistry,
+				ProcessRegistry.of({ add: () => Effect.sleep("300 millis"), remove: () => Effect.void }),
+			);
+			return yield* Effect.gen(function* () {
+				const terminals = yield* TerminalService;
+				const info = yield* terminals.open("workspace-1", tempDir, size);
+				const first = yield* terminals.attach(info.id).pipe(Stream.take(1), Stream.runCollect);
+				return outputText(first);
+			}).pipe(
+				Effect.provide(TerminalService.layer),
+				Effect.provide(
+					Layer.mergeAll(
+						slowRegistry,
+						SecureRandom.layerWebCrypto,
+						ConfigProvider.layer(ConfigProvider.fromEnv({ env: { SHELL: shell } })),
+					),
+				),
+			);
+		}).pipe(Effect.scoped, Effect.provide(BunServices.layer), Effect.runPromise);
+		expect(text).toContain("eager-output");
 	});
 });
 

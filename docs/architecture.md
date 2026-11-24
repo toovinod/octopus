@@ -207,7 +207,7 @@ Rules:
   - A project cannot be deleted while it has active workspaces. Deleting it cascades to archived ones.
   - A workspace cascades to its sessions, events and script runs.
   - In Neon, deleting an org cascades to its cloud workspaces, and deleting the user who created one is restricted.
-- **Sessions per workspace** are unlimited in the schema. Only the daemon-wide cap on concurrent sessions (section 14) applies.
+- **Sessions per workspace** are unlimited. Agent processes have no fixed cap either: an idle process stops after 5 minutes and resumes through its native id on the next message (section 14).
 - **Event order** is `sequence` per session, never time.
 - **No raw output** is stored. Script output keeps the last 64 KB or 2,000 lines in memory, whichever is smaller.
 
@@ -249,7 +249,7 @@ It changed these decisions:
   - Terminal scrollback: 5,000 lines or 2 MB.
   - Script output: 64 KB or 2,000 lines.
   - Subscriber buffers: 1,000 events or 1 MB.
-- **Limits.** One file watcher per open workspace. Concurrent agent sessions are capped (default 8, configurable).
+- **Limits.** One file watcher per open workspace. Concurrent agent processes are not capped. An agent idle for 5 minutes is stopped, so only working agents hold a process.
 - **Measure the whole thing.** Report the combined memory of the shell, the webview processes, the daemon and the agent processes, measured by a script in the repo against the same task in other tools. We publish only claims we measured.
 - **Privacy statement.** Octopus keeps local workspace data on your machine. The agents you configure still send context to their model providers under those providers' terms. Native agent histories (Claude Code and Codex transcripts) may keep output that Octopus itself drops.
 
