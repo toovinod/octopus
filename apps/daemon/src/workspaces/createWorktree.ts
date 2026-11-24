@@ -1,6 +1,18 @@
-import { BranchAlreadyExistsError, WorktreeCreateError } from "@repo/contracts/Workspace";
+import {
+	BranchAlreadyExistsError,
+	BranchCheckedOutError,
+	BranchNotFoundError,
+	WorktreeCreateError,
+} from "@repo/contracts/Workspace";
 import { runGit } from "../git/runGit.ts";
 import { Effect } from "effect";
+
+// show-ref exits 1 when the ref does not exist.
+export const refExists = (repositoryPath: string, ref: string) =>
+	runGit(repositoryPath, ["show-ref", "--verify", "--quiet", ref]).pipe(
+		Effect.as(true),
+		Effect.catchTag("GitCommandError", () => Effect.succeed(false)),
+	);
 
 export const createWorktree = Effect.fn("createWorktree")(function* (options: {
 	readonly repositoryPath: string;
@@ -9,12 +21,7 @@ export const createWorktree = Effect.fn("createWorktree")(function* (options: {
 	readonly baseBranch: string;
 }) {
 	const { repositoryPath, worktreePath, branch, baseBranch } = options;
-	// show-ref exits 1 when the branch does not exist, which is the case we want.
-	const branchExists = yield* runGit(repositoryPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).pipe(
-		Effect.as(true),
-		Effect.catchTag("GitCommandError", () => Effect.succeed(false)),
-	);
-	if (branchExists) {
+	if (yield* refExists(repositoryPath, `refs/heads/${branch}`)) {
 		return yield* new BranchAlreadyExistsError({ branch });
 	}
 	yield* runGit(repositoryPath, ["worktree", "add", "-b", branch, worktreePath, baseBranch]).pipe(
@@ -25,3 +32,40 @@ export const createWorktree = Effect.fn("createWorktree")(function* (options: {
 		),
 	);
 });
+
+// Checks out a branch that already exists. A branch only on origin gets a local branch that tracks it.
+export const addBranchWorktree = Effect.fn("addBranchWorktree")(function* (options: {
+	readonly repositoryPath: string;
+	readonly worktreePath: string;
+	readonly branch: string;
+}) {
+	const { repositoryPath, worktreePath, branch } = options;
+	const local = yield* refExists(repositoryPath, `refs/heads/${branch}`);
+	if (!local && !(yield* refExists(repositoryPath, `refs/remotes/origin/${branch}`))) {
+		return yield* new BranchNotFoundError({ branch });
+	}
+	const args = local
+		? ["worktree", "add", worktreePath, branch]
+		: ["worktree", "add", "--track", "-b", branch, worktreePath, `origin/${branch}`];
+	yield* runGit(repositoryPath, args).pipe(
+		Effect.catchTag("GitCommandError", (cause) =>
+			Effect.logError("git worktree add failed", cause).pipe(
+				Effect.andThen(
+					Effect.fail(
+						// Git refuses a branch that another worktree, or the project folder, has checked out.
+						/already (checked out|used by worktree)/.test(cause.stderr)
+							? new BranchCheckedOutError({ branch })
+							: new WorktreeCreateError({ branch }),
+					),
+				),
+			),
+		),
+	);
+});
+
+// A branch name as a folder name: workspace folders keep to the characters a workspace name allows.
+export const worktreeFolderName = (branch: string) =>
+	branch
+		.replace(/[^A-Za-z0-9._-]+/g, "-")
+		.replace(/^[^A-Za-z0-9]+/, "")
+		.slice(0, 63) || "branch";

@@ -87,9 +87,10 @@ export const applyScriptRunEvent = Effect.fn("applyScriptRunEvent")(function* (
 });
 
 export const executeScript = Effect.fn("executeScript")(
-	function* (script: string, cwd: string, onLine: (line: string) => void) {
+	function* (script: string, cwd: string, onLine: (line: string) => void, onSpawn?: (pid: number) => void) {
 		const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 		const handle = yield* spawner.spawn(ChildProcess.make(script, { cwd, shell: true }));
+		onSpawn?.(handle.pid);
 		yield* handle.all.pipe(
 			Stream.decodeText(),
 			capLineLength,

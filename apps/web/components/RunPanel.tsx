@@ -7,7 +7,8 @@ import { followReattaching } from "../lib/followReattaching.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { openDialog, toast } from "../lib/store.ts";
-import { PlayIcon, SquareIcon } from "lucide-react";
+import { ExternalLinkIcon, PlayIcon, SquareIcon } from "lucide-react";
+import { openExternal } from "../lib/desktop.ts";
 import { Button } from "@repo/ui/components/button";
 import { Tabs, TabsList, TabsTrigger } from "@repo/ui/components/tabs";
 
@@ -96,6 +97,7 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 					)
 				) : null}
 			</div>
+			{kind === "run" && running ? <RunScriptPorts workspaceId={workspace.id} /> : null}
 			{run === undefined ? (
 				<div className="flex flex-1 flex-col items-center justify-center gap-2 p-4 text-center text-xs text-muted-foreground">
 					<p>{kind === "run" ? "The run script has not run in this workspace." : "No setup script ran here."}</p>
@@ -110,6 +112,38 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 			) : (
 				<ScriptOutput key={run.id} scriptRunId={run.id} onEnd={reload} />
 			)}
+		</div>
+	);
+};
+
+// The ports the run script's processes listen on, each one a link to open in the browser.
+const RunScriptPorts = ({ workspaceId }: { readonly workspaceId: string }) => {
+	const [ports, setPorts] = useState<ReadonlyArray<number>>([]);
+	useEffect(() => {
+		setPorts([]);
+		return followReattaching<ReadonlyArray<number>>(
+			(handlers) => followDaemon((daemon) => daemon.watchRunScriptPorts({ workspaceId }), handlers),
+			// A new watch sends the current ports first, so there is nothing to catch up on.
+			{ onItem: setPorts, onReattach: () => undefined },
+		);
+	}, [workspaceId]);
+	if (ports.length === 0) return null;
+	return (
+		<div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-3 py-1 text-xs">
+			<span className="text-muted-foreground">Listening on</span>
+			{ports.map((port) => (
+				<Button
+					key={port}
+					variant="ghost"
+					size="xs"
+					className="font-mono"
+					aria-label={`Open localhost:${port} in the browser`}
+					onClick={() => void openExternal(`http://localhost:${port}`)}
+				>
+					localhost:{port}
+					<ExternalLinkIcon />
+				</Button>
+			))}
 		</div>
 	);
 };

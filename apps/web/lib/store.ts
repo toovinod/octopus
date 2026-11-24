@@ -348,6 +348,18 @@ export const archiveWorkspace = async (workspaceId: string, force: boolean) => {
 	if (state.selectedSessionId === null) closeChat();
 };
 
+// Brings an archived workspace back and opens it, with the chats it had.
+export const unarchiveWorkspace = async (workspaceId: string) => {
+	const restored = await attempt(() => callDaemon((daemon) => daemon.unarchiveWorkspace({ workspaceId })));
+	if (restored === null) return;
+	const sessions = await attempt(() => callDaemon((daemon) => daemon.listSessions({ workspaceId })));
+	setState((current) => ({
+		workspaces: { ...current.workspaces, [workspaceId]: restored },
+		sessions: { ...current.sessions, ...byId(sessions ?? []) },
+	}));
+	selectWorkspace(workspaceId);
+};
+
 export const isUnsavedWorkError = (error: unknown) => errorTag(error) === "WorkspaceHasUnsavedWorkError";
 
 export const updateWorkspace = (workspace: Workspace) =>

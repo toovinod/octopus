@@ -4,6 +4,7 @@ import { DIFF_FILE_LINE_LIMIT, GitService } from "./GitService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { runServiceTest } from "../testing/runServiceTest.ts";
 import { describe, expect, test } from "bun:test";
+import { fakeGh } from "../testing/fakeGh.ts";
 import { Effect, FileSystem } from "effect";
 import { GhSettings } from "./runGh.ts";
 import { runGit } from "./runGit.ts";
@@ -28,15 +29,6 @@ const addOrigin = Effect.fn("addOrigin")(function* (tempDir: string, repositoryP
 	yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", originPath]);
 	yield* runGit(repositoryPath, ["remote", "add", "origin", originPath]);
 	return originPath;
-});
-
-// A stand-in gh that answers from a script, so tests never reach GitHub.
-const fakeGh = Effect.fn("fakeGh")(function* (tempDir: string, body: string) {
-	const fs = yield* FileSystem.FileSystem;
-	const path = join(tempDir, "gh");
-	yield* fs.writeFileString(path, `#!/bin/sh\necho "$@" >> "${tempDir}/gh.log"\n${body}\n`);
-	yield* fs.chmod(path, 0o755);
-	return path;
 });
 
 // What `gh pr view --json ...` prints in a workspace whose branch has pull request 7.

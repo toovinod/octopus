@@ -9,9 +9,11 @@ export const runRunScript = Effect.fn("runRunScript")(
 		readonly script: string;
 		readonly cwd: string;
 		readonly onLine: (line: string) => void;
+		// The script's shell leads its own process group, so this pid also names the group.
+		readonly onSpawn: (pid: number) => void;
 	}) {
 		yield* applyScriptRunEvent(run.scriptRunId, { _tag: "Started" });
-		const result = yield* Effect.result(executeScript(run.script, run.cwd, run.onLine));
+		const result = yield* Effect.result(executeScript(run.script, run.cwd, run.onLine, run.onSpawn));
 		if (result._tag === "Success") {
 			yield* applyScriptRunEvent(run.scriptRunId, { _tag: "Succeeded" }, 0);
 			return;

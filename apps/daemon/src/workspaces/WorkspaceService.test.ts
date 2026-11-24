@@ -492,6 +492,33 @@ describe("WorkspaceService", () => {
 		expect(result.runs).toMatchObject([{ kind: "run", status: "failed", lastError: "Stopped." }]);
 	});
 
+	test("finds the port a run script's child process listens on", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				// The server is a child of the script's shell, as a dev server started by a package script is.
+				const serve = `"${process.execPath}" -e 'const s = Bun.serve({ port: 0, fetch: () => new Response() }); console.log(s.port)'`;
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: `${serve}; echo stopped` });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const started = yield* workspaces.startRunScript(created.id);
+				const [printed] = yield* workspaces.followScriptRunOutput(started.id).pipe(Stream.take(1), Stream.runCollect);
+				const ports = yield* workspaces.watchRunScriptPorts(created.id).pipe(
+					Stream.filter((found) => found.length > 0),
+					Stream.take(1),
+					Stream.runCollect,
+					Effect.timeout("10 seconds"),
+				);
+				yield* workspaces.stopRunScript(created.id);
+				const afterStop = yield* workspaces.watchRunScriptPorts(created.id).pipe(Stream.take(1), Stream.runCollect);
+				return { printed: Number(printed), ports: ports[0], afterStop: afterStop[0] };
+			}),
+		);
+		expect(result.ports).toEqual([result.printed]);
+		expect(result.afterStop).toEqual([]);
+	});
+
 	test("a run script that exits records its exit code", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -701,5 +728,123 @@ describe("WorkspaceService", () => {
 			[true, "processing"],
 			[true, "completed"],
 		]);
+	});
+});
+
+describe("WorkspaceService.unarchive", () => {
+	test("brings back a force-archived worktree with its stashed changes", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				yield* fs.writeFileString(join(created.path, "new.txt"), "untracked\n");
+				yield* workspaces.archive(created.id, { force: true });
+				const restored = yield* workspaces.unarchive(created.id);
+				return {
+					restored,
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+					untracked: yield* fs.readFileString(join(created.path, "new.txt")),
+					branch: yield* runGit(created.path, ["branch", "--show-current"]),
+					stashes: yield* runGit(project.path, ["stash", "list"]),
+				};
+			}),
+		);
+		expect(result.restored).toMatchObject({ status: "active", archivedAt: null });
+		expect(result.readme).toBe("edited\n");
+		expect(result.untracked).toBe("untracked\n");
+		expect(result.branch).toBe("feature");
+		expect(result.stashes).toBe("");
+	});
+
+	test("keeps another workspace's archive stash", async () => {
+		const stashes = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const first = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "first" });
+				const second = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "second" });
+				yield* fs.writeFileString(join(first.path, "a.txt"), "a\n");
+				yield* fs.writeFileString(join(second.path, "b.txt"), "b\n");
+				yield* workspaces.archive(first.id, { force: true });
+				yield* workspaces.archive(second.id, { force: true });
+				yield* workspaces.unarchive(first.id);
+				return { list: yield* runGit(project.path, ["stash", "list", "--format=%s"]), second: second.id };
+			}),
+		);
+		expect(stashes.list).toBe(`On second: octopus-archive/${stashes.second}`);
+	});
+
+	test("runs the setup script again, since ignored files were not kept", async () => {
+		const runs = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir, "true");
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* waitForScriptRun(created.id);
+				yield* workspaces.archive(created.id, { force: false });
+				yield* workspaces.unarchive(created.id);
+				yield* waitForScriptRun(created.id);
+				return yield* workspaces.listScriptRuns(created.id);
+			}),
+		);
+		expect(runs.map((run) => [run.kind, run.status])).toEqual([
+			["setup", "completed"],
+			["setup", "completed"],
+		]);
+	});
+
+	test("does not start a setup script on restore where none ran before", async () => {
+		const runs = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const projects = yield* ProjectService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* workspaces.archive(created.id, { force: false });
+				// The script was added after the workspace was made, as for a fork's pull request it was skipped.
+				yield* projects.updateScripts(project.id, { setupScript: "true", runScript: null });
+				yield* workspaces.unarchive(created.id);
+				return yield* workspaces.listScriptRuns(created.id);
+			}),
+		);
+		expect(runs).toEqual([]);
+	});
+
+	test("refuses when the branch is gone, and leaves the workspace archived", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* workspaces.archive(created.id, { force: false });
+				yield* runGit(project.path, ["branch", "-D", "feature"]);
+				const error = yield* Effect.flip(workspaces.unarchive(created.id));
+				return { error, after: yield* workspaces.get(created.id) };
+			}),
+		);
+		expect(result.error._tag).toBe("BranchNotFoundError");
+		expect(result.after.status).toBe("archived");
+	});
+
+	test("flips an in-place workspace back, unless the project folder is active again", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const first = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				yield* workspaces.archive(first.id, { force: false });
+				const restored = yield* workspaces.unarchive(first.id);
+				yield* workspaces.archive(first.id, { force: false });
+				yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const refused = yield* Effect.flip(workspaces.unarchive(first.id));
+				return { restored, refused };
+			}),
+		);
+		expect(result.restored.status).toBe("active");
+		expect(result.refused._tag).toBe("WorkspacePathInUseError");
 	});
 });

@@ -27,5 +27,7 @@ export const useDaemonValue = <A>(load: () => Promise<A>, key: string) => {
 		};
 	}, [key, round]);
 	const reload = useCallback(() => setRound((current) => current + 1), []);
-	return { loaded, reload };
+	// For a newer value that arrived another way, such as a watch.
+	const replace = useCallback((value: A) => setLoaded({ state: "ready", value }), []);
+	return { loaded, reload, replace };
 };

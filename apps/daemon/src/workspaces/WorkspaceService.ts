@@ -5,10 +5,19 @@ import {
 	WorkspaceNotFoundError,
 	WorkspacePathInUseError,
 } from "@repo/contracts/Workspace";
-import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Semaphore, Stream } from "effect";
+import {
+	archiveStashMessage,
+	discardWorktree,
+	findUnsavedWork,
+	removeWorktree,
+	restoreArchiveStash,
+} from "./removeWorktree.ts";
+import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
+import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contracts/ScriptRun";
-import { discardWorktree, findUnsavedWork, removeWorktree } from "./removeWorktree.ts";
+import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
+import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
 import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
@@ -17,10 +26,11 @@ import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import type { ScriptRunKind } from "@repo/contracts/ScriptRun";
+import { listListeningPorts } from "./listListeningPorts.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
-import { createWorktree } from "./createWorktree.ts";
+import type { Project } from "@repo/contracts/Project";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { WorkspaceLock } from "./WorkspaceLock.ts";
 import type { SecureRandom } from "effect/crypto";
@@ -52,6 +62,8 @@ interface ScriptOutput {
 	finished: boolean;
 }
 
+const RUN_SCRIPT_PORT_POLL = "2 seconds";
+
 // A slow follower loses old lines rather than growing the daemon's memory.
 const LIVE_LINES = 1000;
 
@@ -80,6 +92,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			// Two quick clicks on Run must not start the run script twice.
 			const runScriptLock = yield* Semaphore.make(1);
 			const outputs = new Map<string, ScriptOutput>();
+			// The process group of each running run script, by script run id, to find the ports it listens on.
+			const runScriptGroups = new Map<string, number>();
 
 			const startScript = Effect.fn("WorkspaceService.startScript")(function* (
 				scriptRunId: string,
@@ -147,6 +161,79 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					.query((db) => db.$count(workspace, and(eq(workspace.path, path), eq(workspace.status, "active"))))
 					.pipe(Effect.map((count) => count > 0));
 
+			// Where a worktree workspace's code comes from: a new branch, one that exists, or a pull request.
+			// `ownsBranch` says whether the branch was made for the workspace, so undoing the worktree may delete it.
+			// `runSetup` is false for a fork's pull request: the setup script (an install, say) would run code
+			// that anyone on GitHub can write, so the user starts it once they have read the change.
+			const planWorktree = Effect.fn("WorkspaceService.planWorktree")(function* (
+				owner: Project,
+				input: Exclude<CreateWorkspaceInput, { readonly kind: "inPlace" }>,
+			) {
+				switch (input.kind) {
+					case "worktree": {
+						const baseBranch = input.baseBranch ?? owner.defaultBranch;
+						return {
+							branch: input.name,
+							baseBranch,
+							ownsBranch: true,
+							runSetup: true,
+							add: (worktreePath: string) =>
+								createWorktree({ repositoryPath: owner.path, worktreePath, branch: input.name, baseBranch }),
+						};
+					}
+					case "branch":
+						return {
+							branch: input.branch,
+							baseBranch: owner.defaultBranch,
+							ownsBranch: false,
+							runSetup: true,
+							add: (worktreePath: string) =>
+								addBranchWorktree({ repositoryPath: owner.path, worktreePath, branch: input.branch }),
+						};
+					case "pullRequest": {
+						const head = yield* findPullRequestHead(owner.path, input.number);
+						return {
+							branch: head.branch,
+							baseBranch: head.baseBranch,
+							ownsBranch: false,
+							runSetup: !head.fromFork,
+							add: (worktreePath: string) =>
+								checkoutPullRequest({
+									repositoryPath: owner.path,
+									worktreePath,
+									number: input.number,
+									branch: head.branch,
+								}),
+						};
+					}
+				}
+			});
+
+			// The worktrees folder holds checked-out code, so it is as private as the data dir.
+			const worktreesDir = join(dataDir, "worktrees");
+			const makeWorktreesDir = fs
+				.makeDirectory(worktreesDir, {
+					recursive: true,
+					mode: PRIVATE_DIRECTORY_MODE,
+				})
+				.pipe(Effect.andThen(fs.chmod(worktreesDir, PRIVATE_DIRECTORY_MODE)), Effect.orDie);
+
+			const newSetupRun = Effect.fn("WorkspaceService.newSetupRun")(function* (owner: Project, workspaceId: string) {
+				if (owner.setupScript === null) {
+					return null;
+				}
+				const now = yield* nowIso;
+				return {
+					id: yield* newId,
+					workspaceId,
+					kind: "setup",
+					status: "pending",
+					attempts: 0,
+					createdAt: now,
+					updatedAt: now,
+				} satisfies ScriptRunRow;
+			});
+
 			const create = Effect.fn("WorkspaceService.create")(function* (input: CreateWorkspaceInput) {
 				const owner = yield* projects.get(input.projectId);
 				const now = yield* nowIso;
@@ -154,7 +241,6 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				const base = {
 					id,
 					projectId: owner.id,
-					baseBranch: owner.defaultBranch,
 					status: "active",
 					pullRequestUrl: null,
 					createdAt: now,
@@ -163,45 +249,27 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 
 				let row: WorkspaceRow;
 				let setupRun: ScriptRunRow | null = null;
-				if (input.kind === "worktree") {
-					const worktreesDir = join(dataDir, "worktrees");
+				let ownsBranch = false;
+				if (input.kind !== "inPlace") {
+					const plan = yield* planWorktree(owner, input);
+					ownsBranch = plan.ownsBranch;
 					// Keyed by project id: two repositories can share a folder name. The UI shows the workspace name.
-					const path = join(worktreesDir, owner.id, input.name);
+					const path = join(worktreesDir, owner.id, worktreeFolderName(plan.branch));
 					// Checked before git touches the disk, so the user gets a clear error.
 					if (yield* isPathActive(path)) {
 						return yield* new WorkspacePathInUseError({ path });
 					}
-					// The worktrees folder holds checked-out code, so it is as private as the data dir.
-					yield* fs
-						.makeDirectory(worktreesDir, {
-							recursive: true,
-							mode: PRIVATE_DIRECTORY_MODE,
-						})
-						.pipe(Effect.andThen(fs.chmod(worktreesDir, PRIVATE_DIRECTORY_MODE)), Effect.orDie);
-					yield* createWorktree({
-						repositoryPath: owner.path,
-						worktreePath: path,
-						branch: input.name,
-						baseBranch: owner.defaultBranch,
-					});
+					yield* makeWorktreesDir;
+					yield* plan.add(path);
 					row = {
 						...base,
-						name: input.name,
+						name: plan.branch,
 						kind: "worktree",
 						path,
-						branch: input.name,
+						branch: plan.branch,
+						baseBranch: plan.baseBranch,
 					};
-					if (owner.setupScript !== null) {
-						setupRun = {
-							id: yield* newId,
-							workspaceId: id,
-							kind: "setup",
-							status: "pending",
-							attempts: 0,
-							createdAt: now,
-							updatedAt: now,
-						};
-					}
+					setupRun = plan.runSetup ? yield* newSetupRun(owner, id) : null;
 				} else {
 					const current = yield* runGit(owner.path, ["branch", "--show-current"]);
 					row = {
@@ -211,6 +279,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						path: owner.path,
 						// An empty answer means a detached HEAD.
 						branch: current === "" ? "HEAD" : current,
+						baseBranch: owner.defaultBranch,
 					};
 				}
 
@@ -220,7 +289,11 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					),
 					Effect.onError(() =>
 						row.kind === "worktree"
-							? discardWorktree({ repositoryPath: owner.path, worktreePath: row.path, branch: row.branch })
+							? discardWorktree({
+									repositoryPath: owner.path,
+									worktreePath: row.path,
+									branch: ownsBranch ? row.branch : null,
+								})
 							: Effect.void,
 					),
 				);
@@ -236,6 +309,21 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					yield* startSetupScript(setupRun.id, owner.setupScript, row.path);
 				}
 				return new Workspace(row);
+			}, Effect.provide(services));
+
+			// What a new workspace can start from, read from the project's repository and its GitHub remote.
+			const listProjectBranches = Effect.fn("WorkspaceService.listProjectBranches")(function* (projectId: string) {
+				return yield* listBranches((yield* projects.get(projectId)).path);
+			}, Effect.provide(services));
+
+			const listProjectPullRequests = Effect.fn("WorkspaceService.listProjectPullRequests")(function* (
+				projectId: string,
+			) {
+				return yield* listOpenPullRequests((yield* projects.get(projectId)).path);
+			}, Effect.provide(services));
+
+			const listProjectIssues = Effect.fn("WorkspaceService.listProjectIssues")(function* (projectId: string) {
+				return yield* listOpenIssues((yield* projects.get(projectId)).path);
 			}, Effect.provide(services));
 
 			const get = Effect.fn("WorkspaceService.get")(function* (workspaceId: string) {
@@ -321,7 +409,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							yield* removeWorktree({
 								repositoryPath: owner.path,
 								worktreePath: current.path,
-								stashMessage: unsaved.changedFiles.length > 0 ? `octopus-archive/${workspaceId}` : null,
+								stashMessage: unsaved.changedFiles.length > 0 ? archiveStashMessage(workspaceId) : null,
 							});
 						} else {
 							// Someone deleted the folder already. Forget it in git and carry on.
@@ -349,6 +437,78 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					return yield* get(workspaceId);
 				},
 				(effect, workspaceId) => workspaceLock.archiving(workspaceId, effect),
+				Semaphore.withPermit(archiveLock),
+				Effect.provide(services),
+			);
+
+			// Undoes an archive. A worktree comes back from its kept branch, with the changes a forced archive
+			// stashed. Another active workspace may have taken the folder meanwhile, which the partial unique index
+			// on active paths forbids, so that is checked first and again when the row flips.
+			const unarchive = Effect.fn("WorkspaceService.unarchive")(
+				function* (workspaceId: string) {
+					const current = yield* get(workspaceId);
+					if (current.status === "active") {
+						return current;
+					}
+					if (yield* isPathActive(current.path)) {
+						return yield* new WorkspacePathInUseError({ path: current.path });
+					}
+					// The foreign key keeps the project while it has workspaces.
+					const owner = yield* projects
+						.get(current.projectId)
+						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
+					let setupRun: ScriptRunRow | null = null;
+					if (current.kind === "worktree") {
+						yield* makeWorktreesDir;
+						yield* addBranchWorktree({
+							repositoryPath: owner.path,
+							worktreePath: current.path,
+							branch: current.branch,
+						});
+						// Ignored files such as installed dependencies were not kept, so setup runs again. Only where it ran
+						// before: a fork's pull request never ran it, and restoring must not start it on that code either.
+						const setupBefore = yield* database.query((db) =>
+							db.$count(scriptRun, and(eq(scriptRun.workspaceId, workspaceId), eq(scriptRun.kind, "setup"))),
+						);
+						setupRun = setupBefore > 0 ? yield* newSetupRun(owner, workspaceId) : null;
+					}
+					const restored = yield* database.query((db) =>
+						db.transaction((tx) =>
+							Effect.gen(function* () {
+								const taken = yield* tx.$count(
+									workspace,
+									and(eq(workspace.path, current.path), eq(workspace.status, "active")),
+								);
+								if (taken > 0) {
+									return false;
+								}
+								yield* tx
+									.update(workspace)
+									.set({ status: "active", archivedAt: null })
+									.where(eq(workspace.id, workspaceId));
+								if (setupRun !== null) {
+									yield* tx.insert(scriptRun).values(setupRun);
+								}
+								return true;
+							}),
+						),
+					);
+					if (!restored) {
+						if (current.kind === "worktree") {
+							yield* discardWorktree({ repositoryPath: owner.path, worktreePath: current.path, branch: null });
+						}
+						return yield* new WorkspacePathInUseError({ path: current.path });
+					}
+					if (current.kind === "worktree") {
+						yield* restoreArchiveStash(current.path, workspaceId);
+					}
+					yield* Effect.logInfo("Restored workspace").pipe(Effect.annotateLogs({ workspaceId }));
+					if (setupRun !== null && owner.setupScript !== null) {
+						yield* startSetupScript(setupRun.id, owner.setupScript, current.path);
+					}
+					return yield* get(workspaceId);
+				},
+				(effect, workspaceId) => workspaceLock.restoring(workspaceId, effect),
 				Semaphore.withPermit(archiveLock),
 				Effect.provide(services),
 			);
@@ -437,7 +597,15 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							updatedAt: now,
 						}),
 					);
-					yield* startScript(scriptRunId, (onLine) => runRunScript({ scriptRunId, script, cwd: current.path, onLine }));
+					yield* startScript(scriptRunId, (onLine) =>
+						runRunScript({
+							scriptRunId,
+							script,
+							cwd: current.path,
+							onLine,
+							onSpawn: (pid) => runScriptGroups.set(scriptRunId, pid),
+						}).pipe(Effect.ensuring(Effect.sync(() => runScriptGroups.delete(scriptRunId)))),
+					);
 					yield* Effect.logInfo("Started run script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
 					return new ScriptRun({
 						id: scriptRunId,
@@ -458,6 +626,19 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),
 				Effect.provide(services),
 			);
+
+			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
+				const running = yield* findRunningRunScript(workspaceId);
+				const group = running === null ? undefined : runScriptGroups.get(running.id);
+				return group === undefined ? [] : yield* listListeningPorts(group);
+			}, Effect.provide(services));
+
+			// The ports the workspace's run script listens on, sent again each time they change. A dev server
+			// takes a moment to bind, and can move ports when one is taken, so this keeps looking.
+			const watchRunScriptPorts = (workspaceId: string) =>
+				Stream.fromEffectSchedule(readRunScriptPorts(workspaceId), Schedule.spaced(RUN_SCRIPT_PORT_POLL)).pipe(
+					Stream.changesWith((a, b) => a.join() === b.join()),
+				);
 
 			const watchScriptRuns = (workspaceId: string): Stream.Stream<ScriptRun> =>
 				Stream.fromPubSub(scriptRunChanges).pipe(Stream.filter((run) => run.workspaceId === workspaceId));
@@ -536,13 +717,18 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				create,
 				get,
 				list,
+				listProjectBranches,
+				listProjectPullRequests,
+				listProjectIssues,
 				archive,
+				unarchive,
 				listScriptRuns,
 				getScriptRunOutput,
 				followScriptRunOutput,
 				startRunScript,
 				stopRunScript,
 				watchScriptRuns,
+				watchRunScriptPorts,
 				setPullRequestUrl,
 			};
 		}),
