@@ -51,8 +51,8 @@ import {
 } from "effect";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
 import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
+import { AgentEvent, type ApprovalDecision, isLiveOnly } from "@repo/contracts/AgentEvent";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "@repo/contracts/Workspace";
-import { AgentEvent, type ApprovalDecision } from "@repo/contracts/AgentEvent";
 import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
 import { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
@@ -228,7 +228,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const record = Effect.fnUntraced(function* (runtime: Runtime, event: AgentEvent) {
 			const { sessionId } = runtime;
 			const createdAt = yield* nowIso;
-			if (event.type === "message.delta") {
+			if (isLiveOnly(event)) {
 				return yield* publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
 			}
 			const sequence = runtime.nextSequence;
