@@ -169,6 +169,7 @@ export const boot = async () => {
 	// Checking the agents starts their CLIs and reads the keychain, so it never holds up files, terminals or history.
 	void refreshAgents();
 	watchSessions();
+	watchAgentLogins();
 	const remembered = readStored(LAST_WORKSPACE_KEY);
 	const active = Object.values(state.workspaces).filter((workspace) => workspace.status === "active");
 	const start = active.find((workspace) => workspace.id === remembered) ?? active[0];
@@ -213,6 +214,19 @@ const watchSessions = () => {
 	});
 };
 
+// A sign-in finishes in the browser, so the account list refreshes when the agent says it ended.
+// A dropped socket ends this watch too, and the reconnect in watchSessions starts it again.
+const watchAgentLogins = () => {
+	followDaemon((daemon) => daemon.watchAgentLogins(), {
+		onItem: ({ agent, success }) => {
+			const name = agent === "claude" ? "Claude Code" : "Codex";
+			if (success) toast(`Signed in to ${name}.`, "info");
+			else toast(`The ${name} sign-in did not finish. Try again.`);
+			void refreshAgents();
+		},
+	});
+};
+
 // Reloads the lists the watch kept fresh, then watches again. The reload is what proves the daemon is back.
 const reconnect = (attempt: number) => {
 	setTimeout(() => {
@@ -221,6 +235,7 @@ const reconnect = (attempt: number) => {
 				setState(() => ({ connection: { status: "ready" } }));
 				showToast.success("Reconnected to the daemon.", { id: CONNECTION_TOAST, duration: 4000 });
 				watchSessions();
+				watchAgentLogins();
 			},
 			(error: unknown) => {
 				if (isConnectionDrop(error)) {
@@ -690,3 +705,7 @@ export const setAgentAuthMode = async (agent: AgentKind, mode: AgentAuthMode) =>
 
 export const startAgentLogin = (agent: AgentKind) =>
 	attempt(() => callDaemon((daemon) => daemon.startAgentLogin({ agent })));
+
+export const submitAgentLoginCode = async (agent: AgentKind, code: string) =>
+	(await attempt(() => callDaemon((daemon) => daemon.submitAgentLoginCode({ agent, code: Redacted.make(code) })))) !==
+	null;

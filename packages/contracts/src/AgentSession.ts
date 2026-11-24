@@ -63,7 +63,7 @@ export class AgentInfo extends Schema.Class<AgentInfo>("AgentInfo")({
 	kind: AgentKind,
 	availability: AgentAvailability,
 	capabilities: AgentCapabilities,
-	// The modes the user may pick. Claude offers only apiKey until Anthropic approves subscription use (architecture 2.1).
+	// The modes the user may pick.
 	authModes: Schema.Array(AgentAuthMode),
 	authMode: AgentAuthMode,
 	models: Schema.Array(AgentModel),
@@ -161,8 +161,16 @@ export class AuthModeNotAllowedError extends Schema.TaggedError<AuthModeNotAllow
 	mode: AgentAuthMode,
 }) {
 	override get message() {
-		return this.agent === "claude"
-			? "Claude subscriptions cannot be used in other apps yet. Add an Anthropic API key instead."
-			: `Codex cannot use ${this.mode} sign-in here.`;
+		const name = this.agent === "claude" ? "Claude Code" : "Codex";
+		return `${name} cannot use ${this.mode} sign-in here.`;
+	}
+}
+
+// A sign-in code arrived with no sign-in waiting for one: it finished, timed out or was never started.
+export class LoginNotPendingError extends Schema.TaggedError<LoginNotPendingError>()("LoginNotPendingError", {
+	agent: AgentKind,
+}) {
+	override get message() {
+		return "No sign-in is waiting for a code. Start the sign-in again.";
 	}
 }

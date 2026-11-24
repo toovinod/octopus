@@ -7,6 +7,7 @@ import {
 	AuthModeNotAllowedError,
 	ImageData,
 	ImagesNotSupportedError,
+	LoginNotPendingError,
 	MAX_IMAGES_PER_MESSAGE,
 	AgentSession,
 	AgentUnavailableError,
@@ -41,11 +42,17 @@ export class SessionRpcs extends RpcGroup.make(
 		payload: { agent: AgentKind, mode: AgentAuthMode },
 		error: Schema.Union([AuthModeNotAllowedError, DaemonInternalError]),
 	}),
-	// Codex only: starts its own ChatGPT sign-in and returns the URL to open. Codex keeps the tokens.
+	// Starts the agent's own sign-in (ChatGPT for Codex, claude.ai for Claude) and returns the URL to open.
+	// The agent keeps the tokens. claude also opens the browser itself.
 	Rpc.make("startAgentLogin", {
 		payload: { agent: AgentKind },
 		success: Schema.Struct({ authUrl: Schema.String }),
 		error: Schema.Union([AuthModeNotAllowedError, DaemonInternalError]),
+	}),
+	// The code claude.ai shows when the browser cannot hand the sign-in back to claude by itself.
+	Rpc.make("submitAgentLoginCode", {
+		payload: { agent: AgentKind, code: Schema.Redacted(Schema.String) },
+		error: Schema.Union([LoginNotPendingError, DaemonInternalError]),
 	}),
 	// How each sign-in from startAgentLogin ended, as it ends, so the client can refresh the agents without asking.
 	Rpc.make("watchAgentLogins", {

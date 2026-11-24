@@ -1,6 +1,7 @@
 import {
 	type AgentAdapter,
 	AgentAuthError,
+	type AgentError,
 	type AgentAuthStatus,
 	type AgentModels,
 	AgentNotInstalledError,
@@ -9,27 +10,46 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
+import {
+	Config,
+	Context,
+	Deferred,
+	Effect,
+	Exit,
+	FiberHandle,
+	Layer,
+	Option,
+	PubSub,
+	Queue,
+	Redacted,
+	Ref,
+	Schema,
+	Scope,
+	Stream,
+} from "effect";
 import type {
 	CanUseTool,
 	Options,
 	PermissionResult,
 	PermissionUpdate,
 	SDKUserMessage,
+	SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Config, Context, Deferred, Effect, Layer, Option, Queue, Redacted, Ref, Schema, Stream } from "effect";
+import { type AgentCapabilities, type AgentModel, LoginNotPendingError } from "@repo/contracts/AgentSession";
 import type { ApprovalDecision, ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import { BashInput, ClaudeAuthStatus, ClaudeMessage, FileInput } from "./claudeMessages.ts";
-import type { AgentCapabilities, AgentModel } from "@repo/contracts/AgentSession";
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import { stopProcessGroup } from "../../processes/stopProcessGroup.ts";
 import { ProcessRegistry } from "../../processes/ProcessRegistry.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { spawnTerminal } from "../../terminals/spawnTerminal.ts";
 import { spawnInProcessGroup } from "./spawnInProcessGroup.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
+import { homedir } from "node:os";
 
 // Octopus runs the user's own `claude`, found on PATH unless this names another one. Inside a
 // `bun build --compile` binary the SDK cannot find the CLI it bundles, and the user's install
@@ -76,7 +96,7 @@ const models: AgentModels = {
 };
 
 // The SDK replaces the whole child environment when `env` is set, so API key mode passes
-// these through explicitly. Subscription mode leaves `env` unset and inherits everything.
+// these through explicitly. Subscription mode leaves `env` unset and inherits everything but API credentials.
 // Proxies and extra CA certificates keep claude working on corporate networks, and the config
 // folders keep it reading the user's own settings.
 const inheritedVariables = [
@@ -111,6 +131,24 @@ const apiKeyEnvironment = Effect.fnUntraced(function* (apiKey: Redacted.Redacted
 	env.ANTHROPIC_API_KEY = Redacted.value(apiKey);
 	return env;
 });
+
+// A key or token in the shell that started Octopus would make claude bill the API instead of the
+// subscription. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
+const apiCredentials = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
+const withoutApiCredentials = ({
+	ANTHROPIC_API_KEY: _key,
+	ANTHROPIC_AUTH_TOKEN: _token,
+	...env
+}: SpawnOptions["env"]): SpawnOptions["env"] => env;
+
+// claude prints the sign-in link as an OSC 8 hyperlink and as text. Both hold the same URL, and
+// requiring the character after it keeps a link split across two reads from matching early.
+const loginUrlPattern = /https:\/\/[\w.-]+\/oauth\/authorize\?[\w\-.~%&=+/:]+(?=[^\w\-.~%&=+/:])/;
+const findLoginUrl = (printed: string) => loginUrlPattern.exec(printed)?.[0] ?? null;
+
+// claude waits for the browser, or a pasted code, about as long as Codex does.
+const LOGIN_TIMEOUT = "10 minutes";
+const LOGIN_LINK_TIMEOUT = "30 seconds";
 
 const fileTools = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 
@@ -347,7 +385,17 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	return { handle, interrupting };
 });
 
-export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>()(
+// claude runs its own claude.ai sign-in on a terminal. Octopus shows its link and passes it a
+// pasted code, and claude stores the tokens itself.
+export interface ClaudeAgentAdapter extends AgentAdapter {
+	// Returns the link to open. claude also opens it in the browser itself.
+	readonly startLogin: Effect.Effect<string, AgentError>;
+	// The code claude.ai shows when the browser cannot return to claude by itself.
+	submitLoginCode(code: string): Effect.Effect<void, LoginNotPendingError>;
+	readonly loginResults: Stream.Stream<{ readonly success: boolean }>;
+}
+
+export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAdapter>()(
 	"octopus/daemon/agents/claude/ClaudeAdapter",
 ) {
 	static readonly layer = Layer.effect(
@@ -356,11 +404,16 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 			const claudeQuery = yield* ClaudeQuery;
 			const registry = yield* ProcessRegistry;
+			// Holds the sign-in waiting for the browser. A new sign-in replaces it and stops its claude.
+			const pendingLogin = yield* FiberHandle.make();
+			const loginTerminal = yield* Ref.make(Option.none<Bun.Terminal>());
+			const loginResults = yield* PubSub.unbounded<{ readonly success: boolean }>();
+			yield* Effect.addFinalizer(() => PubSub.shutdown(loginResults));
 
 			const checkAuth = Effect.gen(function* () {
 				const { executable } = yield* ClaudeAdapterConfig;
 				const output = yield* spawner
-					.string(ChildProcess.make(executable, ["auth", "status", "--json"]))
+					.string(ChildProcess.make(executable, ["auth", "status", "--json"], { env: apiCredentials, extendEnv: true }))
 					.pipe(Effect.mapError(toAgentError(executable, "Could not run claude auth status.")));
 				const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ClaudeAuthStatus))(output);
 				if (Option.isNone(decoded)) {
@@ -373,6 +426,78 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 					: { status: "loggedOut" };
 				return status;
 			}).pipe(Effect.withSpan("ClaudeAdapter.checkAuth"));
+
+			const startLogin = Effect.gen(function* () {
+				const { executable } = yield* ClaudeAdapterConfig;
+				if (Bun.which(executable) === null) {
+					return yield* new AgentNotInstalledError({ executable });
+				}
+				const scope = yield* Scope.make();
+				const closeScope = Scope.close(scope, Exit.void);
+				const linkShown = yield* Deferred.make<string>();
+				const decoder = new TextDecoder();
+				let printed = "";
+				const { terminal, exited } = yield* spawnTerminal({
+					command: [executable, "auth", "login", "--claudeai"],
+					cwd: homedir(),
+					// Wide enough that claude never wraps the link.
+					cols: 1000,
+					rows: 40,
+					onData: (data) => {
+						printed = keepOutputTail(printed + decoder.decode(data, { stream: true }));
+						const url = findLoginUrl(printed);
+						if (url !== null) Deferred.doneUnsafe(linkShown, Effect.succeed(url));
+					},
+				}).pipe(
+					Scope.provide(scope),
+					Effect.mapError((cause) => new AgentProcessError({ message: "Could not start claude auth login.", cause })),
+					Effect.onError(() => closeScope),
+				);
+				const stoppedEarly = exited.pipe(
+					Effect.andThen(
+						Effect.fail(
+							new AgentProcessError({ message: "claude stopped before it showed a sign-in link.", cause: printed }),
+						),
+					),
+				);
+				const url = yield* Deferred.await(linkShown).pipe(
+					Effect.raceFirst(stoppedEarly),
+					Effect.timeoutOrElse({
+						duration: LOGIN_LINK_TIMEOUT,
+						orElse: () =>
+							Effect.fail(new AgentProcessError({ message: "claude did not show a sign-in link.", cause: printed })),
+					}),
+					Effect.onError(() => closeScope),
+				);
+				// claude must keep running after this call, or the browser sign-in has nothing to return to.
+				yield* Ref.set(loginTerminal, Option.some(terminal)).pipe(
+					Effect.andThen(exited),
+					Effect.flatMap((code) =>
+						Effect.gen(function* () {
+							if (code !== 0) {
+								yield* Effect.logWarning("Claude sign-in failed").pipe(Effect.annotateLogs({ code }));
+							}
+							yield* PubSub.publish(loginResults, { success: code === 0 });
+						}),
+					),
+					Effect.timeoutOption(LOGIN_TIMEOUT),
+					Effect.ensuring(
+						Ref.update(loginTerminal, (current) =>
+							Option.isSome(current) && current.value === terminal ? Option.none() : current,
+						).pipe(Effect.andThen(closeScope)),
+					),
+					FiberHandle.run(pendingLogin),
+				);
+				return url;
+			}).pipe(Effect.provideService(ProcessRegistry, registry), Effect.withSpan("ClaudeAdapter.startLogin"));
+
+			const submitLoginCode = Effect.fn("ClaudeAdapter.submitLoginCode")(function* (code: string) {
+				const terminal = yield* Ref.get(loginTerminal);
+				if (Option.isNone(terminal)) {
+					return yield* new LoginNotPendingError({ agent: "claude" });
+				}
+				terminal.value.write(`${code.trim()}\r`);
+			});
 
 			const startSession = Effect.fn("ClaudeAdapter.startSession")(function* (input: StartSessionInput) {
 				const { executable } = yield* ClaudeAdapterConfig;
@@ -433,7 +558,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
-						const child = spawnInProcessGroup(spawnOptions);
+						const child = spawnInProcessGroup(
+							input.auth.mode === "subscription"
+								? { ...spawnOptions, env: withoutApiCredentials(spawnOptions.env) }
+								: spawnOptions,
+						);
 						claudePid = child.pid;
 						if (child.pid !== undefined) Effect.runForkWith(context)(registry.add(child.pid));
 						return child;
@@ -535,9 +664,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, AgentAdapter>(
 			return ClaudeAdapter.of({
 				kind: "claude",
 				capabilities,
-				// claude.ai subscriptions stay off in third-party apps until Anthropic approves it (architecture 2.1).
-				authModes: ["apiKey"],
+				authModes: ["apiKey", "subscription"],
 				checkAuth,
+				startLogin,
+				submitLoginCode,
+				loginResults: Stream.fromPubSub(loginResults),
 				listModels: Effect.succeed(models),
 				startSession,
 			});

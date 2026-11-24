@@ -7,6 +7,7 @@ import {
 	setAgentApiKey,
 	setAgentAuthMode,
 	startAgentLogin,
+	submitAgentLoginCode,
 	toast,
 	updateSettings,
 	useAppState,
@@ -104,6 +105,7 @@ const availabilityText = (availability: AgentAvailability) => {
 const AgentAccount = ({ agent }: { readonly agent: AgentInfo }) => {
 	const [apiKey, setApiKey] = useState("");
 	const [login, setLogin] = useState<string | null>(null);
+	const [code, setCode] = useState("");
 	const name = agent.kind === "claude" ? "Claude Code" : "Codex";
 	const ready = agent.availability.status === "ready";
 	return (
@@ -119,12 +121,6 @@ const AgentAccount = ({ agent }: { readonly agent: AgentInfo }) => {
 					</Button>
 				) : null}
 			</div>
-			{agent.kind === "claude" ? (
-				<p className="text-xs text-muted-foreground">
-					Anthropic does not yet allow Claude subscriptions in other apps, so Octopus runs Claude Code with your
-					Anthropic API key. The key stays in the system keychain.
-				</p>
-			) : null}
 			{agent.authModes.length > 1 ? (
 				<Tabs
 					value={agent.authMode}
@@ -136,13 +132,13 @@ const AgentAccount = ({ agent }: { readonly agent: AgentInfo }) => {
 					<TabsList aria-label={`${name} sign-in`} className="w-full">
 						{agent.authModes.map((mode) => (
 							<TabsTrigger key={mode} value={mode} className="text-xs">
-								{mode === "subscription" ? (agent.kind === "codex" ? "ChatGPT account" : "Subscription") : "API key"}
+								{mode === "subscription" ? (agent.kind === "codex" ? "ChatGPT account" : "Claude account") : "API key"}
 							</TabsTrigger>
 						))}
 					</TabsList>
 				</Tabs>
 			) : null}
-			{agent.authMode === "subscription" && agent.kind === "codex" ? (
+			{agent.authMode === "subscription" ? (
 				<div className="flex flex-col gap-1.5">
 					<Button
 						variant="secondary"
@@ -152,18 +148,50 @@ const AgentAccount = ({ agent }: { readonly agent: AgentInfo }) => {
 							const started = await startAgentLogin(agent.kind);
 							if (started === null) return;
 							setLogin(started.authUrl);
-							openExternal(started.authUrl).catch(() =>
-								toast("Could not open the sign-in page. Open the link below instead."),
-							);
+							// claude opens the browser itself. Codex leaves it to us.
+							if (agent.kind === "codex") {
+								openExternal(started.authUrl).catch(() =>
+									toast("Could not open the sign-in page. Open the link below instead."),
+								);
+							}
 						}}
 					>
-						Sign in with ChatGPT
+						{agent.kind === "codex" ? "Sign in with ChatGPT" : "Sign in with Claude"}
 					</Button>
 					{login === null ? null : (
 						<p className="text-xs break-all text-muted-foreground">
-							Finish signing in on the page that opened. If none did, open <span className="font-mono">{login}</span>
+							Finish signing in on the page that opened. If none did,{" "}
+							<button
+								type="button"
+								className="underline underline-offset-2"
+								onClick={() => void openExternal(login).catch(() => toast("Could not open the sign-in page."))}
+							>
+								open the sign-in page
+							</button>
+							.
 						</p>
 					)}
+					{login !== null && agent.kind === "claude" ? (
+						<form
+							className="flex gap-1.5"
+							onSubmit={async (event) => {
+								event.preventDefault();
+								if (await submitAgentLoginCode(agent.kind, code.trim())) setCode("");
+							}}
+						>
+							<Input
+								autoComplete="off"
+								value={code}
+								onChange={(event) => setCode(event.target.value)}
+								placeholder="Code from claude.ai, if it shows one"
+								aria-label="Claude sign-in code"
+								className="h-8 font-mono"
+							/>
+							<Button variant="secondary" size="sm" type="submit" disabled={code.trim() === ""}>
+								Submit
+							</Button>
+						</form>
+					) : null}
 				</div>
 			) : (
 				<form

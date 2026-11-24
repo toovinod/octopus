@@ -19,7 +19,12 @@ import {
 	Schema,
 	Stream,
 } from "effect";
-import { commandWithApproval, TEST_LOGIN_URL, testAgentServices } from "../testing/testAgentServices.ts";
+import {
+	commandWithApproval,
+	TEST_CLAUDE_LOGIN_URL,
+	TEST_LOGIN_URL,
+	testAgentServices,
+} from "../testing/testAgentServices.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
@@ -138,7 +143,7 @@ describe("SessionService", () => {
 			}),
 		);
 		expect(sessions.map((session) => [session.agent, session.status, session.authMode])).toEqual([
-			["claude", "idle", "apiKey"],
+			["claude", "idle", "subscription"],
 			["codex", "idle", "subscription"],
 			["codex", "idle", "subscription"],
 		]);
@@ -1010,10 +1015,11 @@ describe("SessionService", () => {
 		expect(result.row).toMatchObject({ model: "replay", effort: null });
 	});
 
-	test("Claude needs an API key before it starts", async () => {
+	test("Claude in API key mode needs a key before it starts", async () => {
 		const error = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const sessions = yield* SessionService;
+				yield* sessions.setAuthMode("claude", "apiKey");
 				const session = yield* addSession(tempDir, "claude");
 				return yield* Effect.flip(sessions.sendMessage(session.id, "hi", [], false));
 			}),
@@ -1029,6 +1035,7 @@ describe("SessionService", () => {
 		const [before, after] = await runServiceTest(() =>
 			Effect.gen(function* () {
 				const sessions = yield* SessionService;
+				yield* sessions.setAuthMode("claude", "apiKey");
 				const before = yield* sessions.listAgents;
 				yield* sessions.setApiKey("claude", Redacted.make("sk-ant-test"));
 				return [before, yield* sessions.listAgents] as const;
@@ -1197,23 +1204,26 @@ describe("SessionService", () => {
 		expect(counts).toEqual([1, 2, 3, 4, 4]);
 	});
 
-	test("keeps Claude on API keys and lets Codex switch between its sign-in modes", async () => {
+	test("lets both agents switch between their sign-in modes and start their own sign-in", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const sessions = yield* SessionService;
-				const claudeRefused = yield* Effect.flip(sessions.setAuthMode("claude", "subscription"));
-				const loginRefused = yield* Effect.flip(sessions.startLogin("claude"));
+				yield* sessions.setAuthMode("claude", "subscription");
+				const claudeLogin = yield* sessions.startLogin("claude");
 				const login = yield* sessions.startLogin("codex");
+				const codeRefused = yield* Effect.flip(sessions.submitLoginCode("codex", "code"));
+				yield* sessions.submitLoginCode("claude", "code");
 				yield* sessions.setAuthMode("codex", "apiKey");
-				const [, codex] = yield* sessions.listAgents;
+				const [claude, codex] = yield* sessions.listAgents;
 				const session = yield* addSession(tempDir);
 				const needsKey = yield* Effect.flip(sessions.sendMessage(session.id, "hi", [], false));
-				return { claudeRefused, loginRefused, login, codex, session, needsKey };
+				return { claudeLogin, login, codeRefused, claude, codex, session, needsKey };
 			}),
 		);
-		expect(result.claudeRefused._tag).toBe("AuthModeNotAllowedError");
-		expect(result.loginRefused._tag).toBe("AuthModeNotAllowedError");
+		expect(result.claudeLogin.authUrl).toBe(TEST_CLAUDE_LOGIN_URL);
 		expect(result.login.authUrl).toBe(TEST_LOGIN_URL);
+		expect(result.codeRefused._tag).toBe("LoginNotPendingError");
+		expect(result.claude).toMatchObject({ authModes: ["apiKey", "subscription"], authMode: "subscription" });
 		expect(result.codex).toMatchObject({
 			authModes: ["apiKey", "subscription"],
 			authMode: "apiKey",
@@ -1221,6 +1231,31 @@ describe("SessionService", () => {
 		});
 		expect(result.session.authMode).toBe("apiKey");
 		expect(result.needsKey).toMatchObject({ _tag: "AgentUnavailableError", availability: { status: "needsApiKey" } });
+	});
+
+	test("reports how a Claude sign-in ended and fetches Claude's models again", async () => {
+		const logins = await Effect.runPromise(Queue.unbounded<{ readonly success: boolean }>());
+		const claude = {
+			...makeReplayAdapter({ ...commandWithApproval, kind: "claude" }),
+			startLogin: Effect.succeed(TEST_CLAUDE_LOGIN_URL),
+			submitLoginCode: () => Effect.void,
+			loginResults: Stream.fromQueue(logins),
+		};
+		const results = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude, codex: makeReplayAdapter(commandWithApproval) }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const watched = yield* sessions.watchLogins.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+					yield* Effect.sleep("20 millis");
+					yield* Queue.offer(logins, { success: true });
+					return yield* Fiber.join(watched);
+				}),
+			),
+		);
+		expect(results).toEqual([{ agent: "claude", success: true }]);
 	});
 
 	test("the API key never reaches the database or the logs", async () => {

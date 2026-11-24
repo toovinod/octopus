@@ -1,7 +1,7 @@
 import { SessionService } from "../sessions/SessionService.ts";
 import { SessionRpcs } from "@repo/contracts/SessionRpcs";
 import { orInternalError } from "./orInternalError.ts";
-import { Effect, Stream } from "effect";
+import { Effect, Redacted, Stream } from "effect";
 
 export const SessionRpcHandlers = SessionRpcs.toLayer(
 	Effect.gen(function* () {
@@ -40,6 +40,8 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 			setAgentAuthMode: ({ agent, mode }) =>
 				sessions.setAuthMode(agent, mode).pipe(orInternalError("save the sign-in choice")),
 			startAgentLogin: ({ agent }) => sessions.startLogin(agent).pipe(orInternalError("start the sign-in")),
+			submitAgentLoginCode: ({ agent, code }) =>
+				sessions.submitLoginCode(agent, Redacted.value(code)).pipe(orInternalError("finish the sign-in")),
 			watchAgentLogins: () => sessions.watchLogins,
 			updateSessionSettings: ({ sessionId, model, effort }) =>
 				sessions.updateSettings(sessionId, { model, effort }).pipe(orInternalError("change the model")),

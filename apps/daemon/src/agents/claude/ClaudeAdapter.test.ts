@@ -6,9 +6,9 @@ import type {
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
+import { ConfigProvider, Effect, Fiber, Layer, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
-import { ConfigProvider, Effect, Layer, Redacted, Stream } from "effect";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
@@ -301,6 +301,70 @@ describe("ClaudeAdapter", () => {
 			}),
 		);
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
+	});
+
+	test("offers a Claude subscription as well as an API key", async () => {
+		const modes = await runWithClaude(Effect.map(ClaudeAdapter, (claude) => claude.authModes));
+		expect(modes).toEqual(["apiKey", "subscription"]);
+	});
+
+	test("checks the CLI's own login, not an API key in the daemon's environment", async () => {
+		process.env.ANTHROPIC_API_KEY = "sk-from-shell";
+		const status = await runWithClaude(Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth)).finally(() => {
+			delete process.env.ANTHROPIC_API_KEY;
+		});
+		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
+	});
+
+	test("subscription mode never hands claude an API key or auth token from the environment", async () => {
+		const printed = await runSession(() =>
+			Effect.promise(async () => {
+				const spawnClaude = startedWith.at(-1)?.spawnClaudeCodeProcess;
+				if (spawnClaude === undefined) return "no spawn hook";
+				const child = spawnClaude({
+					command: "sh",
+					args: ["-c", 'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$KEEP"'],
+					cwd: "/",
+					env: { PATH: "/bin:/usr/bin", ANTHROPIC_API_KEY: "sk-shell", ANTHROPIC_AUTH_TOKEN: "tok", KEEP: "kept" },
+					signal: new AbortController().signal,
+				});
+				let text = "";
+				for await (const chunk of child.stdout) text += String(chunk);
+				return text;
+			}),
+		);
+		expect(printed).toBe("||kept");
+	});
+
+	describe("sign-in", () => {
+		const login = <A, E>(program: (claude: ClaudeAdapter["Service"]) => Effect.Effect<A, E>) =>
+			runWithClaude(Effect.flatMap(ClaudeAdapter, program));
+
+		test("returns the link claude prints for its browser sign-in", async () => {
+			const url = await login((claude) => claude.startLogin);
+			expect(url).toBe("https://claude.ai/oauth/authorize?code=true&client_id=test&state=abc");
+		});
+
+		test.each([
+			["good-code", true],
+			["bad-code", false],
+		])("a pasted code (%s) finishes the sign-in and reports how it ended", async (code, success) => {
+			const results = await login((claude) =>
+				Effect.gen(function* () {
+					const watched = yield* claude.loginResults.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+					yield* Effect.sleep("20 millis");
+					yield* claude.startLogin;
+					yield* claude.submitLoginCode(code);
+					return yield* Fiber.join(watched);
+				}),
+			);
+			expect(results).toEqual([{ success }]);
+		});
+
+		test("a code with no sign-in waiting for it is refused", async () => {
+			const error = await login((claude) => Effect.flip(claude.submitLoginCode("good-code")));
+			expect(error._tag).toBe("LoginNotPendingError");
+		});
 	});
 
 	test("maps SDK messages and learns the session id from the first turn", async () => {

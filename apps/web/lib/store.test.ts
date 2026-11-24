@@ -15,6 +15,7 @@ const sent: Array<string> = [];
 // Each listProjects call takes the next of these, and succeeds once they run out.
 const listFailures: Array<unknown> = [];
 let listCalls = 0;
+let agentLists = 0;
 // Every stream the store follows, newest last.
 const follows: Array<{ readonly name: string; readonly handlers: Follow<unknown> }> = [];
 
@@ -26,7 +27,10 @@ const daemon = {
 	},
 	listWorkspaces: () => [workspace],
 	listSessions: () => [session],
-	listAgents: () => [],
+	listAgents: () => {
+		agentLists++;
+		return [];
+	},
 	loadSessionHistory: () => [],
 	removeProject: () => undefined,
 	sendMessage: ({ text }: { readonly text: string }) => {
@@ -41,7 +45,11 @@ mock.module("./daemonRuntime.ts", () => ({
 	callDaemon: (call: (client: typeof daemon) => unknown) => Promise.resolve(call(daemon)),
 	followDaemon: (open: (client: Record<string, () => string>) => string, handlers: Follow<unknown>) => {
 		follows.push({
-			name: open({ watchSessions: () => "watchSessions", subscribeSession: () => "subscribeSession" }),
+			name: open({
+				watchSessions: () => "watchSessions",
+				watchAgentLogins: () => "watchAgentLogins",
+				subscribeSession: () => "subscribeSession",
+			}),
 			handlers,
 		});
 		return () => {};
@@ -157,5 +165,18 @@ describe("removing a project", () => {
 		expect(state.selectedWorkspaceId).toBeNull();
 		expect(state.selectedSessionId).toBeNull();
 		expect(state.chat).toBeNull();
+	});
+});
+
+describe("signing in", () => {
+	test("a finished sign-in refreshes the agents without being asked", async () => {
+		await boot();
+		const watch = follows.filter((follow) => follow.name === "watchAgentLogins").at(-1)?.handlers;
+		await sleep(0);
+		const before = agentLists;
+		watch?.onItem({ agent: "claude", success: true });
+		await sleep(0);
+		expect(watch).toBeDefined();
+		expect(agentLists).toBe(before + 1);
 	});
 });

@@ -9,6 +9,7 @@ import { Effect, Layer, Schema, Stream } from "effect";
 export const commandWithApproval = Schema.decodeUnknownSync(Recording)(recordingJson);
 
 export const TEST_LOGIN_URL = "https://auth.example/login";
+export const TEST_CLAUDE_LOGIN_URL = "https://claude.example/oauth/authorize?state=test";
 
 // Replayed agents and in-memory keys, so tests never start a real agent or touch the keychain.
 export const testAgentServices = (
@@ -18,7 +19,12 @@ export const testAgentServices = (
 	},
 ) =>
 	Layer.mergeAll(
-		Layer.succeed(ClaudeAdapter, adapters.claude),
+		Layer.succeed(ClaudeAdapter, {
+			startLogin: Effect.succeed(TEST_CLAUDE_LOGIN_URL),
+			submitLoginCode: () => Effect.void,
+			loginResults: Stream.empty,
+			...adapters.claude,
+		}),
 		Layer.succeed(CodexAdapter, {
 			startLogin: Effect.succeed(TEST_LOGIN_URL),
 			loginResults: Stream.empty,

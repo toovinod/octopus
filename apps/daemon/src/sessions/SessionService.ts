@@ -10,6 +10,7 @@ import {
 	ApprovalNotFoundError,
 	AttachmentNotFoundError,
 	AuthModeNotAllowedError,
+	LoginNotPendingError,
 	type ImageData,
 	ImageMediaType,
 	ImagesNotSupportedError,
@@ -148,8 +149,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const database = yield* LocalDatabase;
 		const credentials = yield* CredentialStore;
 		const workspaceLock = yield* WorkspaceLock;
+		const claude = yield* ClaudeAdapter;
 		const codex = yield* CodexAdapter;
-		const adapters: Record<AgentKind, AgentAdapter> = { claude: yield* ClaudeAdapter, codex };
+		const adapters: Record<AgentKind, AgentAdapter> = { claude, codex };
 		const services = yield* Effect.context<SecureRandom.SecureRandom>();
 		const fs = yield* FileSystem.FileSystem;
 		const { dataDir } = yield* DaemonConfig;
@@ -172,14 +174,16 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		// The account decides which models an agent offers, so a new key or auth mode fetches it again.
 		const modelCache = new Map<AgentKind, AgentModels>();
 		const forgetModels = (agent: AgentKind) => void modelCache.delete(agent);
-		// A finished sign-in changes the account, and with it the models Codex offers. Clients hear about it
+		// A finished sign-in changes the account, and with it the models the agent offers. Clients hear about it
 		// here instead of asking again.
 		const agentLogins = yield* PubSub.unbounded<AgentLoginResult>();
-		yield* codex.loginResults.pipe(
-			Stream.runForEach(({ success }) =>
+		const loginsOf = (agent: AgentKind, results: Stream.Stream<{ readonly success: boolean }>) =>
+			Stream.map(results, ({ success }): AgentLoginResult => ({ agent, success }));
+		yield* Stream.merge(loginsOf("claude", claude.loginResults), loginsOf("codex", codex.loginResults)).pipe(
+			Stream.runForEach((result) =>
 				Effect.gen(function* () {
-					if (success) forgetModels("codex");
-					yield* PubSub.publish(agentLogins, { agent: "codex", success } satisfies AgentLoginResult);
+					if (result.success) forgetModels(result.agent);
+					yield* PubSub.publish(agentLogins, result);
 				}),
 			),
 			Effect.forkScoped,
@@ -365,10 +369,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		});
 
 		const startLogin = Effect.fn("SessionService.startLogin")(function* (agent: AgentKind) {
-			if (agent === "claude") {
-				return yield* new AuthModeNotAllowedError({ agent, mode: "subscription" });
+			return { authUrl: yield* agent === "claude" ? claude.startLogin : codex.startLogin };
+		});
+
+		// Codex's sign-in returns to its own callback server, so only Claude ever waits for a pasted code.
+		const submitLoginCode = Effect.fn("SessionService.submitLoginCode")(function* (agent: AgentKind, code: string) {
+			if (agent === "codex") {
+				return yield* new LoginNotPendingError({ agent });
 			}
-			return { authUrl: yield* codex.startLogin };
+			yield* claude.submitLoginCode(code);
 		});
 
 		const authFor = Effect.fnUntraced(function* (agent: AgentKind) {
@@ -896,6 +905,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			setApiKey,
 			setAuthMode,
 			startLogin,
+			submitLoginCode,
 			removeApiKey,
 			// Both can start work in the workspace, so neither may race an archive of it.
 			create: (input: Parameters<typeof create>[0]) => workspaceLock.starting(input.workspaceId, create(input)),
