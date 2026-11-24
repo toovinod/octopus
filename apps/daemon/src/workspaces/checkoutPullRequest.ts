@@ -29,6 +29,7 @@ export const findPullRequestHead = Effect.fn("findPullRequestHead")(function* (r
 	return {
 		branch: head.isCrossRepository ? `pr-${number}-${head.headRefName}` : head.headRefName,
 		baseBranch: head.baseRefName,
+		fromFork: head.isCrossRepository,
 	};
 });
 

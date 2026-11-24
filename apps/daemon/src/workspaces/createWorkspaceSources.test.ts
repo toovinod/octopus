@@ -127,10 +127,14 @@ esac`,
 		expect(result.ghLog).toContain("pr checkout 7 --branch fix-bug");
 	});
 
-	test("names a fork's pull request branch after its number", async () => {
-		const branch = await runServiceTest((tempDir) =>
+	test("names a fork's pull request branch after its number and skips the setup script", async () => {
+		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
-				const project = yield* addProject(tempDir);
+				const project = yield* Effect.flatMap(ProjectService, (projects) =>
+					Effect.flatMap(addProject(tempDir), (added) =>
+						projects.updateScripts(added.id, { setupScript: "true", runScript: null }),
+					),
+				);
 				const executable = yield* fakeGh(
 					tempDir,
 					`case "$1 $2" in
@@ -141,10 +145,12 @@ esac`,
 				const created = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
 					workspaces.create({ kind: "pullRequest", projectId: project.id, number: 9 }),
 				).pipe(Effect.provideService(GhSettings, { executable }));
-				return created.branch;
+				const runs = yield* Effect.flatMap(WorkspaceService, (workspaces) => workspaces.listScriptRuns(created.id));
+				return { branch: created.branch, runs };
 			}),
 		);
-		expect(branch).toBe("pr-9-main");
+		expect(result.branch).toBe("pr-9-main");
+		expect(result.runs).toEqual([]);
 	});
 
 	test("removes the worktree when gh cannot check out the pull request", async () => {

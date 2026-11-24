@@ -152,6 +152,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 
 			// Where a worktree workspace's code comes from: a new branch, one that exists, or a pull request.
 			// `ownsBranch` says whether the branch was made for the workspace, so undoing the worktree may delete it.
+			// `runSetup` is false for a fork's pull request: the setup script (an install, say) would run code
+			// that anyone on GitHub can write, so the user starts it once they have read the change.
 			const planWorktree = Effect.fn("WorkspaceService.planWorktree")(function* (
 				owner: Project,
 				input: Exclude<CreateWorkspaceInput, { readonly kind: "inPlace" }>,
@@ -163,6 +165,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.name,
 							baseBranch,
 							ownsBranch: true,
+							runSetup: true,
 							add: (worktreePath: string) =>
 								createWorktree({ repositoryPath: owner.path, worktreePath, branch: input.name, baseBranch }),
 						};
@@ -172,6 +175,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: input.branch,
 							baseBranch: owner.defaultBranch,
 							ownsBranch: false,
+							runSetup: true,
 							add: (worktreePath: string) =>
 								addBranchWorktree({ repositoryPath: owner.path, worktreePath, branch: input.branch }),
 						};
@@ -181,6 +185,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							branch: head.branch,
 							baseBranch: head.baseBranch,
 							ownsBranch: false,
+							runSetup: !head.fromFork,
 							add: (worktreePath: string) =>
 								checkoutPullRequest({
 									repositoryPath: owner.path,
@@ -253,7 +258,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						branch: plan.branch,
 						baseBranch: plan.baseBranch,
 					};
-					setupRun = yield* newSetupRun(owner, id);
+					setupRun = plan.runSetup ? yield* newSetupRun(owner, id) : null;
 				} else {
 					const current = yield* runGit(owner.path, ["branch", "--show-current"]);
 					row = {
