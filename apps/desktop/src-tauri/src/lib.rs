@@ -10,7 +10,10 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{Emitter, Manager, RunEvent, State};
+#[cfg(target_os = "macos")]
+use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
+use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_shell::{
   process::{CommandChild, CommandEvent},
   ShellExt,
@@ -80,6 +83,27 @@ struct Daemon {
   // can hold while octopusd is stopped, and quitting runs on the UI thread.
   child: Mutex<Option<(CommandChild, u32)>>,
   quitting: AtomicBool,
+}
+
+// What closing the window does. On macOS the app stays in the dock and agents keep working, as macOS apps
+// do. Elsewhere there is no dock to reopen it from, so closing the window quits.
+#[derive(Debug, PartialEq)]
+enum CloseAction {
+  Hide,
+  Quit,
+}
+
+const CLOSE_ACTION: CloseAction = if cfg!(target_os = "macos") { CloseAction::Hide } else { CloseAction::Quit };
+
+// Set by the webview while turns run or approvals wait, with the text to show before quitting. The shell
+// does not track sessions itself. Starting empty means a webview that never reports cannot block a quit.
+struct QuitWarning(Mutex<Option<String>>);
+
+#[tauri::command]
+fn set_quit_warning(warning: Option<String>, quit_warning: State<'_, QuitWarning>) {
+  if let Ok(mut slot) = quit_warning.0.lock() {
+    *slot = warning;
+  }
 }
 
 async fn wait_for_connection(daemon: &Daemon) -> Result<DaemonConnection, String> {
@@ -203,20 +227,101 @@ pub fn run() {
         .level(log::LevelFilter::Info)
         .build(),
     )
+    .on_menu_event(|app, event| {
+      if event.id() == CLOSE_WINDOW_ID
+        && let Some(window) = app.webview_windows().values().find(|window| window.is_focused().unwrap_or(false))
+      {
+        let _ = window.close();
+      }
+    })
     .setup(|app| {
       let (status, _) = watch::channel(DaemonStatus::Starting);
       app.manage(Daemon { status, child: Mutex::new(None), quitting: AtomicBool::new(false) });
+      app.manage(QuitWarning(Mutex::new(None)));
+      #[cfg(target_os = "macos")]
+      app.set_menu(app_menu(app.handle())?)?;
       start_daemon(app.handle().clone());
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![daemon_connection, restart_daemon])
+    .on_window_event(|window, event| {
+      let WindowEvent::CloseRequested { api, .. } = event else { return };
+      // Quitting closes the windows itself.
+      if window.state::<Daemon>().quitting.load(Ordering::SeqCst) {
+        return;
+      }
+      api.prevent_close();
+      match CLOSE_ACTION {
+        CloseAction::Hide => {
+          let _ = window.hide();
+        }
+        CloseAction::Quit => request_quit(window.app_handle()),
+      }
+    })
+    .invoke_handler(tauri::generate_handler![daemon_connection, restart_daemon, set_quit_warning])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app, event| match event {
-      RunEvent::ExitRequested { api, .. } => quit(app, api),
+      // Our own `app.exit` in `quit` asks again, and that one goes through.
+      RunEvent::ExitRequested { api, .. } if !app.state::<Daemon>().quitting.load(Ordering::SeqCst) => {
+        api.prevent_exit();
+        request_quit(app);
+      }
+      // A click on the dock icon brings back the window that closing hid.
+      #[cfg(target_os = "macos")]
+      RunEvent::Reopen { has_visible_windows: false, .. } => {
+        for window in app.webview_windows().values() {
+          let _ = window.show();
+          let _ = window.set_focus();
+        }
+      }
       // In case the app exits without asking first. A crash closes stdin too.
       RunEvent::Exit => drop(take_daemon_child(app)),
       _ => {}
+    });
+}
+
+const CLOSE_WINDOW_ID: &str = "close-window";
+
+// The default menu, except that Close Window moves from ⌘W to ⇧⌘W. Menu shortcuts reach the app before
+// the page, so with ⌘W on Close Window the page's "close the chat tab" shortcut never ran on its own.
+// Only macOS gets a default menu.
+#[cfg(target_os = "macos")]
+fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+  let menu = Menu::default(app)?;
+  let close_window = PredefinedMenuItem::close_window(app, None)?.text()?;
+  for item in menu.items()? {
+    let MenuItemKind::Submenu(submenu) = item else { continue };
+    for entry in submenu.items()? {
+      if let MenuItemKind::Predefined(predefined) = &entry
+        && predefined.text()? == close_window
+      {
+        submenu.remove(&entry)?;
+        let replacement = MenuItem::with_id(app, CLOSE_WINDOW_ID, &close_window, true, Some("CmdOrCtrl+Shift+W"))?;
+        submenu.append(&replacement)?;
+      }
+    }
+  }
+  Ok(menu)
+}
+
+// Asks first when the webview reported running turns or pending approvals.
+fn request_quit(app: &tauri::AppHandle) {
+  let warning = app.state::<QuitWarning>().0.lock().ok().and_then(|warning| warning.clone());
+  let Some(warning) = warning else {
+    quit(app);
+    return;
+  };
+  let handle = app.clone();
+  app
+    .dialog()
+    .message(warning)
+    .title("Quit Octopus?")
+    .kind(MessageDialogKind::Warning)
+    .buttons(MessageDialogButtons::OkCancelCustom("Quit".to_string(), "Cancel".to_string()))
+    .show(move |confirmed| {
+      if confirmed {
+        quit(&handle);
+      }
     });
 }
 
@@ -227,16 +332,16 @@ fn take_daemon_child(app: &tauri::AppHandle) -> Option<(CommandChild, u32)> {
 // Dropping the child closes the daemon's stdin, and it shuts down and stops everything it
 // started. `kill()` would SIGKILL it at once and orphan its children, so the app hides its
 // windows, waits off the UI thread for the daemon to exit, and kills it only when it hangs.
-fn quit(app: &tauri::AppHandle, api: tauri::ExitRequestApi) {
+fn quit(app: &tauri::AppHandle) {
   let daemon = app.state::<Daemon>();
-  // The second request is our own `app.exit` below.
+  // Two quit requests, say from two dialogs, stop the daemon once.
   if daemon.quitting.swap(true, Ordering::SeqCst) {
     return;
   }
   let Some((child, pid)) = take_daemon_child(app) else {
+    app.exit(0);
     return;
   };
-  api.prevent_exit();
   for window in app.webview_windows().values() {
     let _ = window.hide();
   }
@@ -277,6 +382,12 @@ mod tests {
     let status = status_after(&exited, "secret");
     assert_eq!(status, Some(DaemonStatus::Stopped));
     assert!(matches!(status.and_then(|status| status.connection()), Some(Err(_))));
+  }
+
+  #[test]
+  fn closing_the_window_hides_it_only_on_macos() {
+    let expected = if cfg!(target_os = "macos") { CloseAction::Hide } else { CloseAction::Quit };
+    assert_eq!(CLOSE_ACTION, expected);
   }
 
   #[test]

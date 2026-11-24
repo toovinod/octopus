@@ -4,6 +4,8 @@ import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@repo/ui/components/resizable";
 import { onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
+import { quitWarning } from "../lib/quitWarning.ts";
+import { setQuitWarning } from "../lib/desktop.ts";
 import { SidebarProvider } from "@repo/ui/components/sidebar";
 import { TooltipProvider } from "@repo/ui/components/tooltip";
 import { Toaster } from "@repo/ui/components/sonner";
@@ -49,6 +51,14 @@ const useShortcuts = () =>
 		};
 	}, []);
 
+// Keeps the shell's quit warning current, so quitting asks first while turns run or approvals wait.
+const useQuitWarning = () => {
+	const warning = useAppState((current) => quitWarning(Object.values(current.sessions)));
+	useEffect(() => {
+		void setQuitWarning(warning);
+	}, [warning]);
+};
+
 const useDaemonStopped = () => {
 	const [stopped, setStopped] = useState(false);
 	useEffect(() => onDaemonStopped(() => setStopped(true)), []);
@@ -84,6 +94,7 @@ export const App = () => {
 	const hasWorkspace = useAppState((current) => current.selectedWorkspaceId !== null);
 	const daemonStopped = useDaemonStopped();
 	useShortcuts();
+	useQuitWarning();
 	useEffect(() => {
 		void boot();
 	}, []);

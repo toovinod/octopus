@@ -1,7 +1,7 @@
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
-import { isTauri } from "@tauri-apps/api/core";
 
 // What the desktop shell adds over a browser. In a browser during development these fall back or do nothing.
 export const isDesktop = () => isTauri();
@@ -16,6 +16,11 @@ export const pickFolder = async (title: string) => {
 export const openExternal = async (url: string) => {
 	if (isDesktop()) await openUrl(url);
 	else window.open(url, "_blank", "noreferrer");
+};
+
+// The shell asks with this text before it quits. Must match the command in apps/desktop/src-tauri/src/lib.rs.
+export const setQuitWarning = async (warning: string | null) => {
+	if (isDesktop()) await invoke("set_quit_warning", { warning });
 };
 
 let permission: Promise<boolean> | null = null;
