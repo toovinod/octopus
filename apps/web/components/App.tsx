@@ -4,6 +4,7 @@ import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@repo/ui/components/resizable";
 import { onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
+import { isMac, shortcutKey } from "../lib/shortcutKey.ts";
 import { quitWarning } from "../lib/quitWarning.ts";
 import { setQuitWarning } from "../lib/desktop.ts";
 import { SidebarProvider } from "@repo/ui/components/sidebar";
@@ -25,9 +26,11 @@ import { useEffect, useState } from "react";
 
 const useShortcuts = () =>
 	useEffect(() => {
+		const mac = isMac();
 		const onKey = (event: KeyboardEvent) => {
-			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
-			const key = event.key.toLowerCase();
+			const dialogOpen = document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
+			const key = shortcutKey(event, mac, dialogOpen);
+			if (key === null) return;
 			const { selectedSessionId, panel } = getState();
 			const action =
 				key === "k"
