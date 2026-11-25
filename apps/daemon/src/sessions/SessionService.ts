@@ -1103,10 +1103,10 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			listCommands: (sessionId: string) =>
 				Effect.flatMap(getRow(sessionId), (row) => workspaceLock.starting(row.workspaceId, listCommands(sessionId))),
 			previewRevert,
-			// It rewrites the workspace's files, so it may not race an archive of it.
+			// It rewrites the workspace's files, so it may not race an archive of it, or a send from another chat.
 			revertToMessage: (sessionId: string, messageId: string) =>
 				Effect.flatMap(getRow(sessionId), (row) =>
-					workspaceLock.starting(row.workspaceId, revertToMessage(sessionId, messageId)),
+					workspaceLock.rewriting(row.workspaceId, revertToMessage(sessionId, messageId)),
 				),
 			respondToApproval,
 			// It can send the next message, so like sendMessage it may not race an archive.
