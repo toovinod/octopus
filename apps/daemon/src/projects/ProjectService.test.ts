@@ -56,12 +56,25 @@ describe("ProjectService", () => {
 		const project = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["branch", "develop"]);
 				yield* runGit(path, ["checkout", "-b", "feature"]);
 				yield* runGit(path, ["config", "init.defaultBranch", "develop"]);
 				return yield* Effect.flatMap(ProjectService, (projects) => projects.add(path));
 			}),
 		);
 		expect(project.defaultBranch).toBe("develop");
+	});
+
+	test("skips an init.defaultBranch that is not a branch in the repository", async () => {
+		const project = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["checkout", "-b", "feature"]);
+				yield* runGit(path, ["config", "init.defaultBranch", "develop"]);
+				return yield* Effect.flatMap(ProjectService, (projects) => projects.add(path));
+			}),
+		);
+		expect(project.defaultBranch).toBe("feature");
 	});
 
 	test("falls back to the checked-out branch last", async () => {
