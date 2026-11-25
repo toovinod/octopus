@@ -10,6 +10,8 @@ export class WorkspaceLock extends Context.Service<
 		// For the check that the workspace is active and the start that relies on it, not the work itself.
 		readonly starting: <A, E, R>(workspaceId: string, start: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 		readonly archiving: <A, E, R>(workspaceId: string, archive: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+		// Holds the lock alone while work rewrites the workspace's files, like a revert, so no agent starts meanwhile.
+		readonly rewriting: <A, E, R>(workspaceId: string, rewrite: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 		// Holds the lock alone like an archive, and keeps it, since the restored workspace takes work again.
 		readonly restoring: <A, E, R>(workspaceId: string, restore: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
 	}
@@ -26,6 +28,8 @@ export class WorkspaceLock extends Context.Service<
 					locks.set(workspaceId, fresh);
 					return fresh;
 				});
+			const alone = <A, E, R>(workspaceId: string, effect: Effect.Effect<A, E, R>) =>
+				Effect.flatMap(lockFor(workspaceId), (lock) => TxReentrantLock.withWriteLock(lock, effect));
 			return WorkspaceLock.of({
 				starting: (workspaceId, start) =>
 					Effect.flatMap(lockFor(workspaceId), (lock) => TxReentrantLock.withReadLock(lock, start)),
@@ -38,8 +42,8 @@ export class WorkspaceLock extends Context.Service<
 							Effect.tap(archive, () => Effect.sync(() => locks.delete(workspaceId))),
 						),
 					),
-				restoring: (workspaceId, restore) =>
-					Effect.flatMap(lockFor(workspaceId), (lock) => TxReentrantLock.withWriteLock(lock, restore)),
+				rewriting: alone,
+				restoring: alone,
 			});
 		}),
 	);

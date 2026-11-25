@@ -77,6 +77,7 @@ import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
 import { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import { CredentialStore } from "../agents/CredentialStore.ts";
+import { ProjectService } from "../projects/ProjectService.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { isForkCheckout } from "../workspaces/forkBranch.ts";
@@ -115,7 +116,8 @@ interface Runtime {
 	nextSequence: number;
 	// Turns sent and not yet completed, including queued ones.
 	outstanding: number;
-	readonly approvals: Set<string>;
+	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
+	readonly approvals: Map<string, Cancellation>;
 	// The status when no turn or approval is pending.
 	resting: RestingStatus;
 	status: AgentSessionStatus;
@@ -125,6 +127,31 @@ interface Published {
 	readonly event: SessionEvent;
 	readonly bytes: number;
 }
+
+type Cancellation = Extract<AgentEvent, { type: "approval.resolved" | "plan.resolved" | "question.resolved" }>;
+
+// How a request is closed when the process that asked it ends, so the chat stops offering to answer it.
+const cancellationOf = (event: AgentEvent): Cancellation | undefined => {
+	switch (event.type) {
+		case "approval.requested":
+			return { type: "approval.resolved", requestId: event.requestId, outcome: "cancelled" };
+		case "plan.proposed":
+			return { type: "plan.resolved", requestId: event.requestId, outcome: { type: "cancelled" } };
+		case "question.asked":
+			return { type: "question.resolved", requestId: event.requestId, outcome: { type: "cancelled" } };
+		default:
+			return undefined;
+	}
+};
+
+const requestEventTypes = [
+	"approval.requested",
+	"approval.resolved",
+	"plan.proposed",
+	"plan.resolved",
+	"question.asked",
+	"question.resolved",
+] as const;
 
 const isBusy = (status: AgentSessionStatus) => status === "running" || status === "awaitingApproval";
 
@@ -163,7 +190,7 @@ const fromAuthStatus = (auth: AgentAuthStatus): AgentAvailability => {
 const toUnavailable = (agent: AgentKind) => (error: AgentError) =>
 	new AgentUnavailableError({ agent, availability: toAvailability(error) });
 
-const decodeEvent = Schema.decodeUnknownEffect(AgentEvent);
+const decodeEventOption = Schema.decodeUnknownOption(AgentEvent);
 const decodeMediaType = Schema.decodeUnknownOption(ImageMediaType);
 
 export class SessionService extends Context.Service<SessionService>()("octopus/daemon/sessions/SessionService", {
@@ -171,6 +198,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const database = yield* LocalDatabase;
 		const credentials = yield* CredentialStore;
 		const workspaceLock = yield* WorkspaceLock;
+		const projects = yield* ProjectService;
 		const claude = yield* ClaudeAdapter;
 		const codex = yield* CodexAdapter;
 		const adapters: Record<AgentKind, AgentAdapter> = { claude, codex };
@@ -200,7 +228,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const forgetModels = (agent: AgentKind) => void modelCache.delete(agent);
 		// A finished sign-in changes the account, and with it the models the agent offers. Clients hear about it
 		// here instead of asking again.
-		const agentLogins = yield* PubSub.unbounded<AgentLoginResult>();
+		// Only recent results matter, so a client that stops reading cannot make the backlog grow.
+		const agentLogins = yield* PubSub.sliding<AgentLoginResult>(16);
 		const loginsOf = (agent: AgentKind, results: Stream.Stream<{ readonly success: boolean }>) =>
 			Stream.map(results, ({ success }): AgentLoginResult => ({ agent, success }));
 		yield* Stream.merge(loginsOf("claude", claude.loginResults), loginsOf("codex", codex.loginResults)).pipe(
@@ -279,17 +308,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				case "mode.changed":
 					yield* updateSession(sessionId, { mode: event.mode });
 					break;
-				case "approval.requested":
-					runtime.approvals.add(event.requestId);
-					break;
-				case "approval.resolved":
-					runtime.approvals.delete(event.requestId);
-					break;
 				// A plan or a question waits on the user like an approval does, so the chat shows it needs them.
+				case "approval.requested":
 				case "plan.proposed":
-				case "question.asked":
-					runtime.approvals.add(event.requestId);
+				case "question.asked": {
+					const cancellation = cancellationOf(event);
+					if (cancellation !== undefined) runtime.approvals.set(event.requestId, cancellation);
 					break;
+				}
+				case "approval.resolved":
 				case "plan.resolved":
 				case "question.resolved":
 					runtime.approvals.delete(event.requestId);
@@ -312,6 +339,12 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				);
 				runtime.ending = true;
 				yield* Scope.close(runtime.scope, Exit.void);
+				// Nothing can answer what the process left open, so history closes it instead of offering it forever.
+				for (const cancellation of [...runtime.approvals.values()]) yield* record(runtime, cancellation);
+				if (runtime.outstanding > 0) {
+					const turnId = yield* newId.pipe(Effect.provide(services));
+					yield* record(runtime, { type: "turn.completed", turnId, result: { status: "interrupted" } });
+				}
 				runtime.approvals.clear();
 				runtime.outstanding = 0;
 				if (Result.isSuccess(outcome)) {
@@ -479,45 +512,45 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				);
 			}
 			const scope = yield* Scope.make();
-			const handle = yield* adapters[row.agent]
-				.startSession({
-					cwd: target.path,
-					model: row.model,
-					effort: row.effort,
-					mode,
-					trustProjectSettings: target.trusted,
-					auth,
-					...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
-				})
-				.pipe(
-					Scope.provide(scope),
-					Effect.onError(() => Scope.close(scope, Exit.void)),
-					Effect.mapError(toUnavailable(row.agent)),
+			// Nothing else owns the process until the runtime is registered, so a failure before that stops it.
+			const runtime = yield* Effect.gen(function* () {
+				const handle = yield* adapters[row.agent]
+					.startSession({
+						cwd: target.path,
+						model: row.model,
+						effort: row.effort,
+						mode,
+						trustProjectSettings: target.trusted,
+						auth,
+						...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
+					})
+					.pipe(Scope.provide(scope), Effect.mapError(toUnavailable(row.agent)));
+				const [stored] = yield* database.query((db) =>
+					db
+						.select({ last: max(sessionEvent.sequence) })
+						.from(sessionEvent)
+						.where(eq(sessionEvent.sessionId, row.id)),
 				);
-			const [stored] = yield* database.query((db) =>
-				db
-					.select({ last: max(sessionEvent.sequence) })
-					.from(sessionEvent)
-					.where(eq(sessionEvent.sessionId, row.id)),
-			);
-			const runtime: Runtime = {
-				sessionId: row.id,
-				workspaceId: row.workspaceId,
-				agent: row.agent,
-				handle,
-				scope,
-				done: yield* Deferred.make<void>(),
-				ending: false,
-				idleSince: clock.currentTimeNanosUnsafe(),
-				nextSequence: (stored?.last ?? -1) + 1,
-				outstanding: 0,
-				approvals: new Set(),
-				resting: isBusy(row.status) ? "idle" : row.status,
-				status: row.status,
-			};
-			if (row.authMode !== auth.mode) {
-				yield* updateSession(row.id, { authMode: auth.mode });
-			}
+				const created: Runtime = {
+					sessionId: row.id,
+					workspaceId: row.workspaceId,
+					agent: row.agent,
+					handle,
+					scope,
+					done: yield* Deferred.make<void>(),
+					ending: false,
+					idleSince: clock.currentTimeNanosUnsafe(),
+					nextSequence: (stored?.last ?? -1) + 1,
+					outstanding: 0,
+					approvals: new Map(),
+					resting: isBusy(row.status) ? "idle" : row.status,
+					status: row.status,
+				};
+				if (row.authMode !== auth.mode) {
+					yield* updateSession(row.id, { authMode: auth.mode });
+				}
+				return created;
+			}).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
 			runtimes.set(row.id, runtime);
 			yield* consume(runtime).pipe(Effect.forkIn(consumers));
 			yield* Effect.logInfo("Started agent process").pipe(
@@ -551,18 +584,23 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			if (images.length === 0) return [];
 			const directory = attachmentsDir(sessionId);
 			yield* fs.makeDirectory(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+			const written: Array<string> = [];
 			return yield* Effect.forEach(images, ({ mediaType, base64 }) =>
 				Effect.gen(function* () {
 					const id = yield* newId;
 					const path = join(directory, id);
 					const bytes = yield* Effect.fromResult(Base64.decode(base64));
 					yield* fs.writeFile(path, bytes, { mode: PRIVATE_FILE_MODE });
+					written.push(path);
 					return { id, mediaType, base64, path } satisfies UserImage;
 				}),
+			).pipe(
+				// The message is never sent then, so nothing will ask for the images already written.
+				Effect.onError(() => Effect.forEach(written, (path) => Effect.ignore(fs.remove(path)), { discard: true })),
 			);
 		}, Effect.provide(services));
 
-		// Saved before the agent sees the message, so "Revert to here" can undo everything from it on.
+		// Saved just before the agent sees the message, so "Revert to here" can undo everything from it on.
 		// A failure only costs that checkpoint, so the message still goes.
 		const saveTurnCheckpoint = Effect.fnUntraced(
 			function* (sessionId: string, messageId: string) {
@@ -577,24 +615,29 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const sendMessage = Effect.fn("SessionService.sendMessage")(
 			function* (sessionId: string, text: string, images: ReadonlyArray<ImageData>, steer: boolean) {
 				if (images.length > 0) yield* checkImagesSupported(sessionId);
-				const runtime = yield* ensureRuntime(sessionId);
+				const current = yield* ensureRuntime(sessionId);
 				const message = {
 					id: yield* newId.pipe(Effect.provide(services)),
 					text,
 					images: yield* storeImages(sessionId, images),
 				};
-				yield* saveTurnCheckpoint(sessionId, message.id);
+				// The process may have ended while the message was prepared. Its runtime is gone then, and the
+				// message goes to a new one.
+				const runtime = current.ending ? yield* ensureRuntime(sessionId) : current;
 				// Counted before sending, so the turn's own completion can never arrive first.
 				runtime.outstanding++;
 				yield* refreshStatus(runtime);
-				const sent = yield* runtime.handle.sendMessage(message, { steer }).pipe(
+				// Taken when the message's turn starts, so a queued message's checkpoint holds the turns before it.
+				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
+				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>
 						Exit.isSuccess(exit)
 							? Effect.void
 							: Effect.gen(function* () {
-									runtime.outstanding--;
+									// The process may have ended meanwhile, which already cleared the count.
+									runtime.outstanding = Math.max(0, runtime.outstanding - 1);
 									yield* refreshStatus(runtime);
 									// The message was not stored, so nothing will ever ask for its images.
 									yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
@@ -707,13 +750,17 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.answerQuestion(requestId, answers);
 		});
 
+		// Returns the text of the queued messages it dropped, so the user can send them again.
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
 			const runtime = runtimes.get(sessionId);
 			if (runtime === undefined) {
 				yield* getRow(sessionId);
-				return;
+				return [];
 			}
-			yield* runtime.handle.interrupt;
+			const dropped = yield* runtime.handle.interrupt;
+			runtime.outstanding = Math.max(0, runtime.outstanding - dropped.length);
+			yield* refreshStatus(runtime);
+			return dropped.map(({ text }) => text);
 		});
 
 		const stop = Effect.fn("SessionService.stop")(
@@ -756,7 +803,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					.from(sessionEvent)
 					.where(and(eq(sessionEvent.sessionId, sessionId), eq(sessionEvent.type, "user.message"))),
 			);
-			const messages = yield* Effect.forEach(rows, (row) => Effect.orDie(decodeEvent(row.payload)));
+			const messages = rows.flatMap((row) => Option.toArray(decodeEventOption(row.payload)));
 			// Looking the id up in stored messages also keeps it from naming any other file.
 			const attachment = messages
 				.flatMap((event) => (event.type === "user.message" ? event.attachments : []))
@@ -843,33 +890,49 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}
 		});
 
-		const updateSettings = Effect.fn("SessionService.updateSettings")(function* (
-			sessionId: string,
-			settings: SessionSettings,
-		) {
-			const row = yield* getRow(sessionId);
-			yield* checkModeAllowed(row, settings.mode);
-			// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
-			const runtime = runtimes.get(sessionId);
-			if (runtime !== undefined) {
-				yield* runtime.handle.updateSettings(settings);
-			}
-			const session = yield* updateSession(sessionId, settings);
-			if (session === undefined) {
-				return yield* new SessionNotFoundError({ sessionId });
-			}
-			return session;
-		});
+		// Under the process lock, so a process starting meanwhile cannot miss the change.
+		const updateSettings = Effect.fn("SessionService.updateSettings")(
+			function* (sessionId: string, settings: SessionSettings) {
+				const row = yield* getRow(sessionId);
+				yield* checkModeAllowed(row, settings.mode);
+				// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
+				const runtime = runtimes.get(sessionId);
+				if (runtime !== undefined) {
+					yield* runtime.handle.updateSettings(settings);
+				}
+				const session = yield* updateSession(sessionId, settings);
+				if (session === undefined) {
+					return yield* new SessionNotFoundError({ sessionId });
+				}
+				return session;
+			},
+			(effect, sessionId) => withProcessLock(sessionId, effect),
+		);
 
+		// A row that no longer decodes, say after an event's shape changed, is skipped so the rest of the chat
+		// still loads.
 		const toSessionEvents = (rows: ReadonlyArray<typeof sessionEvent.$inferSelect>) =>
-			Effect.forEach(rows, (row) =>
-				// A row that no longer decodes means a corrupt database, not a user error.
-				Effect.map(
-					Effect.orDie(decodeEvent(row.payload)),
-					(event) =>
-						new SessionEvent({ sessionId: row.sessionId, sequence: row.sequence, event, createdAt: row.createdAt }),
-				),
-			);
+			Effect.gen(function* () {
+				const events: Array<SessionEvent> = [];
+				for (const row of rows) {
+					const event = decodeEventOption(row.payload);
+					if (Option.isNone(event)) {
+						yield* Effect.logWarning("Skipping a stored event that no longer decodes").pipe(
+							Effect.annotateLogs({ sessionId: row.sessionId, sequence: row.sequence }),
+						);
+						continue;
+					}
+					events.push(
+						new SessionEvent({
+							sessionId: row.sessionId,
+							sequence: row.sequence,
+							event: event.value,
+							createdAt: row.createdAt,
+						}),
+					);
+				}
+				return events;
+			});
 
 		// Up to limit stored events before beforeSequence, oldest first. null reads the latest ones, so a chat
 		// opens on its last page and subscribes after it.
@@ -975,6 +1038,26 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const watch = Stream.unwrap(
 			Effect.gen(function* () {
 				const subscription = yield* PubSub.subscribe(sessionChanges);
+				// Only each session's newest change waits for a client that reads slowly, so one that stops
+				// reading holds a session per chat, not every change since.
+				const latest = new Map<string, AgentSession>();
+				const changed = yield* Queue.sliding<void>(1);
+				yield* PubSub.take(subscription).pipe(
+					Effect.flatMap((session) => {
+						latest.delete(session.id);
+						latest.set(session.id, session);
+						return Queue.offer(changed, undefined);
+					}),
+					Effect.forever,
+					Effect.forkScoped,
+				);
+				const changes = Stream.fromQueue(changed).pipe(
+					Stream.flatMap(() => {
+						const batch = [...latest.values()];
+						latest.clear();
+						return Stream.fromIterable(batch);
+					}),
+				);
 				const rows = yield* database.query((db) =>
 					db
 						.select({ session: agentSession })
@@ -983,10 +1066,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						.where(eq(workspace.status, "active"))
 						.orderBy(asc(agentSession.createdAt)),
 				);
-				return Stream.concat(
-					Stream.fromIterable(rows.map((row) => toSession(row.session))),
-					Stream.fromSubscription(subscription),
-				);
+				return Stream.concat(Stream.fromIterable(rows.map((row) => toSession(row.session))), changes);
 			}),
 		);
 
@@ -1070,6 +1150,48 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const removeApiKey = (agent: AgentKind) =>
 			credentials.remove(agent).pipe(Effect.tap(() => Effect.sync(() => forgetModels(agent))));
 
+		// The requests a restart left open are cancelled and the turn it cut off ends, as when a process ends.
+		const closeCutOffHistory = Effect.fnUntraced(function* (sessionId: string) {
+			const rows = yield* database.query((db) =>
+				db
+					.select({ payload: sessionEvent.payload })
+					.from(sessionEvent)
+					.where(and(eq(sessionEvent.sessionId, sessionId), inArray(sessionEvent.type, [...requestEventTypes])))
+					.orderBy(asc(sessionEvent.sequence)),
+			);
+			const open = new Map<string, Cancellation>();
+			for (const row of rows) {
+				const event = decodeEventOption(row.payload);
+				if (Option.isNone(event) || !("requestId" in event.value)) continue;
+				const cancellation = cancellationOf(event.value);
+				if (cancellation === undefined) open.delete(event.value.requestId);
+				else open.set(event.value.requestId, cancellation);
+			}
+			const closing: Array<AgentEvent> = [
+				...open.values(),
+				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
+			];
+			const [stored] = yield* database.query((db) =>
+				db
+					.select({ last: max(sessionEvent.sequence) })
+					.from(sessionEvent)
+					.where(eq(sessionEvent.sessionId, sessionId)),
+			);
+			const first = (stored?.last ?? -1) + 1;
+			const createdAt = yield* nowIso;
+			const values = yield* Effect.forEach(closing, (event, index) =>
+				Effect.map(newId, (id) => ({
+					id,
+					sessionId,
+					sequence: first + index,
+					type: event.type,
+					payload: event,
+					createdAt,
+				})),
+			);
+			yield* database.query((db) => db.insert(sessionEvent).values(values));
+		}, Effect.provide(services));
+
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
 		const recoverSessions = Effect.gen(function* () {
 			const updatedAt = yield* nowIso;
@@ -1085,12 +1207,27 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					Effect.annotateLogs({ count: cutOff.length }),
 				);
 			}
+			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 		});
 		yield* recoverSessions;
 
 		// Stop the idle sweep first, then release every remaining runtime while consumers can still save events.
 		yield* Effect.addFinalizer(() => stopRuntimes(() => true));
 		yield* stopExpiredRuntimes.pipe(Effect.repeat(Schedule.spaced(IDLE_SWEEP_INTERVAL)), Effect.forkScoped);
+
+		// A running agent keeps the project settings and full access it started with, so losing trust stops it.
+		// The next message starts it again as untrusted.
+		const stopProject = Effect.fnUntraced(
+			function* (projectId: string) {
+				const rows = yield* database.query((db) =>
+					db.select({ id: workspace.id }).from(workspace).where(eq(workspace.projectId, projectId)),
+				);
+				const workspaceIds = new Set(rows.map(({ id }) => id));
+				yield* stopRuntimes((runtime) => workspaceIds.has(runtime.workspaceId));
+			},
+			Effect.catch((error) => Effect.logError("Could not stop the agents of a project that lost its trust", error)),
+		);
+		yield* projects.trustRevoked.pipe(Stream.runForEach(stopProject), Effect.forkScoped);
 
 		return {
 			listAgents,
@@ -1110,10 +1247,10 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			listCommands: (sessionId: string) =>
 				Effect.flatMap(getRow(sessionId), (row) => workspaceLock.starting(row.workspaceId, listCommands(sessionId))),
 			previewRevert,
-			// It rewrites the workspace's files, so it may not race an archive of it.
+			// It rewrites the workspace's files, so it may not race an archive of it, or a send from another chat.
 			revertToMessage: (sessionId: string, messageId: string) =>
 				Effect.flatMap(getRow(sessionId), (row) =>
-					workspaceLock.starting(row.workspaceId, revertToMessage(sessionId, messageId)),
+					workspaceLock.rewriting(row.workspaceId, revertToMessage(sessionId, messageId)),
 				),
 			respondToApproval,
 			// It can send the next message, so like sendMessage it may not race an archive.

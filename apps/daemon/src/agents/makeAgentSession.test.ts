@@ -1,6 +1,6 @@
 import { type AgentSession, makeAgentSession, TurnWatchdogSettings } from "./makeAgentSession.ts";
 import type { AgentEvent, QuestionOutcome, PlanOutcome } from "@repo/contracts/AgentEvent";
-import type { AgentSessionHandle } from "./AgentAdapter.ts";
+import { AgentProtocolError, type AgentSessionHandle } from "./AgentAdapter.ts";
 import { Duration, Effect, Option, Stream } from "effect";
 import { userMessage } from "../testing/userMessage.ts";
 import { describe, expect, test } from "bun:test";
@@ -25,7 +25,7 @@ const runQuietAgent = <A>(
 		const session = yield* makeAgentSession(capabilities);
 		const handle = yield* session.start({
 			startTurn: () => Effect.void,
-			steerTurn: () => Effect.void,
+			steerTurn: () => Effect.succeed(true),
 			interruptTurn: onInterrupt(session),
 			updateSettings: () => Effect.void,
 			listCommands: Effect.succeed([]),
@@ -64,14 +64,39 @@ describe("makeAgentSession turn watchdog", () => {
 		]);
 	});
 
-	test("ends the turn itself when the agent ignores the interrupt", async () => {
-		const results = await runQuietAgent(
+	test("ends the turn itself when the agent ignores the interrupt, then ends the session", async () => {
+		const events = await runQuietAgent(
 			() => Effect.void,
-			(handle) => handle.sendMessage(userMessage("hi")).pipe(Effect.andThen(turnResults(handle))),
+			// Collects until the session ends, so a late end of the stopped turn can never complete a later one.
+			(handle) => handle.sendMessage(userMessage("hi")).pipe(Effect.andThen(Stream.runCollect(handle.events))),
 		);
-		expect(results).toEqual([
-			{ type: "turn.completed", turnId: "notCompleted", result: { status: "failed", message: stalledMessage } },
-		]);
+		expect(events.at(-1)).toEqual({
+			type: "turn.completed",
+			turnId: expect.stringMatching(/^octopus-/),
+			result: { status: "failed", message: stalledMessage },
+		});
+	});
+
+	test("each turn that fails to start gets its own id, so one notice never replaces another", async () => {
+		const results = await Effect.gen(function* () {
+			const session = yield* makeAgentSession(capabilities);
+			const handle: AgentSessionHandle = yield* session.start({
+				startTurn: () => Effect.fail(new AgentProtocolError({ message: "rejected", cause: null })),
+				steerTurn: () => Effect.succeed(true),
+				interruptTurn: Effect.void,
+				updateSettings: () => Effect.void,
+				listCommands: Effect.succeed([]),
+			});
+			yield* handle.sendMessage(userMessage("one"));
+			yield* handle.sendMessage(userMessage("two"));
+			return yield* handle.events.pipe(
+				Stream.filter((event) => event.type === "turn.completed"),
+				Stream.take(2),
+				Stream.runCollect,
+			);
+		}).pipe(Effect.scoped, Effect.runPromise);
+		const ids = results.map((event) => (event.type === "turn.completed" ? event.turnId : ""));
+		expect(new Set(ids).size).toBe(2);
 	});
 
 	test("keeps a turn that is still sending events, or waiting on the user", async () => {
@@ -103,6 +128,76 @@ describe("makeAgentSession turn watchdog", () => {
 		);
 		expect(results).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } }]);
 	});
+
+	test("agent activity it does not show still keeps the turn alive", async () => {
+		const results = await runQuietAgent(
+			() => Effect.die("the watchdog should not interrupt"),
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					for (let index = 0; index < 4; index++) {
+						yield* Effect.sleep("100 millis");
+						yield* session.touch;
+					}
+					yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+					return yield* turnResults(handle);
+				}),
+		);
+		expect(results).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } }]);
+	});
+});
+
+test("a message sent after the session ended fails instead of being lost", async () => {
+	const error = await runQuietAgent(
+		() => Effect.void,
+		(handle, session) => session.end.pipe(Effect.andThen(Effect.flip(handle.sendMessage(userMessage("late"))))),
+	);
+	expect(error._tag).toBe("AgentProcessError");
+});
+
+test("runs a queued message's beforeTurn only once the turn ahead of it has ended", async () => {
+	const steps: Array<string> = [];
+	await Effect.gen(function* () {
+		const session = yield* makeAgentSession(capabilities);
+		const handle: AgentSessionHandle = yield* session.start({
+			startTurn: (message) => Effect.sync(() => void steps.push(`start ${message.text}`)),
+			steerTurn: () => Effect.succeed(true),
+			interruptTurn: Effect.void,
+			updateSettings: () => Effect.void,
+			listCommands: Effect.succeed([]),
+		});
+		const beforeTurn = (text: string) => Effect.sync(() => void steps.push(`before ${text}`));
+		yield* handle.sendMessage(userMessage("one"), { beforeTurn: beforeTurn("one") });
+		yield* handle.sendMessage(userMessage("two"), { beforeTurn: beforeTurn("two") });
+		yield* Effect.sleep("50 millis");
+		steps.push("end one");
+		yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+		yield* Effect.sleep("50 millis");
+	}).pipe(Effect.scoped, Effect.runPromise);
+	expect(steps).toEqual(["before one", "start one", "end one", "before two", "start two"]);
+});
+
+test("a stop drops the queued messages and hands them back", async () => {
+	const [dropped, started] = await Effect.gen(function* () {
+		const started: Array<string> = [];
+		const session = yield* makeAgentSession(capabilities);
+		const handle: AgentSessionHandle = yield* session.start({
+			startTurn: (message) => Effect.sync(() => void started.push(message.text)),
+			steerTurn: () => Effect.succeed(true),
+			interruptTurn: session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }),
+			updateSettings: () => Effect.void,
+			listCommands: Effect.succeed([]),
+		});
+		yield* handle.sendMessage(userMessage("one"));
+		yield* handle.sendMessage(userMessage("two"));
+		yield* handle.sendMessage(userMessage("three"));
+		yield* Effect.sleep("20 millis");
+		const dropped = yield* handle.interrupt;
+		yield* Effect.sleep("50 millis");
+		return [dropped.map(({ text }) => text), started] as const;
+	}).pipe(Effect.scoped, Effect.runPromise);
+	expect(dropped).toEqual(["two", "three"]);
+	expect(started).toEqual(["one"]);
 });
 
 describe("makeAgentSession plans", () => {

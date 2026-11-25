@@ -10,8 +10,16 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
+import type {
+	CanUseTool,
+	Options,
+	PermissionResult,
+	PermissionMode,
+	PermissionUpdate,
+	SDKUserMessage,
+	SpawnOptions,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
-	Config,
 	Context,
 	Deferred,
 	Effect,
@@ -28,15 +36,6 @@ import {
 	Scope,
 	Stream,
 } from "effect";
-import type {
-	CanUseTool,
-	Options,
-	PermissionResult,
-	PermissionMode,
-	PermissionUpdate,
-	SDKUserMessage,
-	SpawnOptions,
-} from "@anthropic-ai/claude-agent-sdk";
 import {
 	type AgentCapabilities,
 	type AgentMode,
@@ -135,45 +134,8 @@ const models: AgentModels = {
 	defaultModel: "claude-opus-5-5",
 };
 
-// The SDK replaces the whole child environment when `env` is set, so API key mode passes
-// these through explicitly. Subscription mode leaves `env` unset and inherits everything but API credentials.
-// Proxies and extra CA certificates keep claude working on corporate networks, and the config
-// folders keep it reading the user's own settings.
-const inheritedVariables = [
-	"PATH",
-	"HOME",
-	"USER",
-	"SHELL",
-	"TMPDIR",
-	"LANG",
-	"TERM",
-	"HTTPS_PROXY",
-	"HTTP_PROXY",
-	"NO_PROXY",
-	"https_proxy",
-	"http_proxy",
-	"no_proxy",
-	"NODE_EXTRA_CA_CERTS",
-	"CLAUDE_CONFIG_DIR",
-	"XDG_CONFIG_HOME",
-	"XDG_DATA_HOME",
-	"XDG_STATE_HOME",
-	"XDG_CACHE_HOME",
-	"XDG_RUNTIME_DIR",
-];
-
-const apiKeyEnvironment = Effect.fnUntraced(function* (apiKey: Redacted.Redacted<string>) {
-	const env: Record<string, string> = {};
-	for (const name of inheritedVariables) {
-		const value = yield* Config.option(Config.String(name));
-		if (Option.isSome(value)) env[name] = value.value;
-	}
-	env.ANTHROPIC_API_KEY = Redacted.value(apiKey);
-	return env;
-});
-
 // A key or token in the shell that started Octopus would make claude bill the API instead of the
-// subscription. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
+// subscription, or bill another key than the one stored for Octopus. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
 const apiCredentials = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
 const withoutApiCredentials = ({
 	ANTHROPIC_API_KEY: _key,
@@ -343,6 +305,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
 	const handle = Effect.fnUntraced(function* (message: ClaudeMessage) {
+		yield* session.touch;
 		// Subagent frames belong to the Task tool call that started them.
 		if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return;
 		switch (message.type) {
@@ -569,9 +532,12 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					Effect.onError(() => closeScope),
 				);
 				const stoppedEarly = exited.pipe(
+					// Built once claude has stopped, so the error carries what it printed.
 					Effect.andThen(
-						Effect.fail(
-							new AgentProcessError({ message: "claude stopped before it showed a sign-in link.", cause: printed }),
+						Effect.suspend(() =>
+							Effect.fail(
+								new AgentProcessError({ message: "claude stopped before it showed a sign-in link.", cause: printed }),
+							),
 						),
 					),
 				);
@@ -587,15 +553,19 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				// claude must keep running after this call, or the browser sign-in has nothing to return to.
 				yield* Ref.set(loginTerminal, Option.some(terminal)).pipe(
 					Effect.andThen(exited),
+					// A sign-in the user never finishes also ends, so watchers are not left waiting.
+					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.flatMap((code) =>
 						Effect.gen(function* () {
-							if (code !== 0) {
-								yield* Effect.logWarning("Claude sign-in failed").pipe(Effect.annotateLogs({ code }));
+							const success = Option.isSome(code) && code.value === 0;
+							if (!success) {
+								yield* Effect.logWarning("Claude sign-in failed").pipe(
+									Effect.annotateLogs({ code: Option.getOrNull(code) }),
+								);
 							}
-							yield* PubSub.publish(loginResults, { success: code === 0 });
+							yield* PubSub.publish(loginResults, { success });
 						}),
 					),
-					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.ensuring(
 						Ref.update(loginTerminal, (current) =>
 							Option.isSome(current) && current.value === terminal ? Option.none() : current,
@@ -733,21 +703,17 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
-						const child = spawnInProcessGroup(
-							input.auth.mode === "subscription"
-								? { ...spawnOptions, env: withoutApiCredentials(spawnOptions.env) }
-								: spawnOptions,
-						);
+						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
+						const env = withoutApiCredentials(spawnOptions.env);
+						const child = spawnInProcessGroup({
+							...spawnOptions,
+							env:
+								input.auth.mode === "apiKey" ? { ...env, ANTHROPIC_API_KEY: Redacted.value(input.auth.apiKey) } : env,
+						});
 						claudePid = child.pid;
 						if (child.pid !== undefined) Effect.runForkWith(context)(registry.add(child.pid));
 						return child;
 					},
-					...(input.auth.mode === "apiKey"
-						? {
-								// An optional plain string cannot fail to decode, so a ConfigError here is a defect.
-								env: yield* Effect.orDie(apiKeyEnvironment(input.auth.apiKey)),
-							}
-						: {}),
 				};
 
 				const run = yield* Effect.acquireRelease(
@@ -789,6 +755,19 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					Effect.forkScoped,
 				);
 
+				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
+				const modelAndEffort = yield* Ref.make({ model: input.model, effort: input.effort });
+				const settingsError = (cause: unknown) =>
+					new AgentProcessError({ message: "Could not change the chat's settings.", cause });
+				const setModelAndEffort = ({ model, effort }: { readonly model: string; readonly effort: string | null }) =>
+					Effect.tryPromise({
+						try: async () => {
+							await run.setModel(model);
+							await run.setEffort(Option.getOrNull(decodeEffort(effort)));
+						},
+						catch: settingsError,
+					});
+
 				const sendMessage = ({ text, images }: UserMessage) =>
 					Effect.asVoid(
 						Queue.offer(prompts, {
@@ -813,15 +792,25 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.
 					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
-					steerTurn: sendMessage,
-					updateSettings: ({ model, effort, mode }) =>
-						Effect.tryPromise({
-							try: async () => {
-								await run.setModel(model);
-								await run.setEffort(Option.getOrNull(decodeEffort(effort)));
-								await run.setPermissionMode(permissionModes[mode]);
-							},
-							catch: (cause) => new AgentProcessError({ message: "Could not change the chat's settings.", cause }),
+					steerTurn: (message) => Effect.as(sendMessage(message), true),
+					updateSettings: (next) =>
+						Effect.gen(function* () {
+							const previous = yield* Ref.get(modelAndEffort);
+							yield* setModelAndEffort(next).pipe(
+								Effect.andThen(
+									Effect.tryPromise({
+										try: () => run.setPermissionMode(permissionModes[next.mode]),
+										catch: settingsError,
+									}),
+								),
+								// The caller keeps the stored settings when this fails, so claude goes back to them too.
+								Effect.tapError(() =>
+									setModelAndEffort(previous).pipe(
+										Effect.catch((error) => Effect.logWarning("Could not restore the chat's settings", error)),
+									),
+								),
+							);
+							yield* Ref.set(modelAndEffort, { model: next.model, effort: next.effort });
 						}),
 					listCommands: Effect.tryPromise({
 						try: () => run.supportedCommands(),

@@ -129,16 +129,18 @@ export interface AgentSessionHandle {
 	readonly nativeSessionId: Effect.Effect<string, AgentError>;
 	readonly events: Stream.Stream<AgentEvent, AgentError>;
 	// Says whether the text went into the running turn or waits for its own turn.
+	// beforeTurn runs just before the agent gets the message, once any turn ahead of it has ended.
 	sendMessage(
 		message: UserMessage,
-		options?: { readonly steer?: boolean },
+		options?: { readonly steer?: boolean; readonly beforeTurn?: Effect.Effect<void> },
 	): Effect.Effect<"steered" | "queued", SendMessageError>;
 	respondToApproval(requestId: string, decision: ApprovalDecision): Effect.Effect<void, ApprovalError>;
 	// Returns the message the caller must send next, for an agent that waits for one after its plan.
 	respondToPlan(requestId: string, answer: PlanAnswer): Effect.Effect<Option.Option<string>, PlanError>;
 	answerQuestion(requestId: string, answers: QuestionAnswers): Effect.Effect<void, AgentError | QuestionNotFoundError>;
-	// Cancels pending approvals, plans and questions first, then stops the running turn.
-	readonly interrupt: Effect.Effect<void, AgentError>;
+	// Drops queued messages and cancels pending approvals, plans and questions first, then stops the running turn.
+	// Returns the dropped messages, oldest first.
+	readonly interrupt: Effect.Effect<ReadonlyArray<UserMessage>, AgentError>;
 	// Applies from the next turn.
 	updateSettings(settings: SessionSettings): Effect.Effect<void, AgentError>;
 	readonly listCommands: Effect.Effect<ReadonlyArray<AgentCommand>, AgentError>;

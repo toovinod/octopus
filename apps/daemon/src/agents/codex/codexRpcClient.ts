@@ -1,4 +1,4 @@
-import { type Cause, Context, Deferred, Duration, Effect, Queue, Schema, Stream } from "effect";
+import { type Cause, Context, Deferred, Duration, Effect, Queue, Result, Schema, Stream } from "effect";
 import { type AgentError, AgentProcessError, AgentProtocolError } from "../AgentAdapter.ts";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
 import { toAgentError } from "../toAgentError.ts";
@@ -18,8 +18,9 @@ const IncomingMessage = Schema.Union([
 		method: Schema.String,
 		params: Schema.optionalKey(Schema.Unknown),
 	}),
+	// A reply to a request Codex could not even parse has a null id.
 	Schema.Struct({
-		id: RequestId,
+		id: Schema.NullOr(RequestId),
 		error: Schema.Struct({ code: Schema.Number, message: Schema.String }),
 	}),
 	Schema.Struct({ id: RequestId, result: Schema.Unknown }),
@@ -49,6 +50,7 @@ export interface CodexRpcClient {
 }
 
 export const METHOD_NOT_FOUND = -32601;
+export const INVALID_PARAMS = -32602;
 
 export const CodexRequestSettings = Context.Reference<{
 	// How long Codex may take to answer a request. Every app-server request is answered at once, turns
@@ -72,6 +74,8 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	const incoming = yield* Queue.bounded<CodexIncoming, AgentError | Cause.Done>(INCOMING_BUFFER);
 	const pending = new Map<RequestId, Deferred.Deferred<unknown, AgentError>>();
 	let nextId = 0;
+	// Set once the app-server exits, so later calls fail at once instead of waiting out their deadline.
+	let ended: AgentError | undefined;
 
 	const send = (message: object) => Effect.asVoid(Queue.offer(outgoing, `${JSON.stringify(message)}\n`));
 
@@ -83,15 +87,12 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	const handleLine = (line: string) =>
 		Effect.gen(function* () {
 			if (line.trim() === "") return;
-			const message = yield* decodeLine(line).pipe(
-				Effect.mapError(
-					(cause) =>
-						new AgentProtocolError({
-							message: "Codex sent a line Octopus could not read.",
-							cause,
-						}),
-				),
-			);
+			// One line Octopus cannot read, like stray output from a newer Codex, must not end the session.
+			const decoded = yield* Effect.result(decodeLine(line));
+			if (Result.isFailure(decoded)) {
+				return yield* Effect.logWarning("Skipping a line from Codex that Octopus could not read", decoded.failure);
+			}
+			const message = decoded.success;
 			if ("method" in message) {
 				yield* Queue.offer(
 					incoming,
@@ -109,6 +110,11 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 							},
 				);
 				return;
+			}
+			if (message.id === null) {
+				return yield* Effect.logWarning("Codex reported an error for no request").pipe(
+					Effect.annotateLogs({ error: "error" in message ? message.error.message : "" }),
+				);
 			}
 			const deferred = pending.get(message.id);
 			if (deferred === undefined) {
@@ -153,6 +159,7 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		Effect.andThen(Effect.fail(exited)),
 		Effect.catch((error: AgentError) =>
 			Effect.gen(function* () {
+				ended = error;
 				for (const deferred of pending.values()) {
 					yield* Deferred.fail(deferred, error);
 				}
@@ -167,6 +174,7 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		incoming: Stream.fromQueue(incoming),
 		request: (method, params) =>
 			Effect.gen(function* () {
+				if (ended !== undefined) return yield* Effect.fail(ended);
 				const { timeout } = yield* CodexRequestSettings;
 				const id = nextId++;
 				const deferred = yield* Deferred.make<unknown, AgentError>();

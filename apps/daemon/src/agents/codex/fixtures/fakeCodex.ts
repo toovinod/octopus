@@ -175,6 +175,42 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("garbled")) {
+		// What a newer or misbehaving Codex might send: a stray line, a notification and a request whose shapes
+		// changed, and the null-id reply JSON-RPC gives to a line it could not parse.
+		out.write("not json\n");
+		notify("item/completed", { threadId, turnId, item: { id: "x" } });
+		const answer = await ask(400, "item/commandExecution/requestApproval", { threadId, turnId });
+		send({ id: null, error: { code: -32700, message: "Parse error" } });
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: `error ${answer.error?.code}` },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
+	if (text.includes("big diff")) {
+		// A rewritten lockfile: diffs far bigger than a chat should hold.
+		const change = (path: string) => ({ path, kind: { type: "update", move_path: null }, diff: "+".repeat(150_000) });
+		const item = {
+			type: "fileChange",
+			id: "patch-1",
+			changes: ["a.lock", "b.lock", "c.lock", "d.lock", "e.lock"].map(change),
+			status: "completed",
+		};
+		notify("item/completed", { item, threadId, turnId });
+		return completeTurn("completed");
+	}
+	if (text.includes("long command")) {
+		// Octopus shows only the finished output, but each streamed chunk proves the command is alive.
+		notify("item/started", { item: command, threadId, turnId });
+		for (let index = 0; index < 4; index++) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			notify("item/commandExecution/outputDelta", { threadId, turnId, itemId: "cmd-1", delta: "." });
+		}
+		notify("item/completed", { item: { ...command, status: "completed", aggregatedOutput: "...." }, threadId, turnId });
+		return completeTurn("completed");
+	}
 	if (text.includes("approve")) {
 		notify("item/started", { item: command, threadId, turnId });
 		const answer = await ask(100, "item/commandExecution/requestApproval", {
@@ -288,6 +324,10 @@ const serve = async () => {
 					id: message.id,
 					result: { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.example/login" },
 				});
+				if (Bun.argv[1]?.endsWith("abandonedLoginCodex.ts")) {
+					setTimeout(() => process.exit(0), 50);
+					break;
+				}
 				setTimeout(
 					() =>
 						notify(
@@ -332,7 +372,7 @@ const serve = async () => {
 										isDefault: false,
 									},
 								],
-								nextCursor: null,
+								nextCursor: Bun.argv[1]?.endsWith("loopingModelsCodex.ts") ? "page-2" : null,
 							}
 						: {
 								data: [
@@ -363,6 +403,11 @@ const serve = async () => {
 					send({ id: message.id, result: { thread: { id: threadId } } });
 					break;
 				}
+				// Like a thread whose rollout files were deleted.
+				if (message.params.threadId === "thread-gone") {
+					send({ id: message.id, error: { code: -32600, message: "no rollout found for thread id thread-gone" } });
+					break;
+				}
 				send({
 					id: message.id,
 					result: { thread: { id: message.params.threadId } },
@@ -375,6 +420,8 @@ const serve = async () => {
 				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
 				// Never answered, like a hung app-server.
 				if (text.includes("hang")) break;
+				// Like an app-server that crashes.
+				if (text.includes("quit now")) process.exit(1);
 				if (text.includes("early")) {
 					// The turn can finish before Codex answers turn/start.
 					completeTurn("completed");

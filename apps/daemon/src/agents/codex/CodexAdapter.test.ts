@@ -2,6 +2,7 @@ import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
 import { Duration, Effect, Fiber, Option, Stream } from "effect";
+import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
@@ -45,6 +46,12 @@ const takeUntil = (handle: AgentSessionHandle, type: AgentEvent["type"]) =>
 		Stream.runCollect,
 	);
 
+// Codex numbers its requests from 0 in every app-server, so Octopus prefixes them with the process.
+const requestIdOf = (events: ReadonlyArray<AgentEvent>) => {
+	const event = events.at(-1);
+	return event !== undefined && "requestId" in event ? event.requestId : "";
+};
+
 describe("CodexAdapter", () => {
 	test("reports the login from account/read", async () => {
 		const status = await runWithCodex(checkAuth);
@@ -59,6 +66,7 @@ describe("CodexAdapter", () => {
 	test.each([
 		["fakeCodex.ts", { success: true, error: null }],
 		["failedLoginCodex.ts", { success: false, error: "The sign-in was cancelled." }],
+		["abandonedLoginCodex.ts", { success: false, error: "The sign-in did not finish." }],
 	])("reports how the ChatGPT sign-in through %s ended", async (fixture, expected) => {
 		const result = await runWithCodex(
 			Effect.gen(function* () {
@@ -141,18 +149,111 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test("a command that keeps streaming output outlives the idle timeout", async () => {
+		const events = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("long command"));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(TurnWatchdogSettings, {
+					idleTimeout: Duration.millis(250),
+					interruptGrace: Duration.millis(100),
+				}),
+			),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+	});
+
+	test("skips messages it cannot read, answers such a request with an error, and keeps the session", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("garbled"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.filter((event) => event.type === "error")).toHaveLength(2);
+		expect(events.find((event) => event.type === "message.completed")).toMatchObject({ text: "error -32602" });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	test("stops paging models when Codex repeats a cursor", async () => {
+		const { models } = await runWithCodex(
+			Effect.flatMap(CodexAdapter, (codex) => codex.listModels),
+			`${import.meta.dir}/fixtures/loopingModelsCodex.ts`,
+		);
+		expect(models.map((model) => model.id)).toEqual(["gpt-first", "gpt-later"]);
+	});
+
+	test("a call after the app-server exited fails at once instead of waiting for its deadline", async () => {
+		const error = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("quit now"));
+				yield* Effect.ignore(Stream.runDrain(handle.events));
+				return yield* Effect.flip(handle.listCommands);
+			}).pipe(Effect.timeout("2 seconds")),
+		);
+		expect(error).toMatchObject({ _tag: "AgentProcessError", message: "Codex app-server exited." });
+	});
+
+	test("runs a skill named with punctuation after it", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("show the images, then run $tester."));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "message.completed")).toMatchObject({
+			text: JSON.stringify([{ type: "skill", name: "tester", path: "/skills/tester/SKILL.md" }]),
+		});
+	});
+
+	test("a resume of a thread Codex no longer has goes on in a new thread with a notice", async () => {
+		const [id, events] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					const id = yield* handle.nativeSessionId;
+					return [id, yield* takeUntil(handle, "turn.completed")] as const;
+				}),
+			{ ...newSession, resumeId: "thread-gone" },
+		);
+		expect(id).toBe("thread-new");
+		expect(events).toContainEqual({ type: "session.started", nativeSessionId: "thread-new" });
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	test("cuts huge diffs, each and per event, with a marker", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("big diff"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		const tool = events.find((event) => event.type === "tool.completed");
+		const diffs =
+			tool?.type === "tool.completed" && tool.tool.kind === "fileChange"
+				? tool.tool.changes.map((change) => change.diff)
+				: [];
+		expect(diffs.map((diff) => diff.replace(/^\++/, "").length > 0)).toEqual([true, true, true, true, true]);
+		expect(diffs.reduce((total, diff) => total + diff.length, 0)).toBeLessThan(201_000);
+		expect(diffs[0]).toEndWith("(diff cut, 100000 more characters)");
+	});
+
 	test("round-trips a command approval", async () => {
 		const [requested, rest] = await runSession((handle) =>
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("approve this"));
 				const before = yield* takeUntil(handle, "approval.requested");
-				yield* handle.respondToApproval("100", "allowOnce");
+				yield* handle.respondToApproval(requestIdOf(before), "allowOnce");
 				return [before.at(-1), yield* takeUntil(handle, "turn.completed")];
 			}),
 		);
 		expect(requested).toEqual({
 			type: "approval.requested",
-			requestId: "100",
+			requestId: expect.stringMatching(/:100$/),
 			itemId: "cmd-1",
 			kind: "command",
 			summary: "bun test",
@@ -160,7 +261,7 @@ describe("CodexAdapter", () => {
 			choices: ["allowOnce", "allowForSession", "deny"],
 		});
 		expect(rest).toEqual([
-			{ type: "approval.resolved", requestId: "100", outcome: "allowOnce" },
+			{ type: "approval.resolved", requestId: expect.stringMatching(/:100$/), outcome: "allowOnce" },
 			{
 				type: "tool.completed",
 				itemId: "cmd-1",
@@ -176,6 +277,21 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test("a resumed chat's approvals never reuse the ids of an earlier app-server", async () => {
+		const askOnce = (input: StartSessionInput) =>
+			runSession(
+				(handle) =>
+					Effect.gen(function* () {
+						yield* handle.sendMessage(userMessage("approve this"));
+						return requestIdOf(yield* takeUntil(handle, "approval.requested"));
+					}),
+				input,
+			);
+		const first = await askOnce(newSession);
+		const second = await askOnce({ ...newSession, resumeId: "thread-new" });
+		expect(second).not.toBe(first);
+	});
+
 	test("interrupt cancels a pending approval, then interrupts the turn", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
@@ -186,7 +302,7 @@ describe("CodexAdapter", () => {
 			}),
 		);
 		expect(events).toEqual([
-			{ type: "approval.resolved", requestId: "100", outcome: "cancelled" },
+			{ type: "approval.resolved", requestId: expect.stringMatching(/:100$/), outcome: "cancelled" },
 			{
 				type: "turn.completed",
 				turnId: "turn-1",
@@ -205,6 +321,20 @@ describe("CodexAdapter", () => {
 			}),
 		);
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } });
+	});
+
+	test("a steer sent before Codex names the turn waits for its own turn", async () => {
+		const [sent, events] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				const sent = yield* handle.sendMessage(userMessage("hi"), { steer: true });
+				yield* takeUntil(handle, "turn.completed");
+				return [sent, yield* takeUntil(handle, "turn.completed")] as const;
+			}),
+		);
+		expect(sent).toBe("queued");
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
 	});
 
 	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {
@@ -234,7 +364,7 @@ describe("CodexAdapter", () => {
 		);
 		expect(first).toEqual({
 			type: "turn.completed",
-			turnId: "notStarted",
+			turnId: expect.stringMatching(/^octopus-/),
 			result: {
 				status: "failed",
 				message: "Codex did not answer turn/start in time. Try again, and stop the chat if it keeps happening.",
@@ -295,13 +425,13 @@ describe("CodexAdapter", () => {
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("ask me"));
 				const asked = yield* takeUntil(handle, "question.asked");
-				yield* handle.answerQuestion("300", { db: ["Postgres"], token: ["s3cret"] });
+				yield* handle.answerQuestion(requestIdOf(asked), { db: ["Postgres"], token: ["s3cret"] });
 				return [...asked, ...(yield* takeUntil(handle, "turn.completed"))];
 			}),
 		);
 		expect(events.find((event) => event.type === "question.asked")).toEqual({
 			type: "question.asked",
-			requestId: "300",
+			requestId: expect.stringMatching(/:300$/),
 			itemId: "input-1",
 			questions: [
 				{
@@ -326,7 +456,7 @@ describe("CodexAdapter", () => {
 		});
 		expect(events.find((event) => event.type === "question.resolved")).toEqual({
 			type: "question.resolved",
-			requestId: "300",
+			requestId: expect.stringMatching(/:300$/),
 			outcome: { type: "answered", answers: { db: ["Postgres"] } },
 		});
 		expect(events.find((event) => event.type === "message.completed")).toMatchObject({

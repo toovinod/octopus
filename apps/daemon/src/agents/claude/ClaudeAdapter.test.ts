@@ -6,9 +6,10 @@ import type {
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
-import { ConfigProvider, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
+import { Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
@@ -196,6 +197,19 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
 						continue;
 					}
+					if (text.includes("subagent")) {
+						// A Task subagent works on its own: only its frames arrive, each marked with the Task's tool use.
+						for (let index = 0; index < 4; index++) {
+							await new Promise((resolve) => setTimeout(resolve, 100));
+							yield {
+								type: "assistant",
+								parent_tool_use_id: "toolu_task",
+								message: { id: `msg_sub${index}`, content: [{ type: "text", text: "Searching" }] },
+							};
+						}
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("ask me")) {
 						const input = {
 							questions: [
@@ -320,7 +334,11 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 				interrupt: async () => resolveInterrupt(),
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
-				setPermissionMode: async (permissionMode) => void settingsChanges.push({ permissionMode }),
+				setPermissionMode: async (permissionMode) => {
+					// Like a claude that refuses to bypass permissions.
+					if (permissionMode === "bypassPermissions") throw new Error("refused");
+					settingsChanges.push({ permissionMode });
+				},
 				supportedCommands: async () => [
 					{ name: "review", description: "Review the branch", argumentHint: "" },
 					{ name: "fix-issue", description: "Fix a GitHub issue", argumentHint: "<number>" },
@@ -354,14 +372,13 @@ const runSession = <A, E>(
 	options: {
 		input?: StartSessionInput;
 		permissions?: Array<PermissionResult>;
-		configProvider?: ConfigProvider.ConfigProvider;
 	} = {},
 ) =>
 	runWithClaude(
 		Effect.gen(function* () {
 			const claude = yield* ClaudeAdapter;
 			return yield* program(yield* claude.startSession(options.input ?? newSession));
-		}).pipe(Effect.scoped, Effect.provide(ConfigProvider.layer(options.configProvider ?? ConfigProvider.fromEnv()))),
+		}).pipe(Effect.scoped),
 		options.permissions,
 	);
 
@@ -440,6 +457,15 @@ describe("ClaudeAdapter", () => {
 			expect(results).toEqual([{ success }]);
 		});
 
+		test("a claude that stops before showing a link reports what it printed", async () => {
+			const error = await runWithClaude(
+				Effect.flatMap(ClaudeAdapter, (claude) => Effect.flip(claude.startLogin)),
+				[],
+				`${import.meta.dir}/fixtures/brokenLoginClaude.ts`,
+			);
+			expect(error).toMatchObject({ _tag: "AgentProcessError", cause: expect.stringContaining("Raw mode") });
+		});
+
 		test("a code with no sign-in waiting for it is refused", async () => {
 			const error = await login((claude) => Effect.flip(claude.submitLoginCode("good-code")));
 			expect(error._tag).toBe("LoginNotPendingError");
@@ -466,6 +492,24 @@ describe("ClaudeAdapter", () => {
 				result: { status: "completed" },
 			},
 		]);
+	});
+
+	test("a subagent that works longer than the idle timeout keeps its turn alive", async () => {
+		const events = await runWithClaude(
+			Effect.gen(function* () {
+				const claude = yield* ClaudeAdapter;
+				const handle = yield* claude.startSession(newSession);
+				yield* handle.sendMessage(userMessage("subagent"));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(TurnWatchdogSettings, {
+					idleTimeout: Duration.millis(250),
+					interruptGrace: Duration.millis(100),
+				}),
+			),
+		);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
 	test("streams summarized thinking and stores it under the block's own item id", async () => {
@@ -735,23 +779,33 @@ describe("ClaudeAdapter", () => {
 		expect(permissions).toMatchObject([{ behavior: "deny" }]);
 	});
 
-	test("API key mode passes proxy, certificate and config folder variables to claude", async () => {
-		const env = {
-			PATH: "/bin",
-			HTTPS_PROXY: "http://proxy:8080",
-			HTTP_PROXY: "http://proxy:8080",
-			NO_PROXY: "localhost",
-			NODE_EXTRA_CA_CERTS: "/certs/corp.pem",
-			CLAUDE_CONFIG_DIR: "/home/dev/.claude-work",
-			XDG_CONFIG_HOME: "/home/dev/.config",
-			UNRELATED_SECRET: "keep out",
-		};
-		await runSession(() => Effect.void, {
-			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
-			configProvider: ConfigProvider.fromEnv({ env }),
-		});
-		const { UNRELATED_SECRET: _, ...passed } = env;
-		expect(startedWith.at(-1)?.env).toEqual({ ...passed, ANTHROPIC_API_KEY: "sk-test" });
+	test("API key mode hands claude the whole environment with its own key in place of any other", async () => {
+		const printed = await runSession(
+			() =>
+				Effect.promise(async () => {
+					const spawnClaude = startedWith.at(-1)?.spawnClaudeCodeProcess;
+					if (spawnClaude === undefined) return "no spawn hook";
+					const child = spawnClaude({
+						command: "sh",
+						args: ["-c", 'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$SSH_AUTH_SOCK"'],
+						cwd: "/",
+						env: {
+							PATH: "/bin:/usr/bin",
+							ANTHROPIC_API_KEY: "sk-shell",
+							ANTHROPIC_AUTH_TOKEN: "tok",
+							SSH_AUTH_SOCK: "/tmp/agent",
+						},
+						signal: new AbortController().signal,
+					});
+					let text = "";
+					for await (const chunk of child.stdout) text += String(chunk);
+					return text;
+				}),
+			{ input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } } },
+		);
+		expect(printed).toBe("sk-test||/tmp/agent");
+		// Left unset, the SDK passes claude the daemon's whole environment.
+		expect(startedWith.at(-1)?.env).toBeUndefined();
 	});
 
 	test.each(["bad key", "revoked"])("a refused credential (%s) ends the session with an auth error", async (text) => {
@@ -848,6 +902,19 @@ describe("sessionAllowRules", () => {
 			{ model: "claude-haiku-5-5" },
 			{ effort: "low" },
 			{ permissionMode: "plan" },
+		]);
+	});
+
+	test("a settings change claude refuses part of leaves it on the settings it had", async () => {
+		const error = await runSession((handle) =>
+			Effect.flip(handle.updateSettings({ model: "claude-haiku-5-5", effort: "low", mode: "fullAccess" })),
+		);
+		expect(error._tag).toBe("AgentProcessError");
+		expect(settingsChanges.slice(-4)).toEqual([
+			{ model: "claude-haiku-5-5" },
+			{ effort: "low" },
+			{ model: newSession.model },
+			{ effort: null },
 		]);
 	});
 

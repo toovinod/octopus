@@ -174,9 +174,11 @@ export class SessionRpcs extends RpcGroup.make(
 		payload: { sessionId: Schema.String, requestId: Schema.String, answers: QuestionAnswers },
 		error: Schema.Union([SessionNotFoundError, QuestionNotFoundError, DaemonInternalError]),
 	}),
-	// Stops the running turn and keeps the agent process.
+	// Stops the running turn and keeps the agent process. Queued messages are dropped, and their text comes back,
+	// oldest first, for the composer to restore.
 	Rpc.make("interruptSession", {
 		payload: { sessionId: Schema.String },
+		success: Schema.Array(Schema.String),
 		error: Schema.Union([SessionNotFoundError, DaemonInternalError]),
 	}),
 	// Ends the agent process. The next message resumes through the native session id.

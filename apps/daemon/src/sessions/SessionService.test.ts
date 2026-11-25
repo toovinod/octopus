@@ -559,6 +559,57 @@ describe("SessionService", () => {
 		]);
 	});
 
+	test("a watcher that reads slowly gets only each session's newest change", async () => {
+		const titles = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const watched = yield* sessions.watch.pipe(
+					// Busy with the snapshot while the changes pile up.
+					Stream.tap(() => Effect.sleep("200 millis")),
+					Stream.takeUntil((changed) => changed.title === "Title 49"),
+					Stream.runCollect,
+					Effect.timeout("5 seconds"),
+					Effect.forkChild,
+				);
+				yield* Effect.sleep("50 millis");
+				for (let index = 0; index < 50; index++) yield* sessions.rename(session.id, `Title ${index}`);
+				return (yield* Fiber.join(watched)).map((changed) => changed.title);
+			}),
+		);
+		expect(titles.at(-1)).toBe("Title 49");
+		expect(titles.length).toBeLessThan(5);
+	});
+
+	test("a stored event that no longer decodes is skipped and the rest of the chat loads", async () => {
+		const loaded = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				const payloads: Array<unknown> = [
+					{ type: "user.message", itemId: "m1", text: "hi", attachments: [] },
+					{ type: "message.completed", itemId: "a1" },
+					{ type: "message.completed", itemId: "a2", text: "ok" },
+				];
+				yield* database.query((db) =>
+					db.insert(sessionEvent).values(
+						payloads.map((payload, sequence) => ({
+							id: `event-${sequence}`,
+							sessionId: session.id,
+							sequence,
+							type: "message.completed",
+							payload,
+							createdAt: "2026-01-01T00:00:00.000Z",
+						})),
+					),
+				);
+				return (yield* sessions.history(session.id, null, 10)).map((stored) => stored.sequence);
+			}),
+		);
+		expect(loaded).toEqual([0, 2]);
+	});
+
 	test("marks sessions cut off by a restart as interrupted", async () => {
 		const statuses = await runInTempDir((tempDir) =>
 			Effect.gen(function* () {
@@ -588,6 +639,135 @@ describe("SessionService", () => {
 			}),
 		);
 		expect(statuses).toEqual(["interrupted", "interrupted", "idle"]);
+	});
+
+	test("a project that loses its trust stops its running agents", async () => {
+		const status = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const { projectId } = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
+					workspaces.get(session.workspaceId),
+				);
+				const projects = yield* ProjectService;
+				yield* projects.setTrust(projectId, true);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				yield* projects.setTrust(projectId, false);
+				return yield* waitForStatus(session.id, "interrupted");
+			}),
+		);
+		expect(status).toBe("interrupted");
+	});
+
+	test("a restart cancels the requests it left open and ends the turn it cut off", async () => {
+		const stored = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const dataDir = join(tempDir, "data");
+				const sessionId = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const database = yield* LocalDatabase;
+						const session = yield* addSession(tempDir);
+						const requests: Array<AgentEvent> = [
+							{
+								type: "approval.requested",
+								requestId: "answered",
+								itemId: "cmd-1",
+								kind: "command",
+								summary: "ls",
+								reason: null,
+								choices: ["allowOnce", "deny"],
+							},
+							{ type: "approval.resolved", requestId: "answered", outcome: "allowOnce" },
+							{
+								type: "approval.requested",
+								requestId: "open",
+								itemId: "cmd-2",
+								kind: "command",
+								summary: "rm",
+								reason: null,
+								choices: ["allowOnce", "deny"],
+							},
+						];
+						yield* database.query((db) =>
+							db.insert(sessionEvent).values(
+								requests.map((event, sequence) => ({
+									id: `event-${sequence}`,
+									sessionId: session.id,
+									sequence,
+									type: event.type,
+									payload: event,
+									createdAt: "2026-01-01T00:00:00.000Z",
+								})),
+							),
+						);
+						yield* database.query((db) =>
+							db.update(agentSession).set({ status: "awaitingApproval" }).where(eq(agentSession.id, session.id)),
+						);
+						return session.id;
+					}),
+				);
+				return yield* withServices(dataDir)(storedEvents(sessionId));
+			}),
+		);
+		expect(stored.slice(3).map((row) => [row.sequence, row.payload])).toEqual([
+			[3, { type: "approval.resolved", requestId: "open", outcome: "cancelled" }],
+			[4, { type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } }],
+		]);
+	});
+
+	test("an agent process that dies mid-turn leaves its approval cancelled and its turn ended", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-crash");
+					return yield* session.start({
+						startTurn: () =>
+							session
+								.requestApproval(
+									{
+										requestId: "approval-1",
+										itemId: "cmd-1",
+										kind: "command",
+										summary: "bun test",
+										reason: null,
+										choices: ["allowOnce", "deny"],
+									},
+									() => Effect.void,
+								)
+								.pipe(
+									Effect.andThen(Effect.sleep("50 millis")),
+									Effect.andThen(session.fail(new AgentProtocolError({ message: "Codex exited.", cause: null }))),
+								),
+						steerTurn: () => Effect.succeed(true),
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
+					});
+				}),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "first", [], false);
+					yield* waitForStatus(session.id, "failed");
+					return (yield* storedEvents(session.id)).map((row) => row.payload).slice(-3);
+				}),
+			),
+		);
+		expect(result).toEqual([
+			{ type: "approval.resolved", requestId: "approval-1", outcome: "cancelled" },
+			{ type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } },
+			{ type: "error", message: "Codex exited.", willRetry: false },
+		]);
 	});
 
 	test("reverting to a message puts the files back as they were before it, but not while an agent works", async () => {
@@ -977,7 +1157,7 @@ describe("SessionService", () => {
 					yield* session.setNativeSessionId("thread-auth");
 					return yield* session.start({
 						startTurn: () => session.fail(new AgentAuthError({ agent: "codex", cause: "401 Unauthorized" })),
-						steerTurn: () => Effect.void,
+						steerTurn: () => Effect.succeed(true),
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
 						listCommands: Effect.succeed([]),
@@ -1080,6 +1260,22 @@ describe("SessionService", () => {
 					return (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [];
 				}),
 			),
+		);
+		expect(result).toEqual([]);
+	});
+
+	test("a message whose second image cannot be stored leaves no image on disk", async () => {
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const broken = { mediaType: "image/png", base64: "not base64!" } as const;
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const fs = yield* FileSystem.FileSystem;
+				const session = yield* addSession(tempDir);
+				yield* Effect.flip(sessions.sendMessage(session.id, "look", [image, broken], false));
+				const directory = join(tempDir, "data", "attachments", session.id);
+				return (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [];
+			}),
 		);
 		expect(result).toEqual([]);
 	});

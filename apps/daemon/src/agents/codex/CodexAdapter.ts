@@ -26,13 +26,19 @@ import {
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
-	AgentProtocolError,
+	type AgentProtocolError,
 	CodexVersionMismatchError,
 	type SessionSettings,
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
-import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
+import {
+	type CodexIncoming,
+	type CodexRpcClient,
+	INVALID_PARAMS,
+	METHOD_NOT_FOUND,
+	makeCodexRpcClient,
+} from "./codexRpcClient.ts";
 import { Context, Effect, Exit, FiberHandle, Layer, Option, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
 import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
@@ -56,6 +62,7 @@ import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
+import { makeProcessId } from "../makeProcessId.ts";
 import { toAgentError } from "../toAgentError.ts";
 
 const CODEX_VERSION = codexVersionFile.trim();
@@ -111,21 +118,30 @@ const codexDecisions = {
 	cancelled: "cancel",
 } as const satisfies Record<ApprovalOutcome, CommandExecutionApprovalDecision>;
 
+// A rewritten lockfile or generated file can be megabytes. Each diff and each event keep only their start,
+// so one change cannot fill the database or a chat's live buffer.
+const MAX_DIFF_CHARS = 50_000;
+const MAX_EVENT_DIFF_CHARS = 200_000;
+
+const capDiff = (diff: string, limit: number) =>
+	diff.length > limit ? `${diff.slice(0, limit)}\n... (diff cut, ${diff.length - limit} more characters)` : diff;
+
 const toToolCall = (item: ThreadItem): ToolCall | undefined => {
 	switch (item.type) {
 		case "commandExecution":
 			return "command" in item ? { kind: "command", command: item.command, cwd: item.cwd } : undefined;
-		case "fileChange":
-			return "changes" in item
-				? {
-						kind: "fileChange",
-						changes: item.changes.map((change) => ({
-							path: change.path,
-							kind: change.kind.type,
-							diff: change.diff,
-						})),
-					}
-				: undefined;
+		case "fileChange": {
+			if (!("changes" in item)) return undefined;
+			let budget = MAX_EVENT_DIFF_CHARS;
+			return {
+				kind: "fileChange",
+				changes: item.changes.map((change) => {
+					const limit = Math.min(MAX_DIFF_CHARS, budget);
+					budget -= Math.min(change.diff.length, limit);
+					return { path: change.path, kind: change.kind.type, diff: capDiff(change.diff, limit) };
+				}),
+			};
+		}
 		case "mcpToolCall":
 			return "server" in item ? { kind: "mcpCall", server: item.server, tool: item.tool } : undefined;
 		default:
@@ -371,10 +387,11 @@ const handleNotification = Effect.fnUntraced(function* (
 const handleServerRequest = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
+	processId: string,
 	request: Extract<CodexIncoming, { _tag: "request" }>,
 ) {
 	const respond = (outcome: ApprovalOutcome) => client.respond(request.id, { decision: codexDecisions[outcome] });
-	const requestId = `${request.id}`;
+	const requestId = `${processId}:${request.id}`;
 	switch (request.method) {
 		case "item/commandExecution/requestApproval": {
 			const params = yield* decodeCodex(CommandApprovalParams)(request.params);
@@ -444,6 +461,32 @@ const handleServerRequest = Effect.fnUntraced(function* (
 	}
 });
 
+// A newer Codex can change the shape of a message. Skipping it keeps the chat going, and a request still
+// gets an answer, so Codex is never left waiting.
+const skipUnreadable = Effect.fnUntraced(function* (
+	session: AgentSession,
+	client: CodexRpcClient,
+	message: CodexIncoming,
+	error: AgentProtocolError,
+) {
+	yield* Effect.logWarning("Skipping a Codex message Octopus could not read", error).pipe(
+		Effect.annotateLogs({ method: message.method }),
+	);
+	if (message._tag === "request") {
+		yield* client.respondError(message.id, INVALID_PARAMS, `Octopus could not read ${message.method}`);
+	}
+	yield* session.emit({
+		type: "error",
+		message:
+			"Codex sent a message Octopus could not read, so Octopus skipped it. Update Octopus if this keeps happening.",
+		willRetry: false,
+	});
+});
+
+// What Codex answers a thread/resume whose thread it has no record of.
+const isMissingThread = (error: AgentError) =>
+	error._tag === "AgentProtocolError" && /no rollout found|thread not found/i.test(error.message);
+
 // Codex runs its own ChatGPT sign-in, which Claude has no equivalent for.
 export interface CodexAgentAdapter extends AgentAdapter {
 	// Returns the URL to open. Codex stores the tokens itself when the user finishes.
@@ -451,6 +494,9 @@ export interface CodexAgentAdapter extends AgentAdapter {
 	// How each sign-in ended, so the daemon can refresh the account and its models without being asked.
 	readonly loginResults: Stream.Stream<LoginCompleted>;
 }
+
+// "$name" in a message, without the punctuation after it. A name starts with a letter, so "$5" names none.
+const SKILL_NAME = /\$[A-Za-z][\w:-]*/g;
 
 // Codex waits on its local callback server until the user finishes in the browser.
 const LOGIN_TIMEOUT = "10 minutes";
@@ -502,6 +548,8 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const models: Array<AgentModel> = [];
 				let defaultModel = "";
 				let cursor: string | null = null;
+				// A cursor Codex already sent would page forever.
+				const seenCursors = new Set<string>();
 				do {
 					const page: typeof ModelListResponse.Type = yield* client
 						.request("model/list", { cursor } satisfies ModelListParams)
@@ -520,6 +568,11 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						if (model.isDefault) defaultModel = model.id;
 					}
 					cursor = page.nextCursor;
+					if (cursor !== null && seenCursors.has(cursor)) {
+						yield* Effect.logWarning("Codex repeated a model/list cursor, so Octopus stopped paging");
+						break;
+					}
+					if (cursor !== null) seenCursors.add(cursor);
 				} while (cursor !== null);
 				return { models, defaultModel: defaultModel || (models[0]?.id ?? "") } satisfies AgentModels;
 			}).pipe(Effect.scoped, provide, Effect.withSpan("CodexAdapter.listModels"));
@@ -541,7 +594,17 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					Stream.filter((message) => message._tag === "notification" && message.method === "account/login/completed"),
 					Stream.take(1),
 					Stream.mapEffect((message) => decodeCodex(LoginCompleted)(message.params)),
-					Stream.runForEach((result) =>
+					Stream.runHead,
+					Effect.timeoutOption(LOGIN_TIMEOUT),
+					Effect.map(Option.flatten),
+					Effect.catch((error) =>
+						Effect.logWarning("Codex sign-in stopped", error).pipe(Effect.as(Option.none<LoginCompleted>())),
+					),
+					// A sign-in that times out or whose app-server exits also ends, so watchers are not left waiting.
+					Effect.map(
+						Option.getOrElse((): LoginCompleted => ({ success: false, error: "The sign-in did not finish." })),
+					),
+					Effect.flatMap((result) =>
 						Effect.gen(function* () {
 							if (!result.success) {
 								yield* Effect.logWarning("Codex sign-in failed").pipe(Effect.annotateLogs({ error: result.error }));
@@ -549,8 +612,6 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							yield* PubSub.publish(loginResults, result);
 						}),
 					),
-					Effect.timeoutOption(LOGIN_TIMEOUT),
-					Effect.catch((error) => Effect.logWarning("Codex sign-in stopped", error)),
 					Effect.ensuring(Scope.close(scope, Exit.void)),
 					FiberHandle.run(pendingLogin),
 				);
@@ -561,6 +622,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
+				const processId = yield* makeProcessId;
 				const currentTurn = yield* Ref.make(idle);
 				const plans: PlanTracking = {
 					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
@@ -582,30 +644,54 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 
 				yield* client.incoming.pipe(
 					Stream.runForEach((message) =>
-						message._tag === "notification"
-							? handleNotification(session, currentTurn, plans, message.method, message.params)
-							: handleServerRequest(session, client, message),
+						session.touch.pipe(
+							Effect.andThen(
+								message._tag === "notification"
+									? handleNotification(session, currentTurn, plans, message.method, message.params)
+									: handleServerRequest(session, client, processId, message),
+							),
+							Effect.catchTag("AgentProtocolError", (error) => skipUnreadable(session, client, message, error)),
+						),
 					),
 					Effect.andThen(session.end),
 					Effect.catch(session.fail),
 					Effect.forkScoped,
 				);
 
+				const startThread = client.request("thread/start", {
+					model: input.model,
+					cwd: input.cwd,
+					...threadPolicy,
+				} satisfies ThreadStartParams);
+
 				yield* Effect.gen(function* () {
 					yield* initialize(client);
 					const response =
 						input.resumeId === undefined
-							? yield* client.request("thread/start", {
-									model: input.model,
-									cwd: input.cwd,
-									...threadPolicy,
-								} satisfies ThreadStartParams)
-							: yield* client.request("thread/resume", {
-									threadId: input.resumeId,
-									model: input.model,
-									cwd: input.cwd,
-									...threadPolicy,
-								} satisfies ThreadResumeParams);
+							? yield* startThread
+							: yield* client
+									.request("thread/resume", {
+										threadId: input.resumeId,
+										model: input.model,
+										cwd: input.cwd,
+										...threadPolicy,
+									} satisfies ThreadResumeParams)
+									.pipe(
+										// A thread whose files are gone can never resume, so the chat goes on in a new one rather
+										// than failing every message.
+										Effect.catchIf(isMissingThread, (error) =>
+											Effect.gen(function* () {
+												yield* Effect.logWarning("Codex lost the chat's thread, starting a new one", error);
+												yield* session.emit({
+													type: "error",
+													message:
+														"Codex could not find this chat's earlier conversation, so it continues in a new one without that context.",
+													willRetry: false,
+												});
+												return yield* startThread;
+											}),
+										),
+									);
 					const { thread } = yield* decodeCodex(ThreadResponse)(response);
 					yield* session.setNativeSessionId(thread.id);
 				}).pipe(Effect.catch(session.fail), Effect.forkScoped);
@@ -618,7 +704,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				// A skill runs when the message names it as "$name" and also carries it as an input item,
 				// the way Codex's own composer sends it.
 				const skillsNamedIn = (text: string) => {
-					const named = new Set(text.match(/\$[^\s$]+/g));
+					const named = new Set(text.match(SKILL_NAME));
 					return named.size === 0
 						? Effect.succeed([])
 						: listSkills.pipe(
@@ -683,17 +769,14 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
 							const state = yield* Ref.get(currentTurn);
-							if (state._tag !== "running") {
-								return yield* new AgentProtocolError({
-									message: "Codex has not started the turn yet, so it cannot be steered.",
-									cause: null,
-								});
-							}
+							// Codex steers only a turn it has named, so earlier the message waits for its own turn.
+							if (state._tag !== "running") return false;
 							yield* client.request("turn/steer", {
 								threadId,
 								input: yield* toInput(message),
 								expectedTurnId: state.turnId,
 							} satisfies TurnSteerParams);
+							return true;
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
 					listCommands: Effect.map(listSkills, (skills) =>
