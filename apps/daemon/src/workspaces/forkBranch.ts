@@ -23,6 +23,26 @@ export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: strin
 	return !remotes.split("\n").includes(remote);
 });
 
+const countAsFork = (path: string) => (cause: unknown) =>
+	Effect.logWarning("Could not tell whether the branch is a fork's, so it counts as one", cause).pipe(
+		Effect.annotateLogs({ path }),
+		Effect.as(true),
+	);
+
+// Whether a workspace holds a fork's code: stored when it was made, or seen now on its checked-out branch, as
+// after `gh pr checkout` in an in-place workspace. When git cannot tell, it counts as a fork's, so a fork's code
+// never gets the project's trust or hooks by accident.
+export const holdsForkCode = Effect.fn("holdsForkCode")(function* (workspace: {
+	readonly fromFork: boolean;
+	readonly path: string;
+}) {
+	if (workspace.fromFork) return true;
+	const giveUp = countAsFork(workspace.path);
+	return yield* isForkCheckout(workspace.path).pipe(
+		Effect.catchTags({ GitCommandError: giveUp, GitSpawnError: giveUp, GitTimeoutError: giveUp }),
+	);
+});
+
 export const isForkBranch = Effect.fn("isForkBranch")(function* (repositoryPath: string, branch: string) {
 	const value = yield* runGit(repositoryPath, [
 		"config",

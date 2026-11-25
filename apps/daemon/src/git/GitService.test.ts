@@ -652,13 +652,14 @@ describe("GitService on a branch that tracks another remote", () => {
 				yield* runGit(repositoryPath, ["config", "branch.contrib.merge", "refs/heads/their-branch"]);
 				yield* addMarkingHooks(tempDir, repositoryPath);
 				const project = yield* Effect.flatMap(ProjectService, (projects) => projects.add(repositoryPath));
-				const created = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
-					workspaces.create({ kind: "inPlace", projectId: project.id }),
-				);
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
 				yield* fs.writeFileString(join(created.path, "fix.txt"), "fix\n");
 				yield* git.commit(created.id, "review fix", null);
 				yield* git.push(created.id);
 				return {
+					created: created.fromFork,
+					listed: (yield* workspaces.list(project.id)).map((workspace) => workspace.fromFork),
 					forkBranch: yield* runGit(fork, ["log", "-1", "--format=%s", "their-branch"]),
 					originBranches: yield* runGit(origin, ["branch", "--list"]),
 					hooksRan:
@@ -667,6 +668,9 @@ describe("GitService on a branch that tracks another remote", () => {
 				};
 			}),
 		);
+		// The UI hides Create PR and confirms Run by this.
+		expect(result.created).toBe(true);
+		expect(result.listed).toEqual([true]);
 		expect(result.forkBranch).toBe("review fix");
 		expect(result.originBranches).toBe("");
 		expect(result.hooksRan).toBe(false);

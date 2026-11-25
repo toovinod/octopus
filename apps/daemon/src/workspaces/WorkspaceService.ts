@@ -18,12 +18,12 @@ import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorksp
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
+import { holdsForkCode, isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
 import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
-import { isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
@@ -327,7 +327,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					// Never block the RPC on the script.
 					yield* startSetupScript(setupRun.id, owner.setupScript, row.path);
 				}
-				return new Workspace(row);
+				return yield* withForkState(row);
 			}, Effect.provide(services));
 
 			// What a new workspace can start from, read from the project's repository and its GitHub remote.
@@ -353,12 +353,20 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				return new Workspace(row);
 			});
 
+			// What the UI is sent. An active workspace's folder may have switched to a fork's branch since it was made, as
+			// with `gh pr checkout` in an in-place workspace, so its fork state is read again.
+			const withForkState = (row: WorkspaceRow) =>
+				(row.status === "active" ? holdsForkCode(row) : Effect.succeed(row.fromFork)).pipe(
+					Effect.map((fromFork) => new Workspace({ ...row, fromFork })),
+					Effect.provide(services),
+				);
+
 			const list = (projectId: string) =>
 				database
 					.query((db) =>
 						db.select().from(workspace).where(eq(workspace.projectId, projectId)).orderBy(asc(workspace.createdAt)),
 					)
-					.pipe(Effect.map((rows) => rows.map((row) => new Workspace(row))));
+					.pipe(Effect.flatMap((rows) => Effect.forEach(rows, withForkState, { concurrency: "unbounded" })));
 
 			const cancelScripts = Effect.fn("WorkspaceService.cancelScripts")(function* (
 				workspaceId: string,
@@ -533,7 +541,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (setupRun !== null && owner.setupScript !== null) {
 						yield* startSetupScript(setupRun.id, owner.setupScript, current.path);
 					}
-					return yield* get(workspaceId);
+					return yield* withForkState(yield* get(workspaceId));
 				},
 				(effect, workspaceId) => workspaceLock.restoring(workspaceId, effect),
 				Semaphore.withPermit(archiveLock),
