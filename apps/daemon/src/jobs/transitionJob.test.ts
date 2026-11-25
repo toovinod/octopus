@@ -87,6 +87,20 @@ describe("transitionJob", () => {
 		}
 	});
 
+	test("a failed or dead-lettered job retried by the user starts over as pending", () => {
+		for (const status of ["failed", "deadLetter"] as const) {
+			expect(move(status, { _tag: "Retried" }, 3)).toEqual(
+				Result.succeed({
+					status: "pending",
+					attempts: 0,
+					lastError: null,
+					updatedAt: NOW,
+					finishedAt: null,
+				}),
+			);
+		}
+	});
+
 	test("refuses every other move", () => {
 		const legal = new Set([
 			"pending:Started",
@@ -95,6 +109,8 @@ describe("transitionJob", () => {
 			"processing:FailedRetryably",
 			"pending:Cancelled",
 			"processing:Cancelled",
+			"failed:Retried",
+			"deadLetter:Retried",
 		]);
 		const statuses = ["pending", "processing", "completed", "failed", "deadLetter"] as const;
 		const events: ReadonlyArray<JobEvent> = [
@@ -103,6 +119,7 @@ describe("transitionJob", () => {
 			{ _tag: "FailedPermanently", error: "x" },
 			retryable,
 			{ _tag: "Cancelled", reason: "x" },
+			{ _tag: "Retried" },
 		];
 		for (const status of statuses) {
 			for (const event of events) {

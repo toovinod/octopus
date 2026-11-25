@@ -15,7 +15,9 @@ export type JobEvent =
 			readonly error: string;
 			readonly maxAttempts: number;
 	  }
-	| { readonly _tag: "Cancelled"; readonly reason: string };
+	| { readonly _tag: "Cancelled"; readonly reason: string }
+	// The user runs a failed or dead-lettered job again, with a fresh set of attempts.
+	| { readonly _tag: "Retried" };
 
 export interface JobUpdate {
 	readonly status: JobStatus;
@@ -23,7 +25,7 @@ export interface JobUpdate {
 	readonly lastError: string | null;
 	readonly updatedAt: string;
 	readonly startedAt?: string;
-	readonly finishedAt?: string;
+	readonly finishedAt?: string | null;
 }
 
 export class IllegalJobTransitionError extends Schema.TaggedError<IllegalJobTransitionError>()(
@@ -99,6 +101,16 @@ export const transitionJob = (
 						lastError: event.reason,
 						updatedAt: now,
 						finishedAt: now,
+					})
+				: illegal;
+		case "Retried":
+			return job.status === "failed" || job.status === "deadLetter"
+				? Result.succeed({
+						status: "pending",
+						attempts: 0,
+						lastError: null,
+						updatedAt: now,
+						finishedAt: null,
 					})
 				: illegal;
 	}
