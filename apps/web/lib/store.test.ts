@@ -75,6 +75,7 @@ const daemon = {
 		return history(request);
 	},
 	removeProject: () => undefined,
+	interruptSession: () => [],
 	revertToMessage: () => [{ path: "README.md", change: "modified" }],
 	sendMessage: ({ text }: { readonly text: string }) => {
 		sent.push(text);
@@ -107,6 +108,8 @@ const {
 	discardFailedSend,
 	failedSendsOf,
 	getState,
+	interruptSession,
+	queuedOf,
 	isConnectionDrop,
 	loadOlderEvents,
 	newChat,
@@ -125,6 +128,7 @@ const {
 // size and notifications read focus and visibility.
 Object.assign(globalThis, {
 	document: { documentElement: { style: {} }, visibilityState: "visible", hasFocus: () => true },
+	requestAnimationFrame: (callback: () => void) => setTimeout(callback, 0),
 });
 
 const lastWatch = () => follows.filter((follow) => follow.name === "watchSessions").at(-1)?.handlers;
@@ -352,6 +356,58 @@ describe("older history", () => {
 		void loadOlderEvents();
 		expect(historyCalls).toEqual(["t:7"]);
 		history = () => [];
+	});
+});
+
+describe("queued messages", () => {
+	const queuedTexts = () => queuedOf(getState(), "s").map(({ text }) => text);
+	const started = (sequence: number, text: string) =>
+		subscriptions()
+			.at(-1)
+			?.handlers.onItem({
+				sessionId: "s",
+				sequence,
+				event: { type: "user.message", itemId: `u${sequence}`, text, attachments: [] },
+				createdAt: "1",
+			});
+
+	test("a message sent to a busy chat shows as queued until its turn starts or the chat stops working", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, status: "running", updatedAt: "5" });
+		await sendMessage("s", "next", [], false);
+		await sendMessage("s", "after", [], false);
+		expect(queuedOf(getState(), "s")).toMatchObject([
+			{ text: "next", imageCount: 0 },
+			{ text: "after", imageCount: 0 },
+		]);
+		started(10, "next");
+		await sleep(5);
+		expect(queuedTexts()).toEqual(["after"]);
+		lastWatch()?.onItem({ ...session, status: "idle", updatedAt: "6" });
+		expect(queuedTexts()).toEqual([]);
+	});
+
+	test("a message sent to an idle chat, or one the daemon refuses, is not shown as queued", async () => {
+		await boot();
+		await sleep(0);
+		await sendMessage("s", "now", [], false);
+		expect(queuedTexts()).toEqual([]);
+		lastWatch()?.onItem({ ...session, status: "running", updatedAt: "5" });
+		outcomes.push("busy");
+		await sendMessage("s", "too many", [], false);
+		expect(queuedTexts()).toEqual([]);
+		expect(failedSendsOf(getState(), "s").map(({ text }) => text)).toEqual(["too many"]);
+		discardFailedSend("s", failedSendsOf(getState(), "s")[0]?.id ?? -1);
+	});
+
+	test("a stop takes back the queued messages", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, status: "running", updatedAt: "5" });
+		await sendMessage("s", "next", [], false);
+		await interruptSession("s");
+		expect(queuedTexts()).toEqual([]);
 	});
 });
 

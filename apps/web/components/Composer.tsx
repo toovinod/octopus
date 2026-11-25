@@ -15,6 +15,7 @@ import {
 	type FailedSend,
 	failedSendsOf,
 	interruptSession,
+	queuedOf,
 	retryFailedSend,
 	sendMessage,
 	toast,
@@ -63,6 +64,7 @@ export const Composer = memo(
 		const busy = session.status === "running" || session.status === "awaitingApproval";
 		const steer = busy && agent?.capabilities.steerWhileRunning === true;
 		const failedSends = useAppState((current) => failedSendsOf(current, session.id));
+		const queued = useAppState((current) => queuedOf(current, session.id));
 		const [caret, setCaret] = useState(0);
 		// Escape hides the suggestions for the word it was pressed in.
 		const [dismissedAt, setDismissedAt] = useState<number | null>(null);
@@ -126,6 +128,16 @@ export const Composer = memo(
 				{failedSends.map((failed) => (
 					<FailedSendNotice key={failed.id} sessionId={session.id} failed={failed} steer={steer} />
 				))}
+				{queued.length === 0 ? null : (
+					<div className="mb-2 px-3 text-xs text-muted-foreground">
+						<p className="font-medium">Queued</p>
+						{queued.map((message) => (
+							<p key={message.id} className="truncate">
+								{[message.text, imageCountLabel(message.imageCount)].filter((part) => part !== "").join(" + ")}
+							</p>
+						))}
+					</div>
+				)}
 				{/* biome-ignore lint/a11y/noStaticElementInteractions: dropping images is an extra way in, the + button is the accessible one. */}
 				<div
 					className={cn(
@@ -309,6 +321,8 @@ export const Composer = memo(
 		);
 	},
 );
+
+const imageCountLabel = (count: number) => (count === 0 ? "" : `${count} ${count === 1 ? "image" : "images"}`);
 
 const FailedSendNotice = ({
 	sessionId,

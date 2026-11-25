@@ -43,6 +43,16 @@ export interface FailedSend {
 	readonly error: string;
 }
 
+// A message this window sent while the agent was busy, shown above the composer until its turn starts. The daemon
+// stores a message only once the agent takes it, so until then nothing else shows it.
+export interface QueuedMessage {
+	readonly id: number;
+	readonly text: string;
+	readonly imageCount: number;
+	// The chat's last event when it was sent, so an earlier message with the same text is not taken for it.
+	readonly afterSequence: number;
+}
+
 export interface AppState {
 	readonly connection:
 		| { readonly status: "connecting" | "ready" | "reconnecting" }
@@ -57,6 +67,8 @@ export interface AppState {
 	readonly attention: Readonly<Record<string, Attention>>;
 	// Keyed by session id, oldest first.
 	readonly failedSends: Readonly<Record<string, ReadonlyArray<FailedSend>>>;
+	// Keyed by session id, oldest first.
+	readonly queued: Readonly<Record<string, ReadonlyArray<QueuedMessage>>>;
 	// Keyed by workspace id: how many reverts rewrote its files, so views of them reload.
 	readonly reverts: Readonly<Record<string, number>>;
 	readonly selectedWorkspaceId: string | null;
@@ -79,6 +91,7 @@ let state: AppState = {
 	closedTabs: new Set(),
 	attention: {},
 	failedSends: {},
+	queued: {},
 	reverts: {},
 	selectedWorkspaceId: null,
 	selectedSessionId: null,
@@ -217,6 +230,8 @@ const watchSessions = () => {
 			// boot can be newer than either. Never step a session back to an older state.
 			if (before !== undefined && session.updatedAt < before.updatedAt) return;
 			setState((current) => ({ sessions: { ...current.sessions, [session.id]: session } }));
+			// A chat that stopped working has started or dropped every queued message.
+			if (!isWorking(session)) clearQueued(session.id);
 			if (before !== undefined) noticeChange(before, session);
 		},
 		onEnd: (error) => {
@@ -605,6 +620,37 @@ const releaseImages = (images: ReadonlyArray<DraftImage>) => {
 	for (const image of images) URL.revokeObjectURL(image.previewUrl);
 };
 
+const noQueued: ReadonlyArray<QueuedMessage> = [];
+
+export const queuedOf = (current: AppState, sessionId: string) => current.queued[sessionId] ?? noQueued;
+
+let nextQueued = 0;
+
+const setQueued = (sessionId: string, update: (queued: ReadonlyArray<QueuedMessage>) => ReadonlyArray<QueuedMessage>) =>
+	setState((current) => {
+		const queued = update(queuedOf(current, sessionId));
+		return {
+			queued: queued.length === 0 ? without(current.queued, sessionId) : { ...current.queued, [sessionId]: queued },
+		};
+	});
+
+const clearQueued = (sessionId: string) => {
+	if (queuedOf(state, sessionId).length > 0) setQueued(sessionId, () => []);
+};
+
+const isWorking = (session: AgentSession) => session.status === "running" || session.status === "awaitingApproval";
+
+// Each stored user message is the oldest queued one with its text that was sent before it.
+const takeStarted = (sessionId: string, events: ReadonlyArray<SessionEvent>) => {
+	for (const { sequence, event } of events) {
+		if (event.type !== "user.message" || sequence === null) continue;
+		const started = queuedOf(state, sessionId).find(
+			(queued) => queued.afterSequence < sequence && queued.text === event.text,
+		);
+		if (started !== undefined) setQueued(sessionId, (queued) => queued.filter((item) => item !== started));
+	}
+};
+
 // A refused message is kept with the daemon's reason, for the composer to offer Retry and Discard.
 // Resolves to whether the daemon took the message.
 export const sendMessage = (
@@ -614,12 +660,25 @@ export const sendMessage = (
 	steer: boolean,
 ): Promise<boolean> => {
 	const payload = images.map(({ mediaType, base64 }) => ({ mediaType, base64 }));
+	const session = state.sessions[sessionId];
+	// Shown before the daemon answers, so a turn that starts at once removes it again rather than racing it.
+	const queued =
+		session !== undefined && isWorking(session)
+			? {
+					id: nextQueued++,
+					text,
+					imageCount: images.length,
+					afterSequence: state.chat?.sessionId === sessionId ? state.chat.lastSequence : -1,
+				}
+			: null;
+	if (queued !== null) setQueued(sessionId, (current) => [...current, queued]);
 	return callDaemon((daemon) => daemon.sendMessage({ sessionId, text, images: payload, steer })).then(
 		() => {
 			releaseImages(images);
 			return true;
 		},
 		(error: unknown) => {
+			if (queued !== null) setQueued(sessionId, (current) => current.filter((item) => item !== queued));
 			const failed = { id: nextFailedSend++, text, images, error: errorMessage(error) };
 			setFailedSends(sessionId, (sends) => [...sends, failed]);
 			return false;
@@ -663,8 +722,12 @@ export const respondToPlan = (sessionId: string, requestId: string, answer: Plan
 export const answerQuestion = (sessionId: string, requestId: string, answers: QuestionAnswers) =>
 	attempt(() => callDaemon((daemon) => daemon.answerQuestion({ sessionId, requestId, answers })));
 
-export const interruptSession = (sessionId: string) =>
-	attempt(() => callDaemon((daemon) => daemon.interruptSession({ sessionId })));
+// A stop hands the queued messages back, so they are no longer waiting.
+export const interruptSession = async (sessionId: string) => {
+	const dropped = await attempt(() => callDaemon((daemon) => daemon.interruptSession({ sessionId })));
+	if (dropped !== null) clearQueued(sessionId);
+	return dropped;
+};
 
 export const respondToApproval = (sessionId: string, requestId: string, decision: ApprovalDecision) =>
 	attempt(() => callDaemon((daemon) => daemon.respondToApproval({ sessionId, requestId, decision })));
@@ -687,6 +750,7 @@ const flush = () => {
 	setState((current) =>
 		current.chat === null || events.length === 0 ? {} : { chat: applyEvents(current.chat, events) },
 	);
+	if (state.chat !== null) takeStarted(state.chat.sessionId, events);
 };
 
 // failures counts the drops in a row, so a daemon that stays away is retried less and less often.
@@ -745,6 +809,7 @@ const openChat = async (sessionId: string) => {
 		return;
 	}
 	setState((current) => (current.chat === null ? {} : { chat: applyEvents(current.chat, page) }));
+	takeStarted(sessionId, page);
 	// The subscription reads stored events after the page's last one, so events stored meanwhile are neither
 	// lost nor shown twice.
 	follow(sessionId, state.chat?.lastSequence ?? -1);
