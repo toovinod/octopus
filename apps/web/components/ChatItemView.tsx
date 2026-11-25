@@ -7,6 +7,7 @@ import {
 	FileDiffIcon,
 	LoaderIcon,
 	PlugIcon,
+	RotateCwIcon,
 	TerminalIcon,
 	TriangleAlertIcon,
 	Undo2Icon,
@@ -265,22 +266,39 @@ const cacheAttachment = (attachmentId: string, src: string) => {
 
 const Attachment = ({ sessionId, attachmentId }: { readonly sessionId: string; readonly attachmentId: string }) => {
 	const [src, setSrc] = useState(() => cachedAttachment(attachmentId));
+	const [failed, setFailed] = useState(false);
+	// Bumped by Retry, to load again.
+	const [attempt, setAttempt] = useState(0);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: attempt is the retry signal.
 	useEffect(() => {
 		if (attachmentCache.has(attachmentId)) return;
 		let live = true;
+		setFailed(false);
 		callDaemon((daemon) => daemon.getAttachment({ sessionId, attachmentId })).then(
 			(image) => {
 				const url = `data:${image.mediaType};base64,${image.base64}`;
 				cacheAttachment(attachmentId, url);
 				if (live) setSrc(url);
 			},
-			() => undefined,
+			() => {
+				if (live) setFailed(true);
+			},
 		);
 		return () => {
 			live = false;
 		};
-	}, [sessionId, attachmentId]);
-	return src === null ? (
+	}, [sessionId, attachmentId, attempt]);
+	return failed ? (
+		<button
+			type="button"
+			onClick={() => setAttempt((current) => current + 1)}
+			title="The image could not be loaded. Click to try again."
+			className="flex size-16 flex-col items-center justify-center gap-1 rounded-lg bg-muted text-xs text-muted-foreground hover:text-foreground"
+		>
+			<RotateCwIcon className="size-3.5" />
+			Retry
+		</button>
+	) : src === null ? (
 		<div className="size-16 rounded-lg bg-muted" />
 	) : (
 		// biome-ignore lint/performance/noImgElement: a data URL in a static export, which next/image cannot optimize.
