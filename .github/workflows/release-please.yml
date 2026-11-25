@@ -49,9 +49,20 @@ jobs:
             artifact: macos-arm64
             os: macos-15
             files: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          - name: macOS Intel
+            artifact: macos-x64
+            os: macos-15-intel
+            files: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux x64
             artifact: linux-x64
             os: ubuntu-24.04
+            bundles: deb,appimage
+            files: |
+              apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+              apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          - name: Linux arm64
+            artifact: linux-arm64
+            os: ubuntu-24.04-arm
             bundles: deb,appimage
             files: |
               apps/desktop/src-tauri/target/release/bundle/deb/*.deb
