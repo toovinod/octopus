@@ -403,6 +403,11 @@ const serve = async () => {
 					send({ id: message.id, result: { thread: { id: threadId } } });
 					break;
 				}
+				// Like a thread whose rollout files were deleted.
+				if (message.params.threadId === "thread-gone") {
+					send({ id: message.id, error: { code: -32600, message: "no rollout found for thread id thread-gone" } });
+					break;
+				}
 				send({
 					id: message.id,
 					result: { thread: { id: message.params.threadId } },

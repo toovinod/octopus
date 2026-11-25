@@ -483,6 +483,10 @@ const skipUnreadable = Effect.fnUntraced(function* (
 	});
 });
 
+// What Codex answers a thread/resume whose thread it has no record of.
+const isMissingThread = (error: AgentError) =>
+	error._tag === "AgentProtocolError" && /no rollout found|thread not found/i.test(error.message);
+
 // Codex runs its own ChatGPT sign-in, which Claude has no equivalent for.
 export interface CodexAgentAdapter extends AgentAdapter {
 	// Returns the URL to open. Codex stores the tokens itself when the user finishes.
@@ -654,21 +658,40 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					Effect.forkScoped,
 				);
 
+				const startThread = client.request("thread/start", {
+					model: input.model,
+					cwd: input.cwd,
+					...threadPolicy,
+				} satisfies ThreadStartParams);
+
 				yield* Effect.gen(function* () {
 					yield* initialize(client);
 					const response =
 						input.resumeId === undefined
-							? yield* client.request("thread/start", {
-									model: input.model,
-									cwd: input.cwd,
-									...threadPolicy,
-								} satisfies ThreadStartParams)
-							: yield* client.request("thread/resume", {
-									threadId: input.resumeId,
-									model: input.model,
-									cwd: input.cwd,
-									...threadPolicy,
-								} satisfies ThreadResumeParams);
+							? yield* startThread
+							: yield* client
+									.request("thread/resume", {
+										threadId: input.resumeId,
+										model: input.model,
+										cwd: input.cwd,
+										...threadPolicy,
+									} satisfies ThreadResumeParams)
+									.pipe(
+										// A thread whose files are gone can never resume, so the chat goes on in a new one rather
+										// than failing every message.
+										Effect.catchIf(isMissingThread, (error) =>
+											Effect.gen(function* () {
+												yield* Effect.logWarning("Codex lost the chat's thread, starting a new one", error);
+												yield* session.emit({
+													type: "error",
+													message:
+														"Codex could not find this chat's earlier conversation, so it continues in a new one without that context.",
+													willRetry: false,
+												});
+												return yield* startThread;
+											}),
+										),
+									);
 					const { thread } = yield* decodeCodex(ThreadResponse)(response);
 					yield* session.setNativeSessionId(thread.id);
 				}).pipe(Effect.catch(session.fail), Effect.forkScoped);

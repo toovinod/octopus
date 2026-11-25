@@ -209,6 +209,22 @@ describe("CodexAdapter", () => {
 		});
 	});
 
+	test("a resume of a thread Codex no longer has goes on in a new thread with a notice", async () => {
+		const [id, events] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					const id = yield* handle.nativeSessionId;
+					return [id, yield* takeUntil(handle, "turn.completed")] as const;
+				}),
+			{ ...newSession, resumeId: "thread-gone" },
+		);
+		expect(id).toBe("thread-new");
+		expect(events).toContainEqual({ type: "session.started", nativeSessionId: "thread-new" });
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
 	test("cuts huge diffs, each and per event, with a marker", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
