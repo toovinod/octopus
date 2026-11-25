@@ -133,27 +133,41 @@ const LAST_WORKSPACE_KEY = "octopus.lastWorkspace";
 // Without storage the app opens the first workspace next time, which is fine.
 const rememberWorkspace = (workspaceId: string) => writeStored(LAST_WORKSPACE_KEY, workspaceId);
 
-const loadWorkspaces = async (projectId: string) => {
-	const workspaces = await callDaemon((daemon) => daemon.listWorkspaces({ projectId }));
-	const active = workspaces.filter((workspace) => workspace.status === "active");
-	const sessions = await Promise.all(
-		active.map((workspace) => callDaemon((daemon) => daemon.listSessions({ workspaceId: workspace.id }))),
-	);
-	setState((current) => ({
-		workspaces: { ...current.workspaces, ...byId(workspaces) },
-		sessions: { ...current.sessions, ...byId(sessions.flat()) },
-	}));
-};
-
 export const refreshAgents = async () => {
 	const agents = await attempt(() => callDaemon((daemon) => daemon.listAgents()));
 	if (agents !== null) setState(() => ({ agents }));
 };
 
+// The lists replace what was held, so a reload after a reconnect also drops what was deleted meanwhile.
 const loadProjects = async () => {
 	const projects = await callDaemon((daemon) => daemon.listProjects());
-	setState(() => ({ projects: byId(projects) }));
-	await Promise.all(projects.map((project) => loadWorkspaces(project.id)));
+	const workspaces = (
+		await Promise.all(
+			projects.map((project) => callDaemon((daemon) => daemon.listWorkspaces({ projectId: project.id }))),
+		)
+	).flat();
+	const sessions = (
+		await Promise.all(
+			workspaces
+				.filter((workspace) => workspace.status === "active")
+				.map((workspace) => callDaemon((daemon) => daemon.listSessions({ workspaceId: workspace.id }))),
+		)
+	).flat();
+	const sessionIds = new Set(sessions.map((session) => session.id));
+	const kept = <A>(record: Readonly<Record<string, A>>) =>
+		Object.fromEntries(Object.entries(record).filter(([sessionId]) => sessionIds.has(sessionId)));
+	const selectionGone =
+		(state.selectedWorkspaceId !== null &&
+			!workspaces.some((workspace) => workspace.id === state.selectedWorkspaceId)) ||
+		(state.selectedSessionId !== null && !sessionIds.has(state.selectedSessionId));
+	setState((current) => ({
+		projects: byId(projects),
+		workspaces: byId(workspaces),
+		sessions: byId(sessions),
+		attention: kept(current.attention),
+		...(selectionGone ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
+	}));
+	if (selectionGone) closeChat();
 };
 
 export const boot = async () => {
@@ -228,6 +242,11 @@ const watchAgentLogins = () => {
 			if (success) toast(`Signed in to ${name}.`, "info");
 			else toast(`The ${name} sign-in did not finish. Try again.`);
 			void refreshAgents();
+		},
+		onEnd: (error) => {
+			// The daemon ended it by shutting down, or the socket dropped and watchSessions reconnects both.
+			if (error === null || isConnectionDrop(error)) return;
+			toast("Sign-in results stopped arriving. Restart Octopus to see them again.");
 		},
 	});
 };
@@ -667,13 +686,16 @@ const flush = () => {
 	);
 };
 
-const follow = (sessionId: string, afterSequence: number) => {
+// failures counts the drops in a row, so a daemon that stays away is retried less and less often.
+const follow = (sessionId: string, afterSequence: number, failures = 0) => {
 	stopChat?.();
 	const generation = ++chatGeneration;
 	const isCurrent = () => generation === chatGeneration;
+	let failed = failures;
 	const stop = followDaemon((daemon) => daemon.subscribeSession({ sessionId, afterSequence }), {
 		onItem: (event) => {
 			if (!isCurrent()) return;
+			failed = 0;
 			pending.push(event);
 			if (!flushScheduled) {
 				flushScheduled = true;
@@ -683,12 +705,14 @@ const follow = (sessionId: string, afterSequence: number) => {
 		onEnd: (error) => {
 			if (!isCurrent()) return;
 			flush();
-			const resume = () => {
-				if (isCurrent() && state.chat?.sessionId === sessionId) follow(sessionId, state.chat.lastSequence);
+			const resume = (failures: number) => {
+				if (isCurrent() && state.chat?.sessionId === sessionId) follow(sessionId, state.chat.lastSequence, failures);
 			};
 			// Too far behind, or the socket dropped: pick up after the last event we hold, without clearing the chat.
-			if (errorTag(error) === "ResubscribeRequiredError") resume();
-			else if (error !== null && errorTag(error) !== "SessionNotFoundError") setTimeout(resume, 1000);
+			if (errorTag(error) === "ResubscribeRequiredError") resume(0);
+			else if (error !== null && errorTag(error) !== "SessionNotFoundError") {
+				setTimeout(() => resume(failed + 1), reconnectDelay(failed));
+			}
 		},
 	});
 	stopChat = () => {
@@ -723,20 +747,23 @@ const openChat = async (sessionId: string) => {
 	follow(sessionId, state.chat?.lastSequence ?? -1);
 };
 
-let loadingOlder = false;
+// Per chat, so a page still loading for the chat just left does not hold up the one now open.
+const loadingOlder = new Set<string>();
 
 export const loadOlderEvents = async () => {
 	const chat = state.chat;
-	if (chat === null || chat.firstSequence === null || chat.firstSequence <= 0 || loadingOlder) return;
+	if (chat === null || chat.firstSequence === null || chat.firstSequence <= 0) return;
 	const { sessionId, firstSequence } = chat;
-	loadingOlder = true;
+	if (loadingOlder.has(sessionId)) return;
+	loadingOlder.add(sessionId);
 	const page = await attempt(() => loadHistory(sessionId, firstSequence));
-	loadingOlder = false;
+	loadingOlder.delete(sessionId);
 	if (page === null) return;
 	// Only onto the chat it was loaded for. A chat reopened in the meantime starts from another page.
+	// An empty page means nothing older is stored, so the chat stops asking.
 	setState((current) =>
 		current.chat?.sessionId === sessionId && current.chat.firstSequence === firstSequence
-			? { chat: prependEvents(current.chat, page) }
+			? { chat: page.length === 0 ? { ...current.chat, firstSequence: 0 } : prependEvents(current.chat, page) }
 			: {},
 	);
 };

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AgentSession } from "@repo/contracts/AgentSession";
 import { draftOf, keepDraft } from "./drafts.ts";
 import type { Follow } from "./daemonRuntime.ts";
+import { toast as sonnerToast } from "sonner";
 import { Predicate } from "effect";
 
 const project = { id: "p", name: "app", path: "/app", defaultBranch: "main", trusted: false };
@@ -39,6 +40,20 @@ const pendingUpdate = () =>
 		settleUpdate = (outcome) => (Predicate.hasProperty(outcome, "_tag") ? reject(outcome) : resolve(outcome));
 	});
 
+interface HistoryRequest {
+	readonly sessionId: string;
+	readonly beforeSequence: number | null;
+}
+// Answers loadSessionHistory. Tests that change it put it back.
+let history: (request: HistoryRequest) => unknown = () => [];
+const historyCalls: Array<string> = [];
+// Each listSessions call takes the next of these, and lists the one session once they run out.
+const sessionLists: Array<Array<unknown>> = [];
+const userMessage = (sequence: number) => ({
+	sequence,
+	event: { type: "user.message", itemId: `u${sequence}`, text: "hi", attachments: [] },
+});
+
 const daemon = {
 	updateSessionSettings: pendingUpdate,
 	renameSession: pendingUpdate,
@@ -48,13 +63,16 @@ const daemon = {
 		return failure === undefined ? [project] : Promise.reject(failure);
 	},
 	listWorkspaces: () => [workspace],
-	listSessions: () => [session],
+	listSessions: () => sessionLists.shift() ?? [session],
 	listAgents: () => {
 		agentLists++;
 		return [{ kind: "claude", availability: { status: "ready" }, defaultModel: "replay", models: [{ id: "replay" }] }];
 	},
 	createSession: pendingUpdate,
-	loadSessionHistory: () => [],
+	loadSessionHistory: (request: HistoryRequest) => {
+		historyCalls.push(`${request.sessionId}:${request.beforeSequence}`);
+		return history(request);
+	},
 	removeProject: () => undefined,
 	revertToMessage: () => [{ path: "README.md", change: "modified" }],
 	sendMessage: ({ text }: { readonly text: string }) => {
@@ -90,6 +108,7 @@ const {
 	failedSendsOf,
 	getState,
 	isConnectionDrop,
+	loadOlderEvents,
 	newChat,
 	reconnectDelay,
 	removeProject,
@@ -280,5 +299,85 @@ describe("new chats", () => {
 		settleUpdate({ ...session, id: "m", createdAt: "4" });
 		await created;
 		expect(getState().selectedSessionId).toBe("m");
+	});
+});
+
+const subscriptions = () => follows.filter((follow) => follow.name === "subscribeSession");
+
+describe("following the open chat", () => {
+	test("a dropped chat stream retries with a growing delay", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		await boot();
+		await sleep(0);
+		const before = subscriptions().length;
+		subscriptions().at(-1)?.handlers.onEnd?.(drop);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 1);
+		subscriptions().at(-1)?.handlers.onEnd?.(drop);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 1);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 2);
+	});
+});
+
+describe("older history", () => {
+	test("an empty older page stops the chat asking again", async () => {
+		history = ({ beforeSequence }) => (beforeSequence === null ? [userMessage(5)] : []);
+		await boot();
+		lastWatch()?.onItem({ ...session, id: "h", createdAt: "2" });
+		selectSession("h");
+		await sleep(0);
+		historyCalls.length = 0;
+		await loadOlderEvents();
+		await loadOlderEvents();
+		expect(historyCalls).toEqual(["h:5"]);
+		expect(getState().chat?.firstSequence).toBe(0);
+		history = () => [];
+	});
+
+	test("a page still loading for the last chat does not hold up the next", async () => {
+		history = ({ sessionId, beforeSequence }) =>
+			beforeSequence === null ? [userMessage(sessionId === "a" ? 5 : 7)] : new Promise(() => {});
+		await boot();
+		lastWatch()?.onItem({ ...session, id: "a", createdAt: "2" });
+		lastWatch()?.onItem({ ...session, id: "t", createdAt: "3" });
+		selectSession("a");
+		await sleep(0);
+		void loadOlderEvents();
+		expect(historyCalls.at(-1)).toBe("a:5");
+		selectSession("t");
+		await sleep(0);
+		historyCalls.length = 0;
+		void loadOlderEvents();
+		expect(historyCalls).toEqual(["t:7"]);
+		history = () => [];
+	});
+});
+
+describe("reconnecting after deletions", () => {
+	test("drops chats the daemon no longer lists, and their selection", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		await boot();
+		expect(getState().selectedSessionId).toBe("s");
+		sessionLists.push([]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		expect(getState().sessions).toEqual({});
+		expect(getState().selectedSessionId).toBeNull();
+		expect(getState().chat).toBeNull();
+	});
+});
+
+describe("watching sign-ins", () => {
+	test("says so when the watch fails for another reason than a dropped socket", async () => {
+		const shown = spyOn(sonnerToast, "error");
+		await boot();
+		const watch = follows.filter((follow) => follow.name === "watchAgentLogins").at(-1)?.handlers;
+		watch?.onEnd?.(drop);
+		expect(shown).not.toHaveBeenCalled();
+		watch?.onEnd?.(internal);
+		expect(shown).toHaveBeenCalledWith("Sign-in results stopped arriving. Restart Octopus to see them again.");
+		shown.mockRestore();
 	});
 });
