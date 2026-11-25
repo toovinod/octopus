@@ -80,9 +80,9 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 		case "assistant":
 			return <AssistantMessage text={item.text} streaming={item.streaming} />;
 		case "reasoning":
-			return <ThinkingBlock text={item.text} streaming={item.streaming} />;
+			return <ThinkingBlock rowKey={`${sessionId}:${item.key}`} text={item.text} streaming={item.streaming} />;
 		case "tool":
-			return <ToolCard item={item} />;
+			return <ToolCard rowKey={`${sessionId}:${item.key}`} item={item} />;
 		case "approval":
 			return <ApprovalCard item={item} sessionId={sessionId} />;
 		case "plan":
@@ -195,15 +195,37 @@ const AssistantMessage = ({ text, streaming }: { readonly text: string; readonly
 	);
 };
 
+// Rows unmount when they scroll out of view, so a row the user opened or closed keeps that choice here. Until then it
+// follows its default, which can change, as when a running tool fails. Only toggled rows are kept, so it stays small.
+const toggledRows = new Map<string, boolean>();
+
+const useRowOpen = (rowKey: string, byDefault: boolean) => {
+	const [toggled, setToggled] = useState(() => toggledRows.get(rowKey));
+	const open = toggled ?? byDefault;
+	const toggle = () => {
+		toggledRows.set(rowKey, !open);
+		setToggled(!open);
+	};
+	return [open, toggle] as const;
+};
+
 // Collapsed by default: the thinking is there for whoever wants it, and the reply stays the focus.
-const ThinkingBlock = ({ text, streaming }: { readonly text: string; readonly streaming: boolean }) => {
-	const [open, setOpen] = useState(false);
+const ThinkingBlock = ({
+	rowKey,
+	text,
+	streaming,
+}: {
+	readonly rowKey: string;
+	readonly text: string;
+	readonly streaming: boolean;
+}) => {
+	const [open, toggle] = useRowOpen(rowKey, false);
 	const throttled = useThrottledText(text);
 	return (
 		<div className="flex flex-col gap-1.5 text-xs text-muted-foreground">
 			<button
 				type="button"
-				onClick={() => setOpen(!open)}
+				onClick={toggle}
 				className="flex items-center gap-1.5 self-start hover:text-foreground"
 				aria-expanded={open}
 			>
@@ -286,8 +308,14 @@ const TOOL_ICONS = {
 	other: WrenchIcon,
 } as const;
 
-const ToolCard = ({ item }: { readonly item: Extract<ChatItem, { kind: "tool" }> }) => {
-	const [open, setOpen] = useState(item.status === "failed");
+const ToolCard = ({
+	rowKey,
+	item,
+}: {
+	readonly rowKey: string;
+	readonly item: Extract<ChatItem, { kind: "tool" }>;
+}) => {
+	const [open, toggle] = useRowOpen(rowKey, item.status === "failed");
 	const Icon = TOOL_ICONS[item.tool.kind];
 	const detail =
 		item.tool.kind === "fileChange" ? item.tool.changes.map((change) => change.diff).join("\n") : item.output;
@@ -295,7 +323,7 @@ const ToolCard = ({ item }: { readonly item: Extract<ChatItem, { kind: "tool" }>
 		<div className="rounded-lg border border-border bg-card">
 			<button
 				type="button"
-				onClick={() => setOpen(!open)}
+				onClick={toggle}
 				disabled={detail === null || detail === ""}
 				className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs"
 				aria-expanded={open}
