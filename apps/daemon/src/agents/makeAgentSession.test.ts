@@ -1,4 +1,10 @@
-import { type AgentSession, makeAgentSession, TurnWatchdogSettings, unsentNotice } from "./makeAgentSession.ts";
+import {
+	type AgentSession,
+	makeAgentSession,
+	MAX_QUEUED_MESSAGES,
+	TurnWatchdogSettings,
+	unsentNotice,
+} from "./makeAgentSession.ts";
 import { AgentProtocolError, type AgentSessionHandle, type UserMessage } from "./AgentAdapter.ts";
 import type { AgentEvent, QuestionOutcome, PlanOutcome } from "@repo/contracts/AgentEvent";
 import { Deferred, Duration, Effect, Option, Stream } from "effect";
@@ -333,6 +339,23 @@ describe("makeAgentSession plans", () => {
 		expect(result.again).toBe("PlanNotFoundError");
 		expect(answers).toEqual([{ type: "approve", mode: "auto" }]);
 		expect(result.events.map((event) => event.type)).toEqual(["plan.proposed", "plan.resolved"]);
+	});
+
+	test("a message the full queue refuses leaves a waiting plan alone", async () => {
+		const answers: Array<PlanOutcome> = [];
+		const refused = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("start"));
+					yield* Effect.sleep("20 millis");
+					for (let i = 0; i < MAX_QUEUED_MESSAGES; i++) yield* handle.sendMessage(userMessage(`queued ${i}`));
+					yield* proposed(session, answers);
+					return yield* handle.sendMessage(userMessage("one too many")).pipe(Effect.flip);
+				}),
+		);
+		expect(refused._tag).toBe("SessionBusyError");
+		expect(answers).toEqual([]);
 	});
 
 	test("a new message or a stop cancels a waiting plan", async () => {

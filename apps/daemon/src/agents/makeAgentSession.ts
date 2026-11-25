@@ -321,6 +321,9 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						if (events.state._tag !== "Open") return yield* stopped;
 						const running = Option.isSome(yield* Ref.get(currentTurn));
 						const steer = options?.steer && capabilities.steerWhileRunning && running;
+						const busy = new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
+						// Refused before it replaces anything, so a message that cannot run leaves the plan or question waiting.
+						if (!steer && Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) return yield* busy;
 						// A new message replaces an unanswered plan or question, as typing past the prompt does in both CLIs.
 						yield* cancelPlansAndQuestions;
 						// Recorded only once the agent took it, so a rejected steer leaves no message in history
@@ -331,9 +334,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 							if (!(yield* recordMessage(message))) return yield* stopped;
 							return "steered" as const;
 						}
-						if (Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
-							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
-						}
+						if (Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) return yield* busy;
 						Queue.offerUnsafe(inbox, { message, beforeTurn, discard: options?.discard ?? Effect.void });
 						return "queued" as const;
 					}).pipe(Semaphore.withPermit(sendLock)),
