@@ -27,6 +27,10 @@ const sortRuns = (statements: ReadonlyArray<string>) => {
 	return [...sorted, ...run.sort(byLengthThenName)];
 };
 
+// The line that names the module ends the statement, with or without a semicolon or a trailing comment.
+const endsImport = (line: string) =>
+	/(^import\s+|\bfrom\s+)(["'])[^"']*\2(\s+with\s*\{[^}]*\})?\s*;?\s*(\/\/.*|\/\*.*\*\/)?$/.test(line.trim());
+
 const isPreamble = (line: string) =>
 	line.trim() === "" || line.startsWith("#!") || line.startsWith("//") || /^\s*(\/\*|\*)/.test(line);
 
@@ -48,7 +52,9 @@ export const sortImports = (source: string): string => {
 		}
 		if (!line.startsWith("import ")) break;
 		let last = next;
-		while (last < lines.length && !lines[last]?.trimEnd().endsWith(";")) last++;
+		while (last < lines.length && !endsImport(lines[last] ?? "")) last++;
+		// An import the pattern does not understand is left alone rather than guessed at.
+		if (last === lines.length) return source;
 		statements.push(lines.slice(next, last + 1).join("\n"));
 		end = last + 1;
 		next = last + 1;
