@@ -412,6 +412,20 @@ describe("WorkspaceService", () => {
 		expect(result.output.output).toContain(result.created.path);
 	});
 
+	test("a setup script that leaves a child running in the background finishes when the script exits", async () => {
+		const run = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir, "sleep 30 & echo started");
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				const finished = yield* waitForScriptRun(created.id);
+				return { finished, output: workspaces.getScriptRunOutput(finished?.id ?? "").output };
+			}),
+		);
+		expect(run.finished).toMatchObject({ status: "completed", exitCode: 0 });
+		expect(run.output).toContain("started");
+	});
+
 	test("a failing setup script fails at once, without retries", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

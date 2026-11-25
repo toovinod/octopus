@@ -1,5 +1,5 @@
 import { IllegalJobTransitionError, type JobEvent, transitionJob } from "../jobs/transitionJob.ts";
-import { Duration, Effect, PubSub, Schedule, Schema, Stream } from "effect";
+import { Duration, Effect, Fiber, PubSub, Schedule, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
@@ -36,6 +36,8 @@ class ScriptSpawnError extends Schema.TaggedError<ScriptSpawnError>()("ScriptSpa
 		return "The setup script could not be started.";
 	}
 }
+
+const OUTPUT_GRACE = Duration.seconds(1);
 
 type ScriptError = ScriptExitError | ScriptTimeoutError | ScriptSpawnError;
 
@@ -91,13 +93,22 @@ export const executeScript = Effect.fn("executeScript")(
 		const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 		const handle = yield* spawner.spawn(ChildProcess.make(script, { cwd, shell: true }));
 		onSpawn?.(handle.pid);
-		yield* handle.all.pipe(
+		const output = yield* handle.all.pipe(
 			Stream.decodeText(),
 			capLineLength,
 			Stream.splitLines,
 			Stream.runForEach((line) => Effect.sync(() => onLine(line))),
+			Effect.forkScoped,
 		);
 		const exitCode = yield* handle.exitCode;
+		// A child the script left in the background (`server &`) can hold the output open long after the script
+		// exited, so the rest of the output gets a moment, not the run's whole timeout.
+		yield* Fiber.join(output).pipe(
+			Effect.timeoutOrElse({
+				duration: OUTPUT_GRACE,
+				orElse: () => Effect.logInfo("The script exited, but a child it left running still holds its output"),
+			}),
+		);
 		if (exitCode !== 0) {
 			return yield* new ScriptExitError({ exitCode });
 		}
