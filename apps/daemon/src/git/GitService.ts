@@ -6,6 +6,7 @@ import {
 	type DiffHunk,
 	ForkPullRequestError,
 	ForkPushTargetMissingError,
+	ForkPushNotAllowedError,
 	GitStatus,
 	NoRemoteError,
 	NothingToCommitError,
@@ -398,6 +399,10 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 				const merge = yield* config("merge");
 				if (remote === "" || merge === "") {
 					return yield* new ForkPushTargetMissingError({ branch: current.branch });
+				}
+				// `gh pr checkout` pulls the pull request's head when the fork keeps maintainers out, and no push lands there.
+				if (merge.startsWith("refs/pull/")) {
+					return yield* new ForkPushNotAllowedError({ branch: current.branch });
 				}
 				push = [...hooks, "push", remote, `refs/heads/${current.branch}:${merge}`];
 			} else {

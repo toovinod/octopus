@@ -5,6 +5,7 @@ import {
 	DiffFile,
 	ForkPullRequestError,
 	ForkPushTargetMissingError,
+	ForkPushNotAllowedError,
 	GhNotAuthenticatedError,
 	GhNotInstalledError,
 	GitStatus,
@@ -35,6 +36,7 @@ const PushError = [
 	BranchChangedError,
 	NoRemoteError,
 	ForkPushTargetMissingError,
+	ForkPushNotAllowedError,
 	PushRejectedError,
 	PushFailedError,
 ] as const;

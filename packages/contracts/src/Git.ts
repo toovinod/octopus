@@ -106,6 +106,14 @@ export class ForkPushTargetMissingError extends Schema.TaggedError<ForkPushTarge
 	}
 }
 
+export class ForkPushNotAllowedError extends Schema.TaggedError<ForkPushNotAllowedError>()("ForkPushNotAllowedError", {
+	branch: Schema.String,
+}) {
+	override get message() {
+		return `${this.branch} holds a pull request from a fork that does not let maintainers push to it. Ask its author to allow edits by maintainers, then check it out again with \`gh pr checkout\`.`;
+	}
+}
+
 export class ForkPullRequestError extends Schema.TaggedError<ForkPullRequestError>()("ForkPullRequestError", {
 	branch: Schema.String,
 }) {

@@ -722,6 +722,18 @@ describe("GitService in a fork's workspace", () => {
 		expect(result.createError._tag).toBe("ForkPullRequestError");
 	});
 
+	test("refuses to push a fork's branch that pulls the pull request's head, since the fork takes no pushes", async () => {
+		const error = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const git = yield* GitService;
+				const { created } = yield* forkWorkspace(tempDir);
+				yield* runGit(join(tempDir, "repo"), ["config", "branch.feature.merge", "refs/pull/7/head"]);
+				return yield* Effect.flip(git.push(created.id));
+			}),
+		);
+		expect(error._tag).toBe("ForkPushNotAllowedError");
+	});
+
 	test("merges a fork's pull request and keeps its branch without an error", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
