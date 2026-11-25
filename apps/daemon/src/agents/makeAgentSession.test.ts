@@ -25,7 +25,7 @@ const runQuietAgent = <A>(
 		const session = yield* makeAgentSession(capabilities);
 		const handle = yield* session.start({
 			startTurn: () => Effect.void,
-			steerTurn: () => Effect.void,
+			steerTurn: () => Effect.succeed(true),
 			interruptTurn: onInterrupt(session),
 			updateSettings: () => Effect.void,
 			listCommands: Effect.succeed([]),
@@ -82,7 +82,7 @@ describe("makeAgentSession turn watchdog", () => {
 			const session = yield* makeAgentSession(capabilities);
 			const handle: AgentSessionHandle = yield* session.start({
 				startTurn: () => Effect.fail(new AgentProtocolError({ message: "rejected", cause: null })),
-				steerTurn: () => Effect.void,
+				steerTurn: () => Effect.succeed(true),
 				interruptTurn: Effect.void,
 				updateSettings: () => Effect.void,
 				listCommands: Effect.succeed([]),

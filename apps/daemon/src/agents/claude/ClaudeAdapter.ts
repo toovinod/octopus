@@ -814,7 +814,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.
 					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
-					steerTurn: sendMessage,
+					steerTurn: (message) => Effect.as(sendMessage(message), true),
 					updateSettings: ({ model, effort, mode }) =>
 						Effect.tryPromise({
 							try: async () => {

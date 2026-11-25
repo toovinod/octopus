@@ -977,7 +977,7 @@ describe("SessionService", () => {
 					yield* session.setNativeSessionId("thread-auth");
 					return yield* session.start({
 						startTurn: () => session.fail(new AgentAuthError({ agent: "codex", cause: "401 Unauthorized" })),
-						steerTurn: () => Effect.void,
+						steerTurn: () => Effect.succeed(true),
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
 						listCommands: Effect.succeed([]),

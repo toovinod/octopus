@@ -26,7 +26,6 @@ import {
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
-	AgentProtocolError,
 	CodexVersionMismatchError,
 	type SessionSettings,
 	type StartSessionInput,
@@ -690,17 +689,14 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
 							const state = yield* Ref.get(currentTurn);
-							if (state._tag !== "running") {
-								return yield* new AgentProtocolError({
-									message: "Codex has not started the turn yet, so it cannot be steered.",
-									cause: null,
-								});
-							}
+							// Codex steers only a turn it has named, so earlier the message waits for its own turn.
+							if (state._tag !== "running") return false;
 							yield* client.request("turn/steer", {
 								threadId,
 								input: yield* toInput(message),
 								expectedTurnId: state.turnId,
 							} satisfies TurnSteerParams);
+							return true;
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
 					listCommands: Effect.map(listSkills, (skills) =>

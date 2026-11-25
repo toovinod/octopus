@@ -246,6 +246,20 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } });
 	});
 
+	test("a steer sent before Codex names the turn waits for its own turn", async () => {
+		const [sent, events] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("slow"));
+				yield* Effect.sleep("50 millis");
+				const sent = yield* handle.sendMessage(userMessage("hi"), { steer: true });
+				yield* takeUntil(handle, "turn.completed");
+				return [sent, yield* takeUntil(handle, "turn.completed")] as const;
+			}),
+		);
+		expect(sent).toBe("queued");
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
+	});
+
 	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {

@@ -70,7 +70,8 @@ type RespondToQuestions = (outcome: QuestionOutcome) => Effect.Effect<void, Agen
 // the event buffer, turn queue, pending approvals and the native id.
 export interface TurnDriver {
 	startTurn(message: UserMessage): Effect.Effect<void, AgentError>;
-	steerTurn(message: UserMessage): Effect.Effect<void, AgentError>;
+	// False when the agent has no turn it can take the message into right now, so it waits for its own turn.
+	steerTurn(message: UserMessage): Effect.Effect<boolean, AgentError>;
 	readonly interruptTurn: Effect.Effect<void, AgentError>;
 	updateSettings(settings: SessionSettings): Effect.Effect<void, AgentError>;
 	readonly listCommands: Effect.Effect<ReadonlyArray<AgentCommand>, AgentError>;
@@ -272,12 +273,14 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 							text: message.text,
 							attachments: message.images.map(({ id, mediaType }) => ({ id, mediaType })),
 						});
-						if (steer) {
-							// Recorded only once the agent took it, so a rejected steer leaves no message in history
-							// that the agent never saw, and the caller can safely drop its images.
-							yield* driver.steerTurn(message);
+						// Recorded only once the agent took it, so a rejected steer leaves no message in history
+						// that the agent never saw, and the caller can safely drop its images.
+						if (steer && (yield* driver.steerTurn(message))) {
 							yield* recordMessage;
 							return "steered" as const;
+						}
+						if (Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
+							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
 						}
 						yield* recordMessage;
 						Queue.offerUnsafe(inbox, message);
