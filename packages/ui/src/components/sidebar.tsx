@@ -90,9 +90,6 @@ function SidebarProvider({
     return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open)
   }, [isMobile, setOpen, setOpenMobile])
 
-  // No global Cmd/Ctrl+B shortcut: Octopus's sidebar never collapses, and Ctrl+B moves the cursor back in macOS
-  // text fields, so the shadcn handler only swallowed the key.
-
   // We add a state so that we can do data-state="expanded" or "collapsed".
   // This makes it easier to style the sidebar with Tailwind classes.
   const state = open ? "expanded" : "collapsed"

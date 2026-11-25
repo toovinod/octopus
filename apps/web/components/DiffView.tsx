@@ -44,13 +44,13 @@ const WORKING_RELOAD_MS = 5000;
 // Comments outlive the panel, so switching tabs and back keeps them until they are sent.
 const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
 
-// Says whether a line number is picked or has a comment, and picks it on click.
 // Which files the commit takes. Every file starts ticked.
 interface FileSelection {
 	readonly included: (path: string) => boolean;
 	readonly onChange: (path: string, included: boolean) => void;
 }
 
+// Says whether a line number is picked or has a comment, and picks it on click.
 interface LinePicking {
 	readonly onPick: (range: LineRange, extend: boolean) => void;
 	readonly marked: (path: string, side: DiffSide, line: number | null) => boolean;
