@@ -37,7 +37,7 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
-import { makeProcessId } from "./makeProcessId.ts";
+import { makeUniqueId } from "./makeUniqueId.ts";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
 // down instead of growing memory.
@@ -242,7 +242,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	);
 
 	// A turn the agent never named gets a fresh id, so the chat shows each failure as its own notice.
-	const syntheticTurnId = Effect.map(makeProcessId, (id) => `octopus-${id}`);
+	const syntheticTurnId = Effect.map(makeUniqueId, (id) => `octopus-${id}`);
 
 	const failTurn = (error: AgentError) =>
 		Effect.flatMap(syntheticTurnId, (turnId) =>
