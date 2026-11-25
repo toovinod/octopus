@@ -4,7 +4,18 @@ import { Predicate } from "effect";
 
 const project = { id: "p", name: "app", path: "/app", defaultBranch: "main", trusted: false };
 const workspace = { id: "w", projectId: "p", status: "active", kind: "worktree", name: "fix", path: "/app-fix" };
-const session = { id: "s", workspaceId: "w", agent: "claude", status: "idle", createdAt: "1", updatedAt: "1" };
+const session = {
+	id: "s",
+	workspaceId: "w",
+	agent: "claude",
+	status: "idle",
+	model: "replay",
+	effort: null,
+	mode: "default",
+	title: null,
+	createdAt: "1",
+	updatedAt: "1",
+};
 
 const drop = { _tag: "RpcClientError", message: "SocketCloseError: closed" };
 const internal = { _tag: "DaemonInternalError", message: "Octopus could not list chats." };
@@ -19,7 +30,16 @@ let agentLists = 0;
 // Every stream the store follows, newest last.
 const follows: Array<{ readonly name: string; readonly handlers: Follow<unknown> }> = [];
 
+// Each settings or rename call waits for the test to settle it.
+let settleUpdate: (outcome: unknown) => void = () => {};
+const pendingUpdate = () =>
+	new Promise((resolve, reject) => {
+		settleUpdate = (outcome) => (Predicate.hasProperty(outcome, "_tag") ? reject(outcome) : resolve(outcome));
+	});
+
 const daemon = {
+	updateSessionSettings: pendingUpdate,
+	renameSession: pendingUpdate,
 	listProjects: () => {
 		listCalls++;
 		const failure = listFailures.shift();
@@ -70,8 +90,10 @@ const {
 	reconnectDelay,
 	removeProject,
 	retryFailedSend,
+	renameSession,
 	revertToMessage,
 	sendMessage,
+	updateSessionSettings,
 } = await import("./store.ts");
 
 // After the import, since sonner skips injecting its styles only when there is no document. boot sets the root font
@@ -189,5 +211,28 @@ describe("signing in", () => {
 		await sleep(0);
 		expect(watch).toBeDefined();
 		expect(agentLists).toBe(before + 1);
+	});
+});
+
+describe("session changes", () => {
+	const running = { ...session, status: "running", updatedAt: "3" };
+
+	test("a refused change undoes only its own fields, keeping a newer status", async () => {
+		await boot();
+		const change = updateSessionSettings("s", { mode: "plan" });
+		expect(getState().sessions.s?.mode).toBe("plan");
+		lastWatch()?.onItem(running);
+		settleUpdate({ _tag: "DaemonInternalError", message: "Octopus could not save the settings." });
+		await change;
+		expect(getState().sessions.s).toMatchObject({ status: "running", mode: "default" });
+	});
+
+	test("a reply older than a watch update does not step the session back", async () => {
+		await boot();
+		const rename = renameSession("s", "Fix the build");
+		lastWatch()?.onItem({ ...running, title: "Fix the build" });
+		settleUpdate({ ...session, status: "idle", title: "Fix the build", updatedAt: "2" });
+		await rename;
+		expect(getState().sessions.s).toMatchObject({ status: "running", title: "Fix the build" });
 	});
 });

@@ -339,7 +339,11 @@ export const setProjectTrust = async (projectId: string, trusted: boolean) => {
 	// Optimistic: the switch moves at once and moves back if the daemon refuses.
 	setState((current) => ({ projects: { ...current.projects, [projectId]: { ...before, trusted } } }));
 	const saved = await attempt(() => callDaemon((daemon) => daemon.setProjectTrust({ projectId, trusted })));
-	setState((current) => ({ projects: { ...current.projects, [projectId]: saved ?? before } }));
+	setState((current) => {
+		const now = current.projects[projectId];
+		if (now === undefined) return {};
+		return { projects: { ...current.projects, [projectId]: saved ?? { ...now, trusted: before.trusted } } };
+	});
 };
 
 export const updateProjectScripts = async (projectId: string, setupScript: string | null, runScript: string | null) => {
@@ -469,6 +473,16 @@ export const newChat = async (
 	return session.id;
 };
 
+// A reply can land after a newer watch update, so it never steps the session back. A refusal undoes only the
+// fields the change touched, keeping status updates that arrived meanwhile.
+const settleSession = (sessionId: string, saved: AgentSession | null, undo: Partial<AgentSession>) =>
+	setState((current) => {
+		const now = current.sessions[sessionId];
+		if (now === undefined) return {};
+		if (saved !== null && saved.updatedAt < now.updatedAt) return {};
+		return { sessions: { ...current.sessions, [sessionId]: saved ?? { ...now, ...undo } } };
+	});
+
 export const renameSession = async (sessionId: string, title: string) => {
 	const before = state.sessions[sessionId];
 	if (before === undefined) return;
@@ -476,7 +490,7 @@ export const renameSession = async (sessionId: string, title: string) => {
 		sessions: { ...current.sessions, [sessionId]: { ...before, title: title.trim() || null } },
 	}));
 	const saved = await attempt(() => callDaemon((daemon) => daemon.renameSession({ sessionId, title })));
-	setState((current) => ({ sessions: { ...current.sessions, [sessionId]: saved ?? before } }));
+	settleSession(sessionId, saved, { title: before.title });
 };
 
 // For the composer's suggestions. Null when the call failed, after a toast says why.
@@ -501,7 +515,7 @@ export const updateSessionSettings = async (
 	const saved = await attempt(() =>
 		callDaemon((daemon) => daemon.updateSessionSettings({ sessionId, model, effort, mode })),
 	);
-	setState((current) => ({ sessions: { ...current.sessions, [sessionId]: saved ?? before } }));
+	settleSession(sessionId, saved, { model: before.model, effort: before.effort, mode: before.mode });
 };
 
 // Closing a tab only hides the chat. A running agent keeps working in the background, its chat stays in the
