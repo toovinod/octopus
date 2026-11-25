@@ -1,9 +1,9 @@
 import { type AgentSession, makeAgentSession, TurnWatchdogSettings } from "./makeAgentSession.ts";
-import type { AgentEvent } from "@repo/contracts/AgentEvent";
+import type { AgentEvent, PlanOutcome } from "@repo/contracts/AgentEvent";
 import type { AgentSessionHandle } from "./AgentAdapter.ts";
+import { Duration, Effect, Option, Stream } from "effect";
 import { userMessage } from "../testing/userMessage.ts";
 import { describe, expect, test } from "bun:test";
-import { Duration, Effect, Stream } from "effect";
 
 const capabilities = {
 	resume: false,
@@ -102,5 +102,66 @@ describe("makeAgentSession turn watchdog", () => {
 				}),
 		);
 		expect(results).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } }]);
+	});
+});
+
+describe("makeAgentSession plans", () => {
+	const plan = { requestId: "plan-1", itemId: "plan-1", text: "1. Add tests", choices: ["auto", "ask"] } as const;
+
+	const proposed = (session: AgentSession, answers: Array<PlanOutcome>) =>
+		session.proposePlan(plan, (outcome) =>
+			Effect.sync(() => {
+				answers.push(outcome);
+				return outcome.type === "approve" ? Option.some("Implement the plan.") : Option.none();
+			}),
+		);
+
+	const planEvents = (handle: AgentSessionHandle, count: number) =>
+		handle.events.pipe(
+			Stream.filter((event) => event.type === "plan.proposed" || event.type === "plan.resolved"),
+			Stream.take(count),
+			Stream.runCollect,
+		);
+
+	test("answers a plan once, returns the agent's next message, and refuses a mode it did not offer", async () => {
+		const answers: Array<PlanOutcome> = [];
+		const result = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* proposed(session, answers);
+					const refused = yield* handle
+						.respondToPlan("plan-1", { type: "approve", mode: "fullAccess" })
+						.pipe(Effect.flip);
+					const next = yield* handle.respondToPlan("plan-1", { type: "approve", mode: "auto" });
+					const again = yield* handle.respondToPlan("plan-1", { type: "approve", mode: "auto" }).pipe(Effect.flip);
+					return { refused: refused._tag, next, again: again._tag, events: yield* planEvents(handle, 2) };
+				}),
+		);
+		expect(result.refused).toBe("ApprovalChoiceError");
+		expect(result.next).toEqual(Option.some("Implement the plan."));
+		expect(result.again).toBe("PlanNotFoundError");
+		expect(answers).toEqual([{ type: "approve", mode: "auto" }]);
+		expect(result.events.map((event) => event.type)).toEqual(["plan.proposed", "plan.resolved"]);
+	});
+
+	test("a new message or a stop cancels a waiting plan", async () => {
+		const answers: Array<PlanOutcome> = [];
+		const events = await runQuietAgent(
+			(session) => session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }),
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* proposed(session, answers);
+					yield* handle.sendMessage(userMessage("actually, use a queue"));
+					yield* proposed(session, answers);
+					yield* handle.interrupt;
+					return yield* planEvents(handle, 4);
+				}),
+		);
+		expect(answers).toEqual([{ type: "cancelled" }, { type: "cancelled" }]);
+		expect(events.filter((event) => event.type === "plan.resolved")).toEqual([
+			{ type: "plan.resolved", requestId: "plan-1", outcome: { type: "cancelled" } },
+			{ type: "plan.resolved", requestId: "plan-1", outcome: { type: "cancelled" } },
+		]);
 	});
 });

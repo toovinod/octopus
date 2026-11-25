@@ -6,7 +6,7 @@ import type {
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
-import { ConfigProvider, Effect, Fiber, Layer, Redacted, Stream } from "effect";
+import { ConfigProvider, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
@@ -193,6 +193,33 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						controller.abort();
 						const result = await permission;
 						if (result) permissions.push(result);
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("plan the work")) {
+						// Claude Code passes the plan file's contents in the tool's input.
+						const input = { plan: "1. Add tests\n2. Fix the bug", planFilePath: "/home/.claude/plans/fix.md" };
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_p", content: [{ type: "tool_use", id: "toolu_p", name: "ExitPlanMode", input }] },
+						};
+						const permission = await options.canUseTool?.("ExitPlanMode", input, {
+							signal: new AbortController().signal,
+							toolUseID: "toolu_p",
+							requestId: "req_p",
+						});
+						if (!permission) return;
+						permissions.push(permission);
+						if (permission.behavior === "allow") {
+							yield {
+								type: "user",
+								parent_tool_use_id: null,
+								message: {
+									content: [{ type: "tool_result", tool_use_id: "toolu_p", content: "User has approved your plan." }],
+								},
+							};
+						}
 						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
 						continue;
 					}
@@ -472,6 +499,61 @@ describe("ClaudeAdapter", () => {
 		]);
 	});
 
+	test("shows ExitPlanMode as a plan, and approving it switches the mode as Claude Code's plan prompt does", async () => {
+		const permissions: Array<PermissionResult> = [];
+		const [proposed, next, rest] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("plan the work"));
+					const before = yield* takeUntil(handle, "plan.proposed");
+					const next = yield* handle.respondToPlan("toolu_p", { type: "approve", mode: "acceptEdits" });
+					return [
+						before.filter((event) => event.type !== "message.delta"),
+						next,
+						yield* takeUntil(handle, "turn.completed"),
+					];
+				}),
+			{ permissions, input: { ...newSession, trustProjectSettings: true } },
+		);
+		expect(proposed.filter((event) => event.type === "tool.started")).toEqual([]);
+		expect(proposed.at(-1)).toEqual({
+			type: "plan.proposed",
+			requestId: "toolu_p",
+			itemId: "toolu_p",
+			text: "1. Add tests\n2. Fix the bug",
+			choices: ["auto", "acceptEdits", "ask", "fullAccess"],
+		});
+		expect(next).toEqual(Option.none());
+		expect(rest).toEqual([
+			{ type: "plan.resolved", requestId: "toolu_p", outcome: { type: "approve", mode: "acceptEdits" } },
+			{ type: "turn.completed", turnId: "result-1", result: { status: "completed" } },
+		]);
+		expect(permissions).toEqual([
+			{
+				behavior: "allow",
+				updatedInput: { plan: "1. Add tests\n2. Fix the bug", planFilePath: "/home/.claude/plans/fix.md" },
+				updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+			},
+		]);
+	});
+
+	test("keeps Claude planning with the user's feedback, and offers no full access on an untrusted project", async () => {
+		const permissions: Array<PermissionResult> = [];
+		const choices = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("plan the work"));
+					const proposed = (yield* takeUntil(handle, "plan.proposed")).at(-1);
+					yield* handle.respondToPlan("toolu_p", { type: "revise", feedback: "Use a queue instead." });
+					yield* takeUntil(handle, "turn.completed");
+					return proposed?.type === "plan.proposed" ? proposed.choices : [];
+				}),
+			{ permissions },
+		);
+		expect(choices).toEqual(["auto", "acceptEdits", "ask"]);
+		expect(permissions).toEqual([{ behavior: "deny", message: "Use a queue instead." }]);
+	});
+
 	test("rejects allowForSession when the SDK offers no session rule", async () => {
 		const error = await runSession((handle) =>
 			Effect.gen(function* () {
@@ -588,6 +670,7 @@ describe("ClaudeAdapter", () => {
 		await runSession(() => Effect.void);
 		expect(startedWith.at(-1)?.settingSources).toEqual(["user"]);
 		expect(startedWith.at(-1)?.permissionMode).toBe("default");
+		expect(startedWith.at(-1)?.allowDangerouslySkipPermissions).toBe(false);
 	});
 
 	test("loads project settings only when the project is trusted", async () => {
@@ -596,6 +679,8 @@ describe("ClaudeAdapter", () => {
 		});
 		expect(startedWith.at(-1)?.settingSources).toEqual(["user", "project", "local"]);
 		expect(startedWith.at(-1)?.permissionMode).toBe("default");
+		// So Full access can be picked later in the chat, or to build an approved plan.
+		expect(startedWith.at(-1)?.allowDangerouslySkipPermissions).toBe(true);
 	});
 
 	test("runs the configured claude instead of the SDK's bundled one", async () => {

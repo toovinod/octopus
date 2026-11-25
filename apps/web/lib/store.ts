@@ -10,8 +10,8 @@ import {
 import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession } from "@repo/contracts/AgentSession";
 import { applyEvents, type ChatState, emptyChat, prependEvents } from "./chatReducer.ts";
 import { callDaemon, errorMessage, errorTag, followDaemon } from "./daemonRuntime.ts";
+import type { ApprovalDecision, PlanAnswer } from "@repo/contracts/AgentEvent";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
-import type { ApprovalDecision } from "@repo/contracts/AgentEvent";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { playChime, showNotification } from "./desktop.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
@@ -593,6 +593,9 @@ export const revertToMessage = async (sessionId: string, messageId: string) => {
 	}
 	return true;
 };
+
+export const respondToPlan = (sessionId: string, requestId: string, answer: PlanAnswer) =>
+	attempt(() => callDaemon((daemon) => daemon.respondToPlan({ sessionId, requestId, answer })));
 
 export const interruptSession = (sessionId: string) =>
 	attempt(() => callDaemon((daemon) => daemon.interruptSession({ sessionId })));

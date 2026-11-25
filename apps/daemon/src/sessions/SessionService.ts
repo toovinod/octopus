@@ -4,6 +4,7 @@ import {
 	AgentInfo,
 	type AgentKind,
 	type AgentLoginResult,
+	type AgentMode,
 	AgentSession,
 	type AgentSessionStatus,
 	AgentUnavailableError,
@@ -12,6 +13,7 @@ import {
 	AuthModeNotAllowedError,
 	LoginNotPendingError,
 	ModeNotAllowedError,
+	PlanNotFoundError,
 	type ImageData,
 	ImageMediaType,
 	ImagesNotSupportedError,
@@ -59,10 +61,10 @@ import {
 	restoreCheckpoint,
 	saveCheckpoint,
 } from "../checkpoints/workspaceCheckpoints.ts";
+import { AgentEvent, type ApprovalDecision, isLiveOnly, type PlanAnswer } from "@repo/contracts/AgentEvent";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
 import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { CheckpointNotFoundError, WorkspaceAgentsBusyError } from "@repo/contracts/Checkpoint";
-import { AgentEvent, type ApprovalDecision, isLiveOnly } from "@repo/contracts/AgentEvent";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "@repo/contracts/Workspace";
 import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
 import { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
@@ -273,6 +275,13 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					runtime.approvals.add(event.requestId);
 					break;
 				case "approval.resolved":
+					runtime.approvals.delete(event.requestId);
+					break;
+				// A plan waits on the user like an approval does, so the chat shows it needs them.
+				case "plan.proposed":
+					runtime.approvals.add(event.requestId);
+					break;
+				case "plan.resolved":
 					runtime.approvals.delete(event.requestId);
 					break;
 				case "turn.completed":
@@ -645,6 +654,25 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.respondToApproval(requestId, decision);
 		});
 
+		// Approving switches the chat to the chosen mode. An agent that waits for a message after its plan, as
+		// Codex does, then gets the one its own CLI sends.
+		const respondToPlan = Effect.fn("SessionService.respondToPlan")(function* (
+			sessionId: string,
+			requestId: string,
+			answer: PlanAnswer,
+		) {
+			const row = yield* getRow(sessionId);
+			const runtime = runtimes.get(sessionId);
+			if (runtime === undefined) return yield* new PlanNotFoundError({ requestId });
+			// Checked first, so a refused mode leaves the plan waiting for another answer.
+			if (answer.type === "approve") yield* checkModeAllowed(row, answer.mode);
+			const next = yield* runtime.handle.respondToPlan(requestId, answer);
+			if (answer.type === "approve") {
+				yield* updateSettings(sessionId, { model: row.model, effort: row.effort, mode: answer.mode });
+			}
+			if (Option.isSome(next)) yield* sendMessage(sessionId, next.value, [], false);
+		});
+
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
 			const runtime = runtimes.get(sessionId);
 			if (runtime === undefined) {
@@ -762,24 +790,31 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return session;
 		});
 
+		const checkModeAllowed = Effect.fnUntraced(function* (
+			row: { readonly agent: AgentKind; readonly workspaceId: string },
+			mode: AgentMode,
+		) {
+			if (!adapters[row.agent].capabilities.modes.includes(mode)) {
+				return yield* new ModeNotAllowedError({ agent: row.agent, mode, reason: "notOffered" });
+			}
+			if (mode === "fullAccess") {
+				const target = yield* workspaceTrust(row.workspaceId);
+				if (!target.trusted) {
+					return yield* new ModeNotAllowedError({
+						agent: row.agent,
+						mode,
+						reason: target.fromFork ? "fork" : "untrustedProject",
+					});
+				}
+			}
+		});
+
 		const updateSettings = Effect.fn("SessionService.updateSettings")(function* (
 			sessionId: string,
 			settings: SessionSettings,
 		) {
 			const row = yield* getRow(sessionId);
-			if (!adapters[row.agent].capabilities.modes.includes(settings.mode)) {
-				return yield* new ModeNotAllowedError({ agent: row.agent, mode: settings.mode, reason: "notOffered" });
-			}
-			if (settings.mode === "fullAccess") {
-				const target = yield* workspaceTrust(row.workspaceId);
-				if (!target.trusted) {
-					return yield* new ModeNotAllowedError({
-						agent: row.agent,
-						mode: settings.mode,
-						reason: target.fromFork ? "fork" : "untrustedProject",
-					});
-				}
-			}
+			yield* checkModeAllowed(row, settings.mode);
 			// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
 			const runtime = runtimes.get(sessionId);
 			if (runtime !== undefined) {
@@ -1047,6 +1082,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					workspaceLock.starting(row.workspaceId, revertToMessage(sessionId, messageId)),
 				),
 			respondToApproval,
+			// It can send the next message, so like sendMessage it may not race an archive.
+			respondToPlan: (...args: Parameters<typeof respondToPlan>) =>
+				Effect.flatMap(getRow(args[0]), (row) => workspaceLock.starting(row.workspaceId, respondToPlan(...args))),
 			interrupt,
 			stop,
 			stopWorkspace,

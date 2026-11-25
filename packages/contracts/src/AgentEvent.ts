@@ -10,6 +10,17 @@ export type ApprovalDecision = typeof ApprovalDecision.Type;
 export const ApprovalOutcome = Schema.Union([ApprovalDecision, Schema.Literal("cancelled")]);
 export type ApprovalOutcome = typeof ApprovalOutcome.Type;
 
+// The user's answer to a plan: build it in one of the offered modes, or keep planning with feedback.
+export const PlanAnswer = Schema.Union([
+	Schema.Struct({ type: Schema.Literal("approve"), mode: AgentMode }),
+	Schema.Struct({ type: Schema.Literal("revise"), feedback: Schema.String }),
+]);
+export type PlanAnswer = typeof PlanAnswer.Type;
+
+// Cancelled when the turn was stopped or the user sent a new message instead of answering.
+export const PlanOutcome = Schema.Union([...PlanAnswer.members, Schema.Struct({ type: Schema.Literal("cancelled") })]);
+export type PlanOutcome = typeof PlanOutcome.Type;
+
 export const FileChange = Schema.Struct({
 	path: Schema.String,
 	kind: Schema.Literals(["add", "delete", "update"]),
@@ -125,6 +136,20 @@ export const AgentEvent = Schema.Union([
 		type: Schema.Literal("turn.completed"),
 		turnId: Schema.String,
 		result: TurnResult,
+	}),
+	// A plan from plan mode, waiting for the user to approve it or ask for changes. choices are the
+	// modes the user may build it in.
+	Schema.Struct({
+		type: Schema.Literal("plan.proposed"),
+		requestId: Schema.String,
+		itemId: Schema.String,
+		text: Schema.String,
+		choices: Schema.Array(AgentMode),
+	}),
+	Schema.Struct({
+		type: Schema.Literal("plan.resolved"),
+		requestId: Schema.String,
+		outcome: PlanOutcome,
 	}),
 	// The agent changed its own mode, as Claude does when the user approves a plan.
 	Schema.Struct({

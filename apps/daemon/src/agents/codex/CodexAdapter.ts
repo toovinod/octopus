@@ -32,16 +32,16 @@ import {
 	type UserMessage,
 } from "../AgentAdapter.ts";
 import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
+import { Context, Effect, Exit, FiberHandle, Layer, Option, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
+import type { ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import type { LoginAccountParams } from "./generated/v2/LoginAccountParams.ts";
 import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.ts";
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.ts";
-import type { ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import type { GetAccountParams } from "./generated/v2/GetAccountParams.ts";
 import type { SkillsListParams } from "./generated/v2/SkillsListParams.ts";
 import type { ModelListParams } from "./generated/v2/ModelListParams.ts";
@@ -73,8 +73,8 @@ const capabilities: AgentCapabilities = {
 	// Codex asks MCP questions through elicitation requests, which Octopus declines for now.
 	mcpApprovals: false,
 	steerWhileRunning: true,
-	// This Codex cannot switch a thread to plan mode from a client, so plan is not offered.
-	modes: ["auto", "readOnly", "ask", "fullAccess"],
+	// Plan mode is Codex's plan collaboration mode, part of its experimental app-server API.
+	modes: ["auto", "readOnly", "ask", "fullAccess", "plan"],
 };
 
 const workspaceWrite: SandboxPolicy = {
@@ -162,7 +162,8 @@ const checkVersion = Effect.fn("CodexAdapter.checkVersion")(function* (executabl
 const initialize = Effect.fn("CodexAdapter.initialize")(function* (client: CodexRpcClient) {
 	yield* client.request("initialize", {
 		clientInfo: { name: "octopus", title: "Octopus", version: packageJson.version },
-		capabilities: { experimentalApi: false, requestAttestation: false },
+		// Plan mode and its collaboration mode setting are only in the experimental API.
+		capabilities: { experimentalApi: true, requestAttestation: false },
 	} satisfies InitializeParams);
 	yield* client.notify("initialized");
 });
@@ -201,9 +202,36 @@ const isAuthFailure = (error: { readonly message: string; readonly codexErrorInf
 
 const reasoningPartSeparator = "\n\n";
 
+// What Codex's own "Yes, implement this plan" sends.
+const IMPLEMENT_PLAN = "Implement the plan.";
+
+// The modes a plan may be built in. Full access needs a trusted project.
+const buildModes = (trusted: boolean): ReadonlyArray<AgentMode> =>
+	(["auto", "ask", "fullAccess"] as const).filter(
+		(mode) => capabilities.modes.includes(mode) && (trusted || mode !== "fullAccess"),
+	);
+
+// Codex waits for the next message after a plan. Approving sends Codex's own implement message, and
+// feedback goes as the next plan message.
+const respondToPlan = (outcome: PlanOutcome) =>
+	Effect.succeed(
+		outcome.type === "approve"
+			? Option.some(IMPLEMENT_PLAN)
+			: outcome.type === "revise" && outcome.feedback.trim() !== ""
+				? Option.some(outcome.feedback)
+				: Option.none(),
+	);
+
+// The plan of the running turn. It is offered once the turn completes, as Codex's own prompt is.
+interface PlanTracking {
+	readonly turnPlan: Ref.Ref<Option.Option<{ readonly id: string; readonly text: string }>>;
+	readonly choices: ReadonlyArray<AgentMode>;
+}
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
 	currentTurn: Ref.Ref<TurnState>,
+	plans: PlanTracking,
 	method: string,
 	params: unknown,
 ) {
@@ -246,6 +274,9 @@ const handleNotification = Effect.fnUntraced(function* (
 		}
 		case "item/completed": {
 			const { item } = yield* decodeCodex(ItemNotification)(params);
+			if (item.type === "plan" && "text" in item) {
+				return yield* Ref.set(plans.turnPlan, Option.some({ id: item.id, text: item.text }));
+			}
 			if (item.type === "agentMessage" && "text" in item) {
 				return yield* session.emit({
 					type: "message.completed",
@@ -275,10 +306,11 @@ const handleNotification = Effect.fnUntraced(function* (
 		case "turn/completed": {
 			const { turn } = yield* decodeCodex(TurnCompleted)(params);
 			yield* Ref.set(currentTurn, idle);
+			const plan = yield* Ref.getAndSet(plans.turnPlan, Option.none());
 			if (turn.status === "failed" && turn.error !== null && isAuthFailure(turn.error)) {
 				return yield* new AgentAuthError({ agent: "codex", cause: turn.error });
 			}
-			return yield* session.emit({
+			yield* session.emit({
 				type: "turn.completed",
 				turnId: turn.id,
 				result:
@@ -291,6 +323,12 @@ const handleNotification = Effect.fnUntraced(function* (
 								}
 							: { status: "completed" },
 			});
+			// A stopped or failed turn offers no plan, as in Codex's own prompt.
+			if (turn.status !== "completed" || Option.isNone(plan)) return;
+			return yield* session.proposePlan(
+				{ requestId: plan.value.id, itemId: plan.value.id, text: plan.value.text, choices: plans.choices },
+				respondToPlan,
+			);
 		}
 		case "thread/tokenUsage/updated": {
 			const { tokenUsage } = yield* decodeCodex(TokenUsageUpdated)(params);
@@ -494,6 +532,10 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
 				const currentTurn = yield* Ref.make(idle);
+				const plans: PlanTracking = {
+					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
+					choices: buildModes(input.trustProjectSettings),
+				};
 				// Sent with every turn, so a change applies from the next one.
 				const settings = yield* Ref.make<SessionSettings>({
 					model: input.model,
@@ -511,7 +553,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				yield* client.incoming.pipe(
 					Stream.runForEach((message) =>
 						message._tag === "notification"
-							? handleNotification(session, currentTurn, message.method, message.params)
+							? handleNotification(session, currentTurn, plans, message.method, message.params)
 							: handleServerRequest(session, client, message),
 					),
 					Effect.andThen(session.end),
@@ -581,12 +623,19 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							const threadId = yield* session.nativeSessionId;
 							const { model, effort, mode } = yield* Ref.get(settings);
 							yield* Ref.set(currentTurn, { _tag: "starting", interruptRequested: false });
+							yield* Ref.set(plans.turnPlan, Option.none());
 							const { turn } = yield* client
 								.request("turn/start", {
 									threadId,
 									model,
 									effort,
 									...turnPolicies[mode],
+									// Sent every turn, so leaving plan mode is as explicit as entering it. Null instructions
+									// use Codex's built-in ones for the mode.
+									collaborationMode: {
+										mode: mode === "plan" ? "plan" : "default",
+										settings: { model, reasoning_effort: effort, developer_instructions: null },
+									},
 									input: yield* toInput(message),
 								} satisfies TurnStartParams)
 								.pipe(

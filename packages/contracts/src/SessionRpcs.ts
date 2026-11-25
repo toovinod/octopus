@@ -15,14 +15,15 @@ import {
 	AgentSession,
 	AgentUnavailableError,
 	ApprovalNotFoundError,
+	PlanNotFoundError,
 	ResubscribeRequiredError,
 	SessionBusyError,
 	SessionNotFoundError,
 } from "./AgentSession.ts";
 import { CheckpointChange, CheckpointNotFoundError, WorkspaceAgentsBusyError } from "./Checkpoint.ts";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "./Workspace.ts";
+import { ApprovalDecision, PlanAnswer } from "./AgentEvent.ts";
 import { DaemonInternalError } from "./DaemonInternalError.ts";
-import { ApprovalDecision } from "./AgentEvent.ts";
 import { SessionEvent } from "./SessionEvent.ts";
 import { GitTimeoutError } from "./Git.ts";
 import { Rpc, RpcGroup } from "effect/rpc";
@@ -152,6 +153,21 @@ export class SessionRpcs extends RpcGroup.make(
 	Rpc.make("respondToApproval", {
 		payload: { sessionId: Schema.String, requestId: Schema.String, decision: ApprovalDecision },
 		error: Schema.Union([SessionNotFoundError, ApprovalNotFoundError, DaemonInternalError]),
+	}),
+	// Approving switches the chat to the chosen mode. Codex then gets "Implement the plan." as the next message,
+	// while Claude carries on in the same turn.
+	Rpc.make("respondToPlan", {
+		payload: { sessionId: Schema.String, requestId: Schema.String, answer: PlanAnswer },
+		error: Schema.Union([
+			SessionNotFoundError,
+			PlanNotFoundError,
+			ModeNotAllowedError,
+			SessionBusyError,
+			AgentUnavailableError,
+			ImagesNotSupportedError,
+			WorkspaceArchivedError,
+			DaemonInternalError,
+		]),
 	}),
 	// Stops the running turn and keeps the agent process.
 	Rpc.make("interruptSession", {

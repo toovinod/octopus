@@ -259,6 +259,60 @@ describe("SessionService", () => {
 		expect(sequences(received)).toEqual(Array.from({ length: 1 + 452 * 2 - 11 }, (_, index) => index + 11));
 	});
 
+	test("approving a plan switches the mode and sends the agent's implement message, and refuses full access when untrusted", async () => {
+		const recording: Recording = {
+			kind: "codex",
+			nativeSessionId: "thread-plan",
+			turns: [
+				[
+					{ type: "message.completed", itemId: "msg-1", text: "Here is the plan." },
+					{ type: "turn.completed", turnId: "plan", result: { status: "completed" } },
+					{
+						type: "plan.proposed",
+						requestId: "plan-1",
+						itemId: "plan-1",
+						text: "1. Add tests",
+						choices: ["ask", "fullAccess"],
+					},
+				],
+				messages("build", 1),
+			],
+		};
+		const result = await runWithRecording(recording, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.updateSettings(session.id, { model: "replay", effort: null, mode: "plan" });
+				yield* sessions.sendMessage(session.id, "plan the work", [], false);
+				// A waiting plan needs the user, like an approval.
+				yield* waitForStatus(session.id, "awaitingApproval");
+				const refused = yield* sessions
+					.respondToPlan(session.id, "plan-1", { type: "approve", mode: "fullAccess" })
+					.pipe(Effect.flip);
+				yield* sessions.respondToPlan(session.id, "plan-1", { type: "approve", mode: "ask" });
+				yield* waitForStored(session.id, 9);
+				yield* waitForStatus(session.id, "idle");
+				const [row] = yield* sessions.list(session.workspaceId);
+				return { refused, mode: row?.mode, stored: yield* storedEvents(session.id) };
+			}),
+		);
+		expect(result.refused).toMatchObject({ _tag: "ModeNotAllowedError", reason: "untrustedProject" });
+		expect(result.mode).toBe("ask");
+		expect(result.stored.map((row) => row.type)).toEqual([
+			"session.started",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+			"plan.proposed",
+			"plan.resolved",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+		]);
+		const implement = result.stored.at(-3)?.payload;
+		expect(implement).toMatchObject({ type: "user.message", text: "Implement the plan." });
+	});
+
 	test("pages stored history backwards, and a subscription after the latest page joins it", async () => {
 		// session.started, the user message and 8 agent events: sequences 0 to 9.
 		const recording: Recording = { kind: "codex", nativeSessionId: "thread-pages", turns: [messages("first", 7)] };

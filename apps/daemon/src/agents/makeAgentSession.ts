@@ -1,4 +1,11 @@
 import {
+	type AgentCapabilities,
+	type AgentCommand,
+	ApprovalNotFoundError,
+	PlanNotFoundError,
+	SessionBusyError,
+} from "@repo/contracts/AgentSession";
+import {
 	type AgentError,
 	type AgentSessionHandle,
 	ApprovalChoiceError,
@@ -19,13 +26,13 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
-import {
-	type AgentCapabilities,
-	type AgentCommand,
-	ApprovalNotFoundError,
-	SessionBusyError,
-} from "@repo/contracts/AgentSession";
-import type { AgentEvent, ApprovalDecision, ApprovalOutcome } from "@repo/contracts/AgentEvent";
+import type {
+	AgentEvent,
+	ApprovalDecision,
+	ApprovalOutcome,
+	PlanAnswer,
+	PlanOutcome,
+} from "@repo/contracts/AgentEvent";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
 // down instead of growing memory.
@@ -46,6 +53,11 @@ type ApprovalRequest = Omit<Extract<AgentEvent, { type: "approval.requested" }>,
 
 type RespondToAgent = (outcome: ApprovalOutcome) => Effect.Effect<void, AgentError>;
 
+type PlanRequest = Omit<Extract<AgentEvent, { type: "plan.proposed" }>, "type">;
+
+// Returns the message to send next, if the agent waits for one after its plan.
+type RespondToPlan = (outcome: PlanOutcome) => Effect.Effect<Option.Option<string>, AgentError>;
+
 // What each adapter does to drive its agent. The session below owns everything else:
 // the event buffer, turn queue, pending approvals and the native id.
 export interface TurnDriver {
@@ -59,6 +71,9 @@ export interface TurnDriver {
 export interface AgentSession {
 	emit(event: AgentEvent): Effect.Effect<void>;
 	requestApproval(request: ApprovalRequest, respond: RespondToAgent): Effect.Effect<void>;
+	proposePlan(request: PlanRequest, respond: RespondToPlan): Effect.Effect<void>;
+	// For an agent that withdraws its own plan. Does nothing once the plan is answered.
+	cancelPlan(requestId: string): Effect.Effect<void, AgentError>;
 	// For an agent that withdraws its own request. Does nothing once the request is answered.
 	cancelApproval(requestId: string): Effect.Effect<void, AgentError>;
 	setNativeSessionId(id: string): Effect.Effect<void>;
@@ -86,6 +101,16 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			readonly respond: RespondToAgent;
 		}
 	>();
+
+	const plans = new Map<
+		string,
+		{
+			readonly choices: PlanRequest["choices"];
+			readonly respond: RespondToPlan;
+		}
+	>();
+	// A plan or an approval waiting on the user, so a quiet turn is not a stalled one.
+	const waitingOnUser = () => approvals.size > 0 || plans.size > 0;
 
 	const emit = (agentEvent: AgentEvent) =>
 		Effect.gen(function* () {
@@ -124,6 +149,17 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 		Effect.forEach([...approvals.keys()], cancelApproval, { discard: true }),
 	);
 
+	const cancelPlan = (requestId: string) =>
+		Effect.gen(function* () {
+			const plan = plans.get(requestId);
+			if (plan === undefined) return;
+			plans.delete(requestId);
+			yield* emit({ type: "plan.resolved", requestId, outcome: { type: "cancelled" } });
+			yield* plan.respond({ type: "cancelled" });
+		});
+
+	const cancelPlans = Effect.suspend(() => Effect.forEach([...plans.keys()], cancelPlan, { discard: true }));
+
 	const failTurn = (error: AgentError) =>
 		emit({ type: "turn.completed", turnId: "notStarted", result: { status: "failed", message: error.message } });
 
@@ -134,8 +170,8 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			const limit = Duration.toMillis(idleTimeout);
 			while (true) {
 				const idleFor = (yield* Clock.currentTimeMillis) - (yield* Ref.get(lastEventAt));
-				if (approvals.size === 0 && idleFor >= limit) break;
-				yield* Effect.sleep(approvals.size === 0 ? Duration.millis(limit - idleFor) : idleTimeout);
+				if (!waitingOnUser() && idleFor >= limit) break;
+				yield* Effect.sleep(waitingOnUser() ? idleTimeout : Duration.millis(limit - idleFor));
 			}
 			const message = `The agent sent nothing for ${Duration.format(idleTimeout)}, so Octopus stopped the turn. Send your message again to retry.`;
 			yield* Effect.logWarning("Stopping a turn that sent nothing").pipe(
@@ -178,6 +214,8 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						if (!steer && Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
 							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
 						}
+						// A new message replaces an unanswered plan, as typing past the plan prompt does in both CLIs.
+						yield* cancelPlans;
 						const recordMessage = emit({
 							type: "user.message",
 							itemId: message.id,
@@ -209,8 +247,22 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						yield* resolve(requestId, decision);
 						yield* approval.respond(decision);
 					}),
+				respondToPlan: (requestId, answer: PlanAnswer) =>
+					Effect.gen(function* () {
+						const plan = plans.get(requestId);
+						if (plan === undefined) {
+							return yield* new PlanNotFoundError({ requestId });
+						}
+						if (answer.type === "approve" && !plan.choices.includes(answer.mode)) {
+							return yield* new ApprovalChoiceError({ requestId, decision: answer.mode });
+						}
+						plans.delete(requestId);
+						yield* emit({ type: "plan.resolved", requestId, outcome: answer });
+						return yield* plan.respond(answer);
+					}),
 				interrupt: Effect.gen(function* () {
 					yield* cancelApprovals;
+					yield* cancelPlans;
 					if (Option.isSome(yield* Ref.get(currentTurn))) {
 						yield* driver.interruptTurn;
 					}
@@ -228,6 +280,12 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				yield* emit({ type: "approval.requested", ...request });
 			}),
 		cancelApproval,
+		proposePlan: (request, respond) =>
+			Effect.gen(function* () {
+				plans.set(request.requestId, { choices: request.choices, respond });
+				yield* emit({ type: "plan.proposed", ...request });
+			}),
+		cancelPlan,
 		nativeSessionId: Deferred.await(nativeId),
 		setNativeSessionId: (id) =>
 			Effect.gen(function* () {

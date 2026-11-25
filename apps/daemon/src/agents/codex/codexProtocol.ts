@@ -104,6 +104,12 @@ export const ThreadItem = Schema.Union([
 		id: Schema.String,
 		summary: Schema.Array(Schema.String),
 	}),
+	// In plan mode Codex takes the proposed plan out of its reply and sends it as this item.
+	Schema.Struct({
+		type: Schema.Literal("plan"),
+		id: Schema.String,
+		text: Schema.String,
+	}),
 	Schema.Struct({ type: Schema.String, id: Schema.String }),
 ]);
 export type ThreadItem = typeof ThreadItem.Type;

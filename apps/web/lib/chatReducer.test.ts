@@ -175,3 +175,32 @@ describe("prependEvents", () => {
 		expect(joined.earlierOutcomes).toEqual({ r0: "deny" });
 	});
 });
+
+describe("plans", () => {
+	const proposed = (requestId: string) =>
+		stored({ type: "plan.proposed", requestId, itemId: "p1", text: "1. Do it", choices: ["auto", "ask"] });
+
+	test("shows a proposed plan and its answer", () => {
+		nextSequence = 0;
+		const state = applyEvents(emptyChat("s"), [proposed("r1")]);
+		expect(state.items).toEqual([
+			{ kind: "plan", key: "plan:r1", requestId: "r1", text: "1. Do it", choices: ["auto", "ask"], outcome: null },
+		]);
+		const done = applyEvents(state, [
+			stored({ type: "plan.resolved", requestId: "r1", outcome: { type: "approve", mode: "auto" } }),
+		]);
+		expect(done.items[0]).toMatchObject({ outcome: { type: "approve", mode: "auto" } });
+	});
+
+	test("an answer in a newer page reaches the plan in an older page", () => {
+		nextSequence = 1;
+		const newer = applyEvents(emptyChat("s"), [
+			stored({ type: "plan.resolved", requestId: "r1", outcome: { type: "revise", feedback: "Smaller" } }),
+		]);
+		expect(newer.earlierPlanOutcomes).toEqual({ r1: { type: "revise", feedback: "Smaller" } });
+		nextSequence = 0;
+		const joined = prependEvents(newer, [proposed("r1")]);
+		expect(joined.items[0]).toMatchObject({ kind: "plan", outcome: { type: "revise", feedback: "Smaller" } });
+		expect(joined.earlierPlanOutcomes).toEqual({});
+	});
+});

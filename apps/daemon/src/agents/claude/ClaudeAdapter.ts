@@ -10,6 +10,24 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
+import {
+	Config,
+	Context,
+	Deferred,
+	Effect,
+	Exit,
+	FiberHandle,
+	Layer,
+	Option,
+	Predicate,
+	PubSub,
+	Queue,
+	Redacted,
+	Ref,
+	Schema,
+	Scope,
+	Stream,
+} from "effect";
 import type {
 	CanUseTool,
 	Options,
@@ -20,29 +38,12 @@ import type {
 	SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
-	Config,
-	Context,
-	Deferred,
-	Effect,
-	Exit,
-	FiberHandle,
-	Layer,
-	Option,
-	PubSub,
-	Queue,
-	Redacted,
-	Ref,
-	Schema,
-	Scope,
-	Stream,
-} from "effect";
-import {
 	type AgentCapabilities,
 	type AgentMode,
 	type AgentModel,
 	LoginNotPendingError,
 } from "@repo/contracts/AgentSession";
-import type { ApprovalDecision, ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
+import type { ApprovalDecision, ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
 import { BashInput, ClaudeAuthStatus, ClaudeMessage, FileInput } from "./claudeMessages.ts";
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import { stopProcessGroup } from "../../processes/stopProcessGroup.ts";
@@ -211,6 +212,38 @@ const toToolCall = (name: string, input: unknown): ToolCall => {
 	return { kind: "other", name };
 };
 
+// Claude calls this tool to leave plan mode. Octopus shows the plan as its own card, not as a tool call.
+const EXIT_PLAN_MODE = "ExitPlanMode";
+
+// The modes a plan may be built in, in the order Claude Code offers them. Full access needs a trusted project.
+const buildModes = (trusted: boolean): ReadonlyArray<AgentMode> =>
+	(["auto", "acceptEdits", "ask", "fullAccess"] as const).filter(
+		(mode) => capabilities.modes.includes(mode) && (trusted || mode !== "fullAccess"),
+	);
+
+// Claude Code reads the plan from its plan file and passes it in the tool's input.
+const planText = (input: Record<string, unknown>) => (Predicate.isString(input.plan) ? input.plan : "");
+
+// Answers ExitPlanMode as Claude Code's own plan prompt does: approving switches the mode for the session,
+// and a refusal with feedback keeps Claude planning.
+const toPlanPermissionResult = (outcome: PlanOutcome, input: Record<string, unknown>): PermissionResult => {
+	switch (outcome.type) {
+		case "approve":
+			return {
+				behavior: "allow",
+				updatedInput: input,
+				updatedPermissions: [{ type: "setMode", mode: permissionModes[outcome.mode], destination: "session" }],
+			};
+		case "revise":
+			return {
+				behavior: "deny",
+				message: outcome.feedback.trim() === "" ? "The user wants to keep planning." : outcome.feedback,
+			};
+		case "cancelled":
+			return { behavior: "deny", message: "The user did not approve the plan." };
+	}
+};
+
 // "Allow for session" may only add allow rules for this session. Suggestions that switch
 // the permission mode, add directories, replace rules or write a settings file are dropped.
 export const sessionAllowRules = (suggestions: ReadonlyArray<PermissionUpdate>): ReadonlyArray<PermissionUpdate> =>
@@ -267,6 +300,8 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	const streamingMessageId = yield* Ref.make("");
 	const finishedBlocks = yield* Ref.make({ messageId: "", count: 0 });
 	const tools = new Map<string, ToolCall>();
+	// ExitPlanMode calls, which show as plan cards instead of tool calls.
+	const planTools = new Set<string>();
 	const interrupting = yield* Ref.make(false);
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
@@ -344,6 +379,10 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 							});
 						}
 					} else if ("name" in block) {
+						if (block.name === EXIT_PLAN_MODE) {
+							planTools.add(block.id);
+							continue;
+						}
 						const tool = toToolCall(block.name, block.input);
 						tools.set(block.id, tool);
 						yield* session.emit({
@@ -361,6 +400,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 				if (typeof content === "string") return;
 				for (const block of content) {
 					if (!("tool_use_id" in block)) continue;
+					if (planTools.delete(block.tool_use_id)) continue;
 					const tool = tools.get(block.tool_use_id) ?? {
 						kind: "other",
 						name: "unknown",
@@ -552,9 +592,31 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				const runPromise = Effect.runPromiseWith(context);
 				let claudePid: number | undefined;
 
+				const proposePlan = (toolInput: Record<string, unknown>, request: Parameters<CanUseTool>[2]) =>
+					Effect.gen(function* () {
+						const answered = yield* Deferred.make<PlanOutcome>();
+						yield* session.proposePlan(
+							{
+								requestId: request.toolUseID,
+								itemId: request.toolUseID,
+								text: planText(toolInput),
+								choices: buildModes(input.trustProjectSettings),
+							},
+							(outcome) => Deferred.succeed(answered, outcome).pipe(Effect.as(Option.none())),
+						);
+						const withdraw = () => Effect.runForkWith(context)(session.cancelPlan(request.toolUseID));
+						if (request.signal.aborted) withdraw();
+						request.signal.addEventListener("abort", withdraw, { once: true });
+						const outcome = yield* Deferred.await(answered).pipe(
+							Effect.ensuring(Effect.sync(() => request.signal.removeEventListener("abort", withdraw))),
+						);
+						return toPlanPermissionResult(outcome, toolInput);
+					});
+
 				const canUseTool: CanUseTool = (toolName, toolInput, request) =>
 					runPromise(
 						Effect.gen(function* () {
+							if (toolName === EXIT_PLAN_MODE) return yield* proposePlan(toolInput, request);
 							const suggestions = sessionAllowRules(request.suggestions ?? []);
 							const choices: ReadonlyArray<ApprovalDecision> =
 								suggestions.length > 0 && !request.suppressAlwaysAllowRule
@@ -592,6 +654,9 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					canUseTool,
 					// Always set, so a settings file can never pick bypassPermissions on its own.
 					permissionMode: permissionModes[input.mode],
+					// Without it Claude refuses to switch a running session to bypassPermissions, as Full access
+					// and approving a plan in Full access do. Only a trusted project may offer that mode.
+					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
 					...Option.match(decodeEffort(input.effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
 					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),

@@ -1,6 +1,6 @@
 import { type AgentCapabilities, AgentKind } from "@repo/contracts/AgentSession";
 import { AgentEvent, type ApprovalOutcome } from "@repo/contracts/AgentEvent";
-import { Deferred, Effect, FiberHandle, Ref, Schema } from "effect";
+import { Deferred, Effect, FiberHandle, Option, Ref, Schema } from "effect";
 import { makeAgentSession } from "../makeAgentSession.ts";
 import type { AgentAdapter } from "../AgentAdapter.ts";
 
@@ -56,7 +56,23 @@ export const makeReplayAdapter = (recording: Recording): AgentAdapter => ({
 					if ((yield* Deferred.await(answered)) === "cancelled") {
 						return yield* Effect.interrupt;
 					}
-				} else if (event.type !== "session.started" && event.type !== "approval.resolved") {
+				} else if (event.type === "plan.proposed") {
+					// Plays a plan the way Codex offers one: after the turn, waiting for the next message.
+					const { type: _, ...request } = event;
+					yield* session.proposePlan(request, (outcome) =>
+						Effect.succeed(
+							outcome.type === "approve"
+								? Option.some("Implement the plan.")
+								: outcome.type === "revise" && outcome.feedback.trim() !== ""
+									? Option.some(outcome.feedback)
+									: Option.none(),
+						),
+					);
+				} else if (
+					event.type !== "session.started" &&
+					event.type !== "approval.resolved" &&
+					event.type !== "plan.resolved"
+				) {
 					yield* session.emit(event);
 				}
 			});

@@ -112,6 +112,14 @@ export class ApprovalNotFoundError extends Schema.TaggedError<ApprovalNotFoundEr
 	}
 }
 
+export class PlanNotFoundError extends Schema.TaggedError<PlanNotFoundError>()("PlanNotFoundError", {
+	requestId: Schema.String,
+}) {
+	override get message() {
+		return "This plan was already answered, or its turn was stopped. Ask the agent for a new plan.";
+	}
+}
+
 export class AgentUnavailableError extends Schema.TaggedError<AgentUnavailableError>()("AgentUnavailableError", {
 	agent: AgentKind,
 	availability: AgentAvailability,

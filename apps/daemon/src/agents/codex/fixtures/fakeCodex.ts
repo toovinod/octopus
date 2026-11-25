@@ -20,6 +20,7 @@ const threadId = "thread-new";
 let turns = 0;
 let turnId = "";
 let interrupted = false;
+let experimentalApi = false;
 const waiting = new Map<number, (answer: Answer) => void>();
 
 const notify = (method: string, params: object) => send({ method, params });
@@ -66,6 +67,7 @@ const runTurn = async (
 		effort?: string | null;
 		approvalPolicy?: string;
 		sandboxPolicy?: { type: string };
+		collaborationMode?: { mode: string; settings: object };
 		input: Array<{ type: string; path?: string }>;
 	},
 ) => {
@@ -133,6 +135,25 @@ const runTurn = async (
 		notify("item/completed", { item: { type: "reasoning", id: "rs-2", summary: [], content: [] }, threadId, turnId });
 		notify("item/completed", { item: { type: "agentMessage", id: "msg-1", text: "Done" }, threadId, turnId });
 		return completeTurn("completed");
+	}
+	if (text.includes("plan the work")) {
+		// What the turn asked for, then a plan item when the turn ran in plan mode, as Codex sends it.
+		notify("item/completed", {
+			item: {
+				type: "agentMessage",
+				id: "msg-1",
+				text: JSON.stringify({ experimentalApi, collaborationMode: params.collaborationMode }),
+			},
+			threadId,
+			turnId,
+		});
+		if (params.collaborationMode?.mode === "plan") {
+			const plan = { type: "plan", id: `plan-${turns}`, text: "" };
+			notify("item/started", { item: plan, threadId, turnId });
+			notify("item/plan/delta", { threadId, turnId, itemId: plan.id, delta: "1. Add tests" });
+			notify("item/completed", { item: { ...plan, text: "1. Add tests\n2. Fix the bug" }, threadId, turnId });
+		}
+		return completeTurn(text.includes("fails") ? "failed" : "completed");
 	}
 	if (text.includes("policy")) {
 		notify("item/completed", {
@@ -224,6 +245,7 @@ const serve = async () => {
 		}
 		switch (message.method) {
 			case "initialize":
+				experimentalApi = message.params.capabilities?.experimentalApi === true;
 				send({ id: message.id, result: { userAgent: "fake" } });
 				break;
 			case "account/read":

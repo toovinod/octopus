@@ -1,10 +1,10 @@
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
+import { Duration, Effect, Fiber, Option, Stream } from "effect";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
-import { Duration, Effect, Fiber, Stream } from "effect";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 
@@ -361,6 +361,64 @@ describe("CodexAdapter", () => {
 			}),
 		);
 		expect(reply).toMatchObject({ text: JSON.stringify([approvalPolicy, sandbox]) });
+	});
+
+	test("a turn in plan mode asks for Codex's plan collaboration mode and offers its plan once the turn ends", async () => {
+		const result = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.updateSettings({ model: "gpt-5", effort: "high", mode: "plan" });
+					yield* handle.sendMessage(userMessage("plan the work"));
+					const events = yield* takeUntil(handle, "plan.proposed");
+					const next = yield* handle.respondToPlan("plan-1", { type: "approve", mode: "auto" });
+					return { events, next };
+				}),
+			{ ...newSession, trustProjectSettings: true },
+		);
+		const sent = result.events.find((event) => event.type === "message.completed");
+		expect(sent?.type === "message.completed" ? JSON.parse(sent.text) : null).toEqual({
+			experimentalApi: true,
+			collaborationMode: {
+				mode: "plan",
+				settings: { model: "gpt-5", reasoning_effort: "high", developer_instructions: null },
+			},
+		});
+		expect(result.events.slice(-2)).toEqual([
+			{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } },
+			{
+				type: "plan.proposed",
+				requestId: "plan-1",
+				itemId: "plan-1",
+				text: "1. Add tests\n2. Fix the bug",
+				choices: ["auto", "ask", "fullAccess"],
+			},
+		]);
+		// Codex waits for the next message, so approving returns the one its own CLI sends.
+		expect(result.next).toEqual(Option.some("Implement the plan."));
+	});
+
+	test("leaves plan mode explicitly, sends feedback as the next plan message, and offers no plan from a failed turn", async () => {
+		const result = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("plan the work"));
+				const outside = (yield* takeUntil(handle, "turn.completed")).find(
+					(event) => event.type === "message.completed",
+				);
+				yield* handle.updateSettings({ model: "gpt-5", effort: null, mode: "plan" });
+				yield* handle.sendMessage(userMessage("plan the work"));
+				const proposed = (yield* takeUntil(handle, "plan.proposed")).at(-1);
+				const feedback = yield* handle.respondToPlan("plan-2", { type: "revise", feedback: "Use a queue." });
+				yield* handle.sendMessage(userMessage("plan the work, but it fails"));
+				const failed = yield* takeUntil(handle, "turn.completed");
+				return { outside, proposed, feedback, failed };
+			}),
+		);
+		expect(
+			result.outside?.type === "message.completed" ? JSON.parse(result.outside.text).collaborationMode.mode : null,
+		).toBe("default");
+		expect(result.proposed).toMatchObject({ type: "plan.proposed", choices: ["auto", "ask"] });
+		expect(result.feedback).toEqual(Option.some("Use a queue."));
+		expect(result.failed.some((event) => event.type === "plan.proposed")).toBe(false);
 	});
 
 	test("passes images as local files", async () => {

@@ -13,8 +13,11 @@ import {
 	WrenchIcon,
 	XIcon,
 } from "lucide-react";
-import type { ApprovalDecision, ApprovalOutcome, ToolCall } from "@repo/contracts/AgentEvent";
-import { openDialog, respondToApproval } from "../lib/store.ts";
+import type { ApprovalDecision, ApprovalOutcome, PlanAnswer, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
+import { openDialog, respondToApproval, respondToPlan } from "../lib/store.ts";
+import type { AgentMode } from "@repo/contracts/AgentSession";
+import { Textarea } from "@repo/ui/components/textarea";
+import { modeLabels } from "../lib/agentModes.ts";
 import type { ChatItem } from "../lib/chatReducer.ts";
 import { callDaemon } from "../lib/daemonRuntime.ts";
 import { memo, useEffect, useRef, useState } from "react";
@@ -73,6 +76,8 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 			return <ToolCard item={item} />;
 		case "approval":
 			return <ApprovalCard item={item} sessionId={sessionId} />;
+		case "plan":
+			return <PlanCard item={item} sessionId={sessionId} />;
 		case "notice":
 			return (
 				<div
@@ -305,6 +310,99 @@ const ToolCard = ({ item }: { readonly item: Extract<ChatItem, { kind: "tool" }>
 				<pre className="max-h-64 overflow-auto border-t border-border px-2.5 py-2 font-mono text-xs whitespace-pre-wrap text-muted-foreground">
 					{detail}
 				</pre>
+			) : null}
+		</div>
+	);
+};
+
+// The same choices Claude Code and Codex offer after a plan, one per mode the plan may be built in.
+const BUILD_LABELS: Partial<Record<AgentMode, string>> = {
+	auto: "Yes, and use auto mode",
+	acceptEdits: "Yes, auto-accept edits",
+	ask: "Yes, and ask before each change",
+	fullAccess: "Yes, with full access (no prompts)",
+};
+
+const planOutcomeText = (outcome: PlanOutcome) => {
+	switch (outcome.type) {
+		case "approve":
+			return `Approved · ${modeLabels[outcome.mode].label}`;
+		case "revise":
+			return "Kept planning";
+		case "cancelled":
+			return "Not answered";
+	}
+};
+
+const PlanCard = ({
+	item,
+	sessionId,
+}: {
+	readonly item: Extract<ChatItem, { kind: "plan" }>;
+	readonly sessionId: string;
+}) => {
+	const [sending, setSending] = useState(false);
+	const [feedback, setFeedback] = useState("");
+	const answer = async (planAnswer: PlanAnswer) => {
+		setSending(true);
+		await respondToPlan(sessionId, item.requestId, planAnswer);
+		setSending(false);
+	};
+	const waiting = item.outcome === null;
+	return (
+		<div
+			className={cn(
+				"flex flex-col gap-2 rounded-lg border px-3 py-2.5",
+				waiting ? "border-attention/50 bg-attention/5" : "border-border bg-card",
+			)}
+		>
+			<div className="flex items-center gap-2 text-xs">
+				<span className={waiting ? "font-medium text-attention" : "text-muted-foreground"}>
+					{item.outcome === null ? "Plan ready" : planOutcomeText(item.outcome)}
+				</span>
+			</div>
+			{item.text === "" ? (
+				<p className="text-sm text-muted-foreground">The agent finished planning without writing a plan.</p>
+			) : (
+				<AssistantMessage text={item.text} streaming={false} />
+			)}
+			{item.outcome?.type === "revise" && item.outcome.feedback !== "" ? (
+				<p className="border-l-2 pl-2 text-xs text-muted-foreground whitespace-pre-wrap">{item.outcome.feedback}</p>
+			) : null}
+			{waiting ? (
+				<>
+					<div className="flex flex-wrap gap-1.5">
+						{item.choices.map((mode, index) => (
+							<Button
+								key={mode}
+								size="sm"
+								variant={mode === "fullAccess" ? "destructive" : index === 0 ? "default" : "secondary"}
+								disabled={sending}
+								onClick={() => void answer({ type: "approve", mode })}
+							>
+								{BUILD_LABELS[mode] ?? `Yes, in ${modeLabels[mode].label}`}
+							</Button>
+						))}
+					</div>
+					<div className="flex items-end gap-1.5">
+						<Textarea
+							value={feedback}
+							onChange={(event) => setFeedback(event.target.value)}
+							placeholder="Tell the agent what to change"
+							aria-label="Feedback on the plan"
+							className="min-h-9 text-sm"
+							rows={1}
+						/>
+						<Button
+							size="sm"
+							variant="ghost"
+							disabled={sending}
+							onClick={() => void answer({ type: "revise", feedback: feedback.trim() })}
+						>
+							No, keep planning
+						</Button>
+					</div>
+				</>
 			) : null}
 		</div>
 	);
