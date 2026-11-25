@@ -1264,6 +1264,22 @@ describe("SessionService", () => {
 		expect(result).toEqual([]);
 	});
 
+	test("a message whose second image cannot be stored leaves no image on disk", async () => {
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const broken = { mediaType: "image/png", base64: "not base64!" } as const;
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const fs = yield* FileSystem.FileSystem;
+				const session = yield* addSession(tempDir);
+				yield* Effect.flip(sessions.sendMessage(session.id, "look", [image, broken], false));
+				const directory = join(tempDir, "data", "attachments", session.id);
+				return (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [];
+			}),
+		);
+		expect(result).toEqual([]);
+	});
+
 	test("refuses images for a model that cannot read them", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
 		const { models } = await Effect.runPromise(replay.listModels);

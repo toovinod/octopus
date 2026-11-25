@@ -572,14 +572,19 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			if (images.length === 0) return [];
 			const directory = attachmentsDir(sessionId);
 			yield* fs.makeDirectory(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+			const written: Array<string> = [];
 			return yield* Effect.forEach(images, ({ mediaType, base64 }) =>
 				Effect.gen(function* () {
 					const id = yield* newId;
 					const path = join(directory, id);
 					const bytes = yield* Effect.fromResult(Base64.decode(base64));
 					yield* fs.writeFile(path, bytes, { mode: PRIVATE_FILE_MODE });
+					written.push(path);
 					return { id, mediaType, base64, path } satisfies UserImage;
 				}),
+			).pipe(
+				// The message is never sent then, so nothing will ask for the images already written.
+				Effect.onError(() => Effect.forEach(written, (path) => Effect.ignore(fs.remove(path)), { discard: true })),
 			);
 		}, Effect.provide(services));
 
