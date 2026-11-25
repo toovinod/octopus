@@ -2,7 +2,7 @@
 
 import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@repo/ui/components/resizable";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup, usePanelRef } from "@repo/ui/components/resizable";
 import { onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
 import { isMac, shortcutKey } from "../lib/shortcutKey.ts";
 import { quitWarning } from "../lib/quitWarning.ts";
@@ -98,11 +98,21 @@ export const App = () => {
 	const panelOpen = useAppState((current) => current.panel.open);
 	const hasWorkspace = useAppState((current) => current.selectedWorkspaceId !== null);
 	const daemonStopped = useDaemonStopped();
+	const panelRef = usePanelRef();
 	useShortcuts();
 	useQuitWarning();
 	useEffect(() => {
 		void boot();
 	}, []);
+
+	// Closing collapses the panel instead of unmounting it, so terminals, loaded diffs and scroll positions survive.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the panel mounts again when a workspace is picked.
+	useEffect(() => {
+		const panel = panelRef.current;
+		if (panel === null) return;
+		if (panelOpen) panel.expand();
+		else panel.collapse();
+	}, [panelOpen, panelRef, hasWorkspace]);
 
 	if (daemonStopped) return <DaemonStopped />;
 
@@ -129,10 +139,22 @@ export const App = () => {
 					<ResizablePanel id="chat" minSize={360}>
 						<ChatView />
 					</ResizablePanel>
-					{panelOpen && hasWorkspace ? (
+					{hasWorkspace ? (
 						<>
 							<ResizableHandle />
-							<ResizablePanel id="panel" defaultSize="36" minSize={320}>
+							<ResizablePanel
+								id="panel"
+								panelRef={panelRef}
+								defaultSize="36"
+								minSize={320}
+								collapsible
+								collapsedSize={0}
+								// Dragging the panel shut or open counts as closing or opening it.
+								onResize={() => {
+									const collapsed = panelRef.current?.isCollapsed();
+									if (collapsed !== undefined && collapsed === getState().panel.open) setPanel({ open: !collapsed });
+								}}
+							>
 								<SidePanel />
 							</ResizablePanel>
 						</>
