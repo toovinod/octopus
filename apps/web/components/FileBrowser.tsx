@@ -69,18 +69,47 @@ const FolderList = ({
 					</Button>
 				</Hint>
 			</div>
-			<div className="min-h-0 flex-1 overflow-y-auto p-1">
-				{entries.state === "loading" ? null : entries.state === "failed" ? (
-					<p className="p-3 text-xs text-destructive">{entries.message}</p>
-				) : entries.value.length === 0 ? (
-					<p className="p-3 text-xs text-muted-foreground">This folder is empty.</p>
-				) : (
-					entries.value.map((entry) => (
+			{entries.state === "loading" ? null : entries.state === "failed" ? (
+				<p className="p-3 text-xs text-destructive">{entries.message}</p>
+			) : entries.value.length === 0 ? (
+				<p className="p-3 text-xs text-muted-foreground">This folder is empty.</p>
+			) : (
+				<EntryRows entries={entries.value} onOpen={onOpen} />
+			)}
+		</div>
+	);
+};
+
+const ENTRY_HEIGHT = 28;
+
+// Virtualized, since a folder like node_modules can hold thousands of entries.
+const EntryRows = ({
+	entries,
+	onOpen,
+}: {
+	readonly entries: ReadonlyArray<FileEntry>;
+	readonly onOpen: (entry: FileEntry) => void;
+}) => {
+	const scrollRef = useRef<HTMLDivElement>(null);
+	const virtualizer = useVirtualizer({
+		count: entries.length,
+		getScrollElement: () => scrollRef.current,
+		estimateSize: () => ENTRY_HEIGHT,
+		getItemKey: (index) => entries[index]?.path ?? index,
+		overscan: 20,
+	});
+	return (
+		<div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-1">
+			<div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+				{virtualizer.getVirtualItems().map((row) => {
+					const entry = entries[row.index];
+					return entry === undefined ? null : (
 						<button
-							key={entry.path}
+							key={row.key}
 							type="button"
 							onClick={() => onOpen(entry)}
-							className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left hover:bg-accent"
+							className="absolute inset-x-0 flex h-7 w-full items-center gap-2 rounded-md px-2 text-left hover:bg-accent"
+							style={{ transform: `translateY(${row.start}px)` }}
 						>
 							{entry.kind === "directory" ? (
 								<FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
@@ -89,8 +118,8 @@ const FolderList = ({
 							)}
 							<span className="truncate">{entry.name}</span>
 						</button>
-					))
-				)}
+					);
+				})}
 			</div>
 		</div>
 	);
