@@ -491,6 +491,9 @@ export interface CodexAgentAdapter extends AgentAdapter {
 	readonly loginResults: Stream.Stream<LoginCompleted>;
 }
 
+// "$name" in a message, without the punctuation after it. A name starts with a letter, so "$5" names none.
+const SKILL_NAME = /\$[A-Za-z][\w:-]*/g;
+
 // Codex waits on its local callback server until the user finishes in the browser.
 const LOGIN_TIMEOUT = "10 minutes";
 
@@ -541,6 +544,8 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const models: Array<AgentModel> = [];
 				let defaultModel = "";
 				let cursor: string | null = null;
+				// A cursor Codex already sent would page forever.
+				const seenCursors = new Set<string>();
 				do {
 					const page: typeof ModelListResponse.Type = yield* client
 						.request("model/list", { cursor } satisfies ModelListParams)
@@ -559,6 +564,11 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						if (model.isDefault) defaultModel = model.id;
 					}
 					cursor = page.nextCursor;
+					if (cursor !== null && seenCursors.has(cursor)) {
+						yield* Effect.logWarning("Codex repeated a model/list cursor, so Octopus stopped paging");
+						break;
+					}
+					if (cursor !== null) seenCursors.add(cursor);
 				} while (cursor !== null);
 				return { models, defaultModel: defaultModel || (models[0]?.id ?? "") } satisfies AgentModels;
 			}).pipe(Effect.scoped, provide, Effect.withSpan("CodexAdapter.listModels"));
@@ -663,7 +673,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				// A skill runs when the message names it as "$name" and also carries it as an input item,
 				// the way Codex's own composer sends it.
 				const skillsNamedIn = (text: string) => {
-					const named = new Set(text.match(/\$[^\s$]+/g));
+					const named = new Set(text.match(SKILL_NAME));
 					return named.size === 0
 						? Effect.succeed([])
 						: listSkills.pipe(

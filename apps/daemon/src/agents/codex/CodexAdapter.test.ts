@@ -177,6 +177,37 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
+	test("stops paging models when Codex repeats a cursor", async () => {
+		const { models } = await runWithCodex(
+			Effect.flatMap(CodexAdapter, (codex) => codex.listModels),
+			`${import.meta.dir}/fixtures/loopingModelsCodex.ts`,
+		);
+		expect(models.map((model) => model.id)).toEqual(["gpt-first", "gpt-later"]);
+	});
+
+	test("a call after the app-server exited fails at once instead of waiting for its deadline", async () => {
+		const error = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("quit now"));
+				yield* Effect.ignore(Stream.runDrain(handle.events));
+				return yield* Effect.flip(handle.listCommands);
+			}).pipe(Effect.timeout("2 seconds")),
+		);
+		expect(error).toMatchObject({ _tag: "AgentProcessError", message: "Codex app-server exited." });
+	});
+
+	test("runs a skill named with punctuation after it", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("show the images, then run $tester."));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "message.completed")).toMatchObject({
+			text: JSON.stringify([{ type: "skill", name: "tester", path: "/skills/tester/SKILL.md" }]),
+		});
+	});
+
 	test("cuts huge diffs, each and per event, with a marker", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {

@@ -74,6 +74,8 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	const incoming = yield* Queue.bounded<CodexIncoming, AgentError | Cause.Done>(INCOMING_BUFFER);
 	const pending = new Map<RequestId, Deferred.Deferred<unknown, AgentError>>();
 	let nextId = 0;
+	// Set once the app-server exits, so later calls fail at once instead of waiting out their deadline.
+	let ended: AgentError | undefined;
 
 	const send = (message: object) => Effect.asVoid(Queue.offer(outgoing, `${JSON.stringify(message)}\n`));
 
@@ -157,6 +159,7 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		Effect.andThen(Effect.fail(exited)),
 		Effect.catch((error: AgentError) =>
 			Effect.gen(function* () {
+				ended = error;
 				for (const deferred of pending.values()) {
 					yield* Deferred.fail(deferred, error);
 				}
@@ -171,6 +174,7 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		incoming: Stream.fromQueue(incoming),
 		request: (method, params) =>
 			Effect.gen(function* () {
+				if (ended !== undefined) return yield* Effect.fail(ended);
 				const { timeout } = yield* CodexRequestSettings;
 				const id = nextId++;
 				const deferred = yield* Deferred.make<unknown, AgentError>();
