@@ -6,6 +6,14 @@ import {
 	PlanNotFoundError,
 	SessionBusyError,
 } from "@repo/contracts/AgentSession";
+import {
+	type AgentError,
+	AgentProcessError,
+	type AgentSessionHandle,
+	ApprovalChoiceError,
+	type SessionSettings,
+	type UserMessage,
+} from "./AgentAdapter.ts";
 import type {
 	AgentEvent,
 	ApprovalDecision,
@@ -15,13 +23,6 @@ import type {
 	PlanAnswer,
 	PlanOutcome,
 } from "@repo/contracts/AgentEvent";
-import {
-	type AgentError,
-	type AgentSessionHandle,
-	ApprovalChoiceError,
-	type SessionSettings,
-	type UserMessage,
-} from "./AgentAdapter.ts";
 import {
 	type Cause,
 	Clock,
@@ -144,11 +145,13 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				const stall = yield* Ref.getAndSet(stalled, Option.none());
 				if (Option.isSome(stall)) event = { ...event, result: { status: "failed", message: stall.value } };
 			}
-			yield* Queue.offer(events, event);
+			// False once the session has ended.
+			const offered = yield* Queue.offer(events, event);
 			if (event.type === "turn.completed") {
 				const turn = yield* Ref.get(currentTurn);
 				if (Option.isSome(turn)) yield* Deferred.succeed(turn.value, undefined);
 			}
+			return offered;
 		});
 
 	const fail = (error: AgentError) =>
@@ -267,12 +270,24 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						}
 						// A new message replaces an unanswered plan or question, as typing past the prompt does in both CLIs.
 						yield* cancelPlansAndQuestions;
+						// A session that ended, as when its process exits while the message is on its way, can never run it.
 						const recordMessage = emit({
 							type: "user.message",
 							itemId: message.id,
 							text: message.text,
 							attachments: message.images.map(({ id, mediaType }) => ({ id, mediaType })),
-						});
+						}).pipe(
+							Effect.flatMap((stored) =>
+								stored
+									? Effect.void
+									: Effect.fail(
+											new AgentProcessError({
+												message: "The agent stopped before it took the message. Send it again.",
+												cause: null,
+											}),
+										),
+							),
+						);
 						// Recorded only once the agent took it, so a rejected steer leaves no message in history
 						// that the agent never saw, and the caller can safely drop its images.
 						if (steer && (yield* driver.steerTurn(message))) {

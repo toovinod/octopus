@@ -565,13 +565,16 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const sendMessage = Effect.fn("SessionService.sendMessage")(
 			function* (sessionId: string, text: string, images: ReadonlyArray<ImageData>, steer: boolean) {
 				if (images.length > 0) yield* checkImagesSupported(sessionId);
-				const runtime = yield* ensureRuntime(sessionId);
+				const current = yield* ensureRuntime(sessionId);
 				const message = {
 					id: yield* newId.pipe(Effect.provide(services)),
 					text,
 					images: yield* storeImages(sessionId, images),
 				};
 				yield* saveTurnCheckpoint(sessionId, message.id);
+				// The process may have ended while the message was prepared. Its runtime is gone then, and the
+				// message goes to a new one.
+				const runtime = current.ending ? yield* ensureRuntime(sessionId) : current;
 				// Counted before sending, so the turn's own completion can never arrive first.
 				runtime.outstanding++;
 				yield* refreshStatus(runtime);
@@ -582,7 +585,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						Exit.isSuccess(exit)
 							? Effect.void
 							: Effect.gen(function* () {
-									runtime.outstanding--;
+									// The process may have ended meanwhile, which already cleared the count.
+									runtime.outstanding = Math.max(0, runtime.outstanding - 1);
 									yield* refreshStatus(runtime);
 									// The message was not stored, so nothing will ever ask for its images.
 									yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));

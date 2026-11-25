@@ -147,6 +147,14 @@ describe("makeAgentSession turn watchdog", () => {
 	});
 });
 
+test("a message sent after the session ended fails instead of being lost", async () => {
+	const error = await runQuietAgent(
+		() => Effect.void,
+		(handle, session) => session.end.pipe(Effect.andThen(Effect.flip(handle.sendMessage(userMessage("late"))))),
+	);
+	expect(error._tag).toBe("AgentProcessError");
+});
+
 describe("makeAgentSession plans", () => {
 	const plan = { requestId: "plan-1", itemId: "plan-1", text: "1. Add tests", choices: ["auto", "ask"] } as const;
 
