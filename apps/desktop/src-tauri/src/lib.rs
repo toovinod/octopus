@@ -260,6 +260,9 @@ fn start_daemon(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // First, so a second launch hands over to the running app before it starts a second daemon on the same
+    // data dir, which would fail and leave that window stuck on "The daemon stopped".
+    .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_windows(app)))
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_notification::init())
@@ -310,16 +313,20 @@ pub fn run() {
       }
       // A click on the dock icon brings back the window that closing hid.
       #[cfg(target_os = "macos")]
-      RunEvent::Reopen { has_visible_windows: false, .. } => {
-        for window in app.webview_windows().values() {
-          let _ = window.show();
-          let _ = window.set_focus();
-        }
-      }
+      RunEvent::Reopen { has_visible_windows: false, .. } => show_windows(app),
       // In case the app exits without asking first. A crash closes stdin too.
       RunEvent::Exit => drop(take_daemon_child(app)),
       _ => {}
     });
+}
+
+// Brings back windows that closing hid, in front of other apps.
+fn show_windows(app: &tauri::AppHandle) {
+  for window in app.webview_windows().values() {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+  }
 }
 
 const CLOSE_WINDOW_ID: &str = "close-window";
