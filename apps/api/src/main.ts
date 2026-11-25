@@ -15,24 +15,25 @@ const AppLayer = Auth.layer.pipe(
 // waits up to the grace period for requests in flight, then the database client closes.
 // If cleanup still hangs at the deadline, or a second signal arrives, the process exits at once,
 // before the platform's own SIGKILL can cut a log line or a query in half.
-const exitIfShutdownHangs = (deadline: Duration.Duration) =>
-	Effect.sync(() => {
-		let stopping = false;
-		const onSignal = (signal: NodeJS.Signals) => {
-			if (stopping) {
-				console.error(`Received ${signal} again, exiting now`);
-				process.exit(1);
-			}
-			stopping = true;
-			console.log(`Received ${signal}, shutting down`);
-			setTimeout(() => {
-				console.error(`Shutdown took longer than ${Duration.format(deadline)}, exiting`);
-				process.exit(1);
-			}, Duration.toMillis(deadline)).unref();
-		};
-		process.on("SIGTERM", onSignal);
-		process.on("SIGINT", onSignal);
-	});
+const exitIfShutdownHangs = Effect.fn("exitIfShutdownHangs")(function* (deadline: Duration.Duration) {
+	// The handlers run outside any fiber, so they log through this runtime, synchronously before exiting.
+	const runSync = Effect.runSyncWith(yield* Effect.context<never>());
+	let stopping = false;
+	const onSignal = (signal: NodeJS.Signals) => {
+		if (stopping) {
+			runSync(Effect.logError("Received the stop signal again, exiting now", { signal }));
+			process.exit(1);
+		}
+		stopping = true;
+		runSync(Effect.logInfo("Shutting down", { signal }));
+		setTimeout(() => {
+			runSync(Effect.logError(`Shutdown took longer than ${Duration.format(deadline)}, exiting`));
+			process.exit(1);
+		}, Duration.toMillis(deadline)).unref();
+	};
+	process.on("SIGTERM", onSignal);
+	process.on("SIGINT", onSignal);
+});
 
 const ApiServer = Layer.unwrap(
 	Effect.gen(function* () {
