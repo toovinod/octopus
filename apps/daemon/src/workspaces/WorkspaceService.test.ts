@@ -263,6 +263,28 @@ describe("WorkspaceService", () => {
 		expect(result.branchHead).toBe("work");
 	});
 
+	test("archives a workspace whose base branch was deleted, refusing unpushed commits without force", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* runGit(project.path, ["branch", "develop"]);
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "develop",
+				});
+				yield* runGit(project.path, ["branch", "-D", "develop"]);
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				const archived = yield* workspaces.archive(created.id, { force: true });
+				return { refused, archived };
+			}),
+		);
+		expect(result.refused._tag).toBe("WorkspaceHasUnsavedWorkError");
+		expect(result.archived.status).toBe("archived");
+	});
+
 	test("archiving an in-place workspace removes nothing", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

@@ -1,4 +1,5 @@
 import { WorktreeRemoveError } from "@repo/contracts/Workspace";
+import { resolveBranchRef } from "./createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
 import { Effect } from "effect";
 
@@ -7,7 +8,14 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 	// Each line is "XY path"; renames read "XY old -> new".
 	const changedFiles = status === "" ? [] : status.split("\n").map((line) => line.slice(3));
 	// Commits made in this workspace that no remote has. Base branch history is not this workspace's work.
-	const unpushed = yield* runGit(worktreePath, ["rev-list", "--count", "HEAD", `^${baseBranch}`, "--not", "--remotes"]);
+	const base = yield* resolveBranchRef(worktreePath, baseBranch);
+	if (base === null) {
+		yield* Effect.logWarning("The base branch is gone, so every commit no remote has counts as unpushed").pipe(
+			Effect.annotateLogs({ worktreePath, baseBranch }),
+		);
+	}
+	const exclude = base === null ? [] : [`^${base}`];
+	const unpushed = yield* runGit(worktreePath, ["rev-list", "--count", "HEAD", ...exclude, "--not", "--remotes"]);
 	return { changedFiles, unpushedCommits: Number(unpushed) };
 });
 

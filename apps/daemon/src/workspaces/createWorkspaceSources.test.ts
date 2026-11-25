@@ -42,6 +42,46 @@ describe("WorkspaceService.create from a source", () => {
 		expect(result.hasFile).toBe(true);
 	});
 
+	test("branches a new worktree off a base branch that only exists on origin", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const project = yield* addProject(tempDir);
+				const origin = join(tempDir, "origin.git");
+				yield* runGit(tempDir, ["clone", "-q", "--bare", project.path, origin]);
+				yield* runGit(project.path, ["remote", "add", "origin", origin]);
+				const other = join(tempDir, "other");
+				yield* runGit(tempDir, ["clone", "-q", origin, other]);
+				yield* runGit(other, ["config", "user.email", "test@octopus.local"]);
+				yield* runGit(other, ["config", "user.name", "Octopus Test"]);
+				yield* runGit(other, ["checkout", "-q", "-b", "remote-only"]);
+				yield* commitFile(other, "remote.txt");
+				yield* runGit(other, ["push", "-q", "origin", "remote-only"]);
+				yield* runGit(project.path, ["fetch", "-q", "origin"]);
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "remote-only",
+				});
+				const missing = yield* Effect.flip(
+					workspaces.create({ kind: "worktree", projectId: project.id, name: "other", baseBranch: "nowhere" }),
+				);
+				const fs = yield* FileSystem.FileSystem;
+				return {
+					checkedOut: yield* runGit(created.path, ["branch", "--show-current"]),
+					hasFile: yield* fs.exists(join(created.path, "remote.txt")),
+					localBranches: yield* runGit(project.path, ["branch", "--format=%(refname:short)"]),
+					missing: missing._tag,
+				};
+			}),
+		);
+		expect(result.checkedOut).toBe("feature");
+		expect(result.hasFile).toBe(true);
+		expect(result.localBranches.split("\n")).toEqual(["feature", "main"]);
+		expect(result.missing).toBe("BranchNotFoundError");
+	});
+
 	test("checks out an existing local branch in a folder named after it", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
