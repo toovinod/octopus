@@ -1,10 +1,9 @@
-import { Predicate } from "effect";
-("use client");
+"use client";
 
 import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup, usePanelRef } from "@repo/ui/components/resizable";
-import { onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
+import { isReason, onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
 import { isMac, shortcutKey } from "../lib/shortcutKey.ts";
 import { quitWarning } from "../lib/quitWarning.ts";
 import { setQuitWarning } from "../lib/desktop.ts";
@@ -80,7 +79,7 @@ const DaemonStopped = ({ reason }: { reason: string | null }) => {
 		setRestart("restarting");
 		restartDaemon().catch((error: unknown) => {
 			// The shell rejects with the daemon's own reason when it printed one.
-			if (Predicate.isString(error)) setFailure(error);
+			if (isReason(error)) setFailure(error);
 			setRestart("failed");
 		});
 	};
