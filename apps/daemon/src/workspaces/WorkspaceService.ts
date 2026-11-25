@@ -16,14 +16,14 @@ import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingEr
 import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
+import { applyScriptRunEvent, runSetupScript, setupRetryDelay } from "./runSetupScript.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
+import { holdsForkCode, isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
-import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
-import { isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
@@ -233,10 +233,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				})
 				.pipe(Effect.andThen(fs.chmod(worktreesDir, PRIVATE_DIRECTORY_MODE)), Effect.orDie);
 
-			const newSetupRun = Effect.fn("WorkspaceService.newSetupRun")(function* (owner: Project, workspaceId: string) {
-				if (owner.setupScript === null) {
-					return null;
-				}
+			const newSetupRun = Effect.fn("WorkspaceService.newSetupRun")(function* (workspaceId: string) {
 				const now = yield* nowIso;
 				return {
 					id: yield* newId,
@@ -244,8 +241,12 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					kind: "setup",
 					status: "pending",
 					attempts: 0,
+					lastError: null,
+					exitCode: null,
 					createdAt: now,
 					updatedAt: now,
+					startedAt: null,
+					finishedAt: null,
 				} satisfies ScriptRunRow;
 			});
 
@@ -286,7 +287,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						baseBranch: plan.baseBranch,
 						fromFork: plan.fromFork,
 					};
-					setupRun = plan.fromFork ? null : yield* newSetupRun(owner, id);
+					setupRun = plan.fromFork || owner.setupScript === null ? null : yield* newSetupRun(id);
 				} else {
 					const current = yield* runGit(owner.path, ["branch", "--show-current"]);
 					row = {
@@ -327,7 +328,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					// Never block the RPC on the script.
 					yield* startSetupScript(setupRun.id, owner.setupScript, row.path);
 				}
-				return new Workspace(row);
+				return yield* withForkState(row);
 			}, Effect.provide(services));
 
 			// What a new workspace can start from, read from the project's repository and its GitHub remote.
@@ -353,12 +354,20 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				return new Workspace(row);
 			});
 
+			// What the UI is sent. An active workspace's folder may have switched to a fork's branch since it was made, as
+			// with `gh pr checkout` in an in-place workspace, so its fork state is read again.
+			const withForkState = (row: WorkspaceRow) =>
+				(row.status === "active" ? holdsForkCode(row) : Effect.succeed(row.fromFork)).pipe(
+					Effect.map((fromFork) => new Workspace({ ...row, fromFork })),
+					Effect.provide(services),
+				);
+
 			const list = (projectId: string) =>
 				database
 					.query((db) =>
 						db.select().from(workspace).where(eq(workspace.projectId, projectId)).orderBy(asc(workspace.createdAt)),
 					)
-					.pipe(Effect.map((rows) => rows.map((row) => new Workspace(row))));
+					.pipe(Effect.flatMap((rows) => Effect.forEach(rows, withForkState, { concurrency: "unbounded" })));
 
 			const cancelScripts = Effect.fn("WorkspaceService.cancelScripts")(function* (
 				workspaceId: string,
@@ -497,7 +506,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						const setupBefore = yield* database.query((db) =>
 							db.$count(scriptRun, and(eq(scriptRun.workspaceId, workspaceId), eq(scriptRun.kind, "setup"))),
 						);
-						setupRun = setupBefore > 0 ? yield* newSetupRun(owner, workspaceId) : null;
+						setupRun = setupBefore > 0 && owner.setupScript !== null ? yield* newSetupRun(workspaceId) : null;
 					}
 					const restored = yield* database.query((db) =>
 						db.transaction((tx) =>
@@ -533,7 +542,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (setupRun !== null && owner.setupScript !== null) {
 						yield* startSetupScript(setupRun.id, owner.setupScript, current.path);
 					}
-					return yield* get(workspaceId);
+					return yield* withForkState(yield* get(workspaceId));
 				},
 				(effect, workspaceId) => workspaceLock.restoring(workspaceId, effect),
 				Semaphore.withPermit(archiveLock),
@@ -670,23 +679,17 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (last !== undefined && (last.status === "pending" || last.status === "processing")) {
 						return last;
 					}
-					let scriptRunId: string;
+					let run: ScriptRun;
 					if (last !== undefined && (last.status === "failed" || last.status === "deadLetter")) {
-						scriptRunId = last.id;
-						yield* applyScriptRunEvent(scriptRunId, { _tag: "Retried" });
+						run = new ScriptRun({ ...last, ...(yield* applyScriptRunEvent(last.id, { _tag: "Retried" })) });
 					} else {
-						const setupRun = yield* newSetupRun(owner, workspaceId);
-						if (setupRun === null) {
-							return yield* new SetupScriptMissingError({ projectId: owner.id });
-						}
-						scriptRunId = setupRun.id;
+						const setupRun = yield* newSetupRun(workspaceId);
 						yield* database.query((db) => db.insert(scriptRun).values(setupRun));
+						run = new ScriptRun(setupRun);
 					}
-					yield* startSetupScript(scriptRunId, script, current.path);
-					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
-					const [row] = yield* database.query((db) => db.select().from(scriptRun).where(eq(scriptRun.id, scriptRunId)));
-					// The row was written just above and runs go only with their workspace.
-					return row === undefined ? yield* Effect.die("The setup run is missing") : new ScriptRun(row);
+					yield* startSetupScript(run.id, script, current.path);
+					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId: run.id }));
+					return run;
 				},
 				Semaphore.withPermit(runScriptLock),
 				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),
@@ -762,7 +765,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				for (const run of pending) {
 					if (run.kind === "setup" && run.workspaceStatus === "active" && run.script !== null) {
 						// A run that already failed waits out the retry delay it would have had, rather than starting at once.
-						const delay = run.attempts === 0 ? Duration.zero : Duration.times(retryBaseDelay, 2 ** (run.attempts - 1));
+						const delay = run.attempts === 0 ? Duration.zero : yield* setupRetryDelay(retryBaseDelay, run.attempts);
 						yield* startSetupScript(run.id, run.script, run.path, delay);
 					} else {
 						yield* applyScriptRunEvent(run.id, {
@@ -782,6 +785,22 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			});
 			yield* recoverScriptRuns.pipe(Effect.provide(services));
 
+			const pruneProjectWorktrees = Effect.fnUntraced(function* (owner: Project, ownedPaths: ReadonlySet<string>) {
+				const folder = join(worktreesDir, owner.id);
+				if (!(yield* fs.exists(folder))) return;
+				const realFolder = yield* fs.realPath(folder);
+				const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
+				for (const line of listed.split("\n")) {
+					if (!line.startsWith("worktree ")) continue;
+					const path = line.slice("worktree ".length);
+					if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
+					// Rows hold the path Octopus made, which git may list with symlinks resolved.
+					if (ownedPaths.has(join(folder, basename(path)))) continue;
+					yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
+					yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
+				}
+			});
+
 			// A crash between adding a worktree and saving its workspace leaves a folder that no workspace owns and
 			// that blocks its name. Nothing ran in it yet, so it goes. Its branch stays, in case it holds commits.
 			const pruneOrphanWorktrees = Effect.gen(function* () {
@@ -793,21 +812,21 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 				const ownedPaths = new Set(owned.map((row) => row.path));
 				for (const owner of yield* projects.list) {
-					const folder = join(worktreesDir, owner.id);
-					if (!(yield* fs.exists(folder))) continue;
-					const realFolder = yield* fs.realPath(folder);
-					const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
-					for (const line of listed.split("\n")) {
-						if (!line.startsWith("worktree ")) continue;
-						const path = line.slice("worktree ".length);
-						if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
-						// Rows hold the path Octopus made, which git may list with symlinks resolved.
-						if (ownedPaths.has(join(folder, basename(path)))) continue;
-						yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
-						yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
-					}
+					// Per project, so one whose folder is gone does not keep the others' orphans.
+					const giveUp = (cause: unknown) =>
+						Effect.logError("Could not look for worktrees that no workspace owns", cause).pipe(
+							Effect.annotateLogs({ projectId: owner.id }),
+						);
+					yield* pruneProjectWorktrees(owner, ownedPaths).pipe(
+						Effect.catchTags({
+							PlatformError: giveUp,
+							GitCommandError: giveUp,
+							GitSpawnError: giveUp,
+							GitTimeoutError: giveUp,
+						}),
+					);
 				}
-			}).pipe(Effect.catch((cause) => Effect.logError("Could not look for worktrees that no workspace owns", cause)));
+			});
 			yield* pruneOrphanWorktrees.pipe(Effect.provide(services));
 
 			return {

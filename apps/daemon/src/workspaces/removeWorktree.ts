@@ -3,6 +3,10 @@ import { resolveBranchRef } from "./createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
 import { Effect } from "effect";
 
+// Folders that installs and builds fill, matched as the directory entries `git ls-files --directory` lists.
+const REGENERABLE_FOLDER =
+	/(^|\/)(node_modules|dist|build|\.next|\.turbo|target|\.venv|venv|__pycache__|\.cache|coverage|out)\/$/;
+
 export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreePath: string, baseBranch: string) {
 	const status = yield* runGit(worktreePath, ["status", "--porcelain"]);
 	// Each line is "XY path"; renames read "XY old -> new".
@@ -16,7 +20,8 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 	}
 	const exclude = base === null ? [] : [`^${base}`];
 	const unpushed = yield* runGit(worktreePath, ["rev-list", "--count", "HEAD", ...exclude, "--not", "--remotes"]);
-	// Ignored files such as .env are not stashed, so they go with the folder. Installed dependencies are meant to.
+	// Ignored files such as .env are not stashed, so they go with the folder. Installed dependencies and build
+	// output are meant to, since an install or a build makes them again.
 	const ignored = yield* runGit(worktreePath, [
 		"ls-files",
 		"--others",
@@ -25,7 +30,7 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 		"--directory",
 		"-z",
 	]);
-	const ignoredFiles = ignored.split("\0").filter((entry) => entry !== "" && !/(^|\/)node_modules\/$/.test(entry));
+	const ignoredFiles = ignored.split("\0").filter((entry) => entry !== "" && !REGENERABLE_FOLDER.test(entry));
 	return { changedFiles, unpushedCommits: Number(unpushed), ignoredFiles };
 });
 

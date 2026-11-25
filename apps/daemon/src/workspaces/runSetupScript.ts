@@ -1,5 +1,5 @@
 import { IllegalJobTransitionError, type JobEvent, transitionJob } from "../jobs/transitionJob.ts";
-import { Duration, Effect, Fiber, PubSub, Schedule, Schema, Stream } from "effect";
+import { Duration, Effect, Fiber, PubSub, Random, Schedule, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
@@ -42,6 +42,11 @@ const OUTPUT_GRACE = Duration.seconds(1);
 type ScriptError = ScriptExitError | ScriptTimeoutError | ScriptSpawnError;
 
 const isRetryable = (error: ScriptError) => error._tag !== "ScriptExitError";
+
+// The wait before retrying a setup script after its `attempts`th failed attempt: doubling from the base, with
+// jitter so runs that failed together do not all retry at once. Retries and a restart's recovery both use it.
+export const setupRetryDelay = (base: Duration.Duration, attempts: number) =>
+	Random.next.pipe(Effect.map((random) => Duration.times(base, 2 ** (attempts - 1) * (0.8 + 0.4 * random))));
 
 // Signals Effect.retry that the run went back to pending and should run again.
 class ScriptRetryScheduled extends Schema.TaggedError<ScriptRetryScheduled>()("ScriptRetryScheduled", {}) {}
@@ -168,7 +173,9 @@ export const runSetupScript = Effect.fn("runSetupScript")(
 
 		yield* attempt.pipe(
 			Effect.retry({
-				schedule: Schedule.exponential(settings.retryBaseDelay).pipe(Schedule.jittered),
+				schedule: Schedule.forever.pipe(
+					Schedule.modifyDelay(({ attempt }) => setupRetryDelay(settings.retryBaseDelay, attempt)),
+				),
 				while: (error) => error._tag === "ScriptRetryScheduled",
 			}),
 		);

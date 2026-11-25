@@ -596,6 +596,88 @@ describe("GitService pull requests", () => {
 	});
 });
 
+describe("GitService on a branch that tracks another remote", () => {
+	// Hooks that leave a mark, so the test sees whether Octopus treated the branch as a fork's.
+	const addMarkingHooks = Effect.fn("addMarkingHooks")(function* (tempDir: string, repositoryPath: string) {
+		const fs = yield* FileSystem.FileSystem;
+		for (const hook of ["pre-commit", "pre-push"]) {
+			const path = join(repositoryPath, ".git", "hooks", hook);
+			yield* fs.writeFileString(path, `#!/bin/sh\ntouch "${tempDir}/${hook}-ran"\n`);
+			yield* fs.chmod(path, 0o755);
+		}
+	});
+
+	test("treats a branch that tracks a named remote such as upstream as the project's own, and pushes it to origin", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const git = yield* GitService;
+				const created = yield* createWorkspace(tempDir);
+				const repositoryPath = join(tempDir, "repo");
+				const origin = yield* addOrigin(tempDir, repositoryPath);
+				const upstream = join(tempDir, "upstream.git");
+				yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", upstream]);
+				yield* runGit(repositoryPath, ["remote", "add", "upstream", upstream]);
+				yield* runGit(repositoryPath, ["config", "branch.feature.remote", "upstream"]);
+				yield* runGit(repositoryPath, ["config", "branch.feature.merge", "refs/heads/main"]);
+				yield* addMarkingHooks(tempDir, repositoryPath);
+				yield* fs.writeFileString(join(created.path, "fix.txt"), "fix\n");
+				yield* git.commit(created.id, "own fix", null);
+				yield* git.push(created.id);
+				return {
+					originBranch: yield* runGit(origin, ["log", "-1", "--format=%s", "feature"]),
+					upstreamBranches: yield* runGit(upstream, ["branch", "--list"]),
+					hooksRan:
+						(yield* fs.exists(join(tempDir, "pre-commit-ran"))) && (yield* fs.exists(join(tempDir, "pre-push-ran"))),
+				};
+			}),
+		);
+		expect(result.originBranch).toBe("own fix");
+		expect(result.upstreamBranches).toBe("");
+		expect(result.hooksRan).toBe(true);
+	});
+
+	test("treats an unmarked branch that pulls from a fork's URL as a fork's, as `gh pr checkout` leaves it", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const git = yield* GitService;
+				const repositoryPath = join(tempDir, "repo");
+				yield* makeTestRepository(repositoryPath);
+				const origin = yield* addOrigin(tempDir, repositoryPath);
+				const fork = join(tempDir, "fork.git");
+				yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", fork]);
+				yield* runGit(repositoryPath, ["checkout", "-b", "contrib"]);
+				yield* runGit(repositoryPath, ["config", "branch.contrib.remote", fork]);
+				yield* runGit(repositoryPath, ["config", "branch.contrib.merge", "refs/heads/their-branch"]);
+				yield* addMarkingHooks(tempDir, repositoryPath);
+				const project = yield* Effect.flatMap(ProjectService, (projects) => projects.add(repositoryPath));
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				yield* fs.writeFileString(join(created.path, "fix.txt"), "fix\n");
+				yield* git.commit(created.id, "review fix", null);
+				yield* git.push(created.id);
+				return {
+					created: created.fromFork,
+					listed: (yield* workspaces.list(project.id)).map((workspace) => workspace.fromFork),
+					forkBranch: yield* runGit(fork, ["log", "-1", "--format=%s", "their-branch"]),
+					originBranches: yield* runGit(origin, ["branch", "--list"]),
+					hooksRan:
+						(yield* fs.exists(join(tempDir, "pre-commit-ran"))) || (yield* fs.exists(join(tempDir, "pre-push-ran"))),
+					createError: yield* Effect.flip(git.createPullRequest(created.id, { title: "x", body: "", draft: false })),
+				};
+			}),
+		);
+		// The UI hides Create PR and confirms Run by this.
+		expect(result.created).toBe(true);
+		expect(result.listed).toEqual([true]);
+		expect(result.forkBranch).toBe("review fix");
+		expect(result.originBranches).toBe("");
+		expect(result.hooksRan).toBe(false);
+		expect(result.createError._tag).toBe("ForkPullRequestError");
+	});
+});
+
 describe("GitService in a fork's workspace", () => {
 	// A worktree whose branch came from a fork's pull request, as `gh pr checkout` leaves it, plus hooks that
 	// would fail any commit or push they ran for.

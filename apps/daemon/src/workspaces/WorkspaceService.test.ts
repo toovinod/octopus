@@ -314,6 +314,28 @@ describe("WorkspaceService", () => {
 		expect(result.folderExists).toBe(false);
 	});
 
+	test("archives a worktree whose only ignored files are build output that a build makes again", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), "dist/\n.next/\n__pycache__/\n");
+				yield* fs.makeDirectory(join(project.path, "packages", "app"), { recursive: true });
+				yield* fs.writeFileString(join(project.path, "packages", "app", "index.js"), "app\n");
+				yield* runGit(project.path, ["add", "."]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				for (const folder of ["dist", ".next", join("packages", "app", "dist"), join("packages", "__pycache__")]) {
+					yield* fs.makeDirectory(join(created.path, folder), { recursive: true });
+					yield* fs.writeFileString(join(created.path, folder, "out.js"), "built\n");
+				}
+				return yield* workspaces.archive(created.id, { force: false });
+			}),
+		);
+		expect(result.status).toBe("archived");
+	});
+
 	test("archives a worktree with an initialized submodule", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -457,14 +479,15 @@ describe("WorkspaceService", () => {
 				yield* Effect.flatMap(ProjectService, (projects) =>
 					projects.updateScripts(project.id, { setupScript: "true", runScript: null }),
 				);
-				yield* workspaces.startSetupScriptRun(created.id);
+				const started = yield* workspaces.startSetupScriptRun(created.id);
 				const retried = yield* waitForScriptRun(created.id);
 				yield* workspaces.archive(created.id, { force: true });
 				const refused = yield* Effect.flip(workspaces.startSetupScriptRun(created.id));
-				return { failed, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
+				return { failed, started, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
 			}),
 		);
 		expect(result.failed?.status).toBe("failed");
+		expect(result.started).toMatchObject({ id: result.failed?.id, status: "pending", attempts: 0, lastError: null });
 		expect(result.retried).toMatchObject({ id: result.failed?.id, status: "completed", attempts: 0, lastError: null });
 		expect(result.runs).toHaveLength(1);
 		expect(result.refused._tag).toBe("WorkspaceArchivedError");
@@ -589,6 +612,34 @@ describe("WorkspaceService", () => {
 			}),
 		);
 		expect(result).toEqual({ orphanExists: false, ownedExists: true, orphanBranch: true });
+	});
+
+	test("on startup, a project that cannot be checked does not keep the others' orphans", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const dataDir = join(tempDir, "data");
+				// First lifetime: a project whose folder goes away later, then one with an orphan.
+				const { broken, orphan } = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const projects = yield* ProjectService;
+						const broken = yield* projects.add(yield* makeTestRepository(join(tempDir, "gone", "repo")));
+						yield* fs.makeDirectory(join(dataDir, "worktrees", broken.id), { recursive: true });
+						// Added later, so startup checks it after the broken one.
+						yield* Effect.sleep("10 millis");
+						const project = yield* projects.add(yield* makeTestRepository(join(tempDir, "kept", "repo")));
+						const orphan = join(dataDir, "worktrees", project.id, "orphan");
+						yield* runGit(project.path, ["worktree", "add", "-q", "-b", "orphan", orphan]);
+						return { broken, orphan };
+					}),
+				);
+				yield* fs.remove(broken.path, { recursive: true });
+				// Second lifetime: startup still finds the orphan.
+				yield* withServices(dataDir)(Effect.void);
+				return yield* fs.exists(orphan);
+			}),
+		);
+		expect(result).toBe(false);
 	});
 
 	test("removes the new worktree and branch when the workspace cannot be saved", async () => {

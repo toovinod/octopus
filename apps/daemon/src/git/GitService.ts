@@ -35,7 +35,6 @@ import {
 	parseNameStatus,
 	parseNumstat,
 	parsePatch,
-	parseTypeChanges,
 	parseStatus,
 	untrackedHunks,
 } from "./parseGitOutput.ts";
@@ -44,7 +43,7 @@ import { Context, Effect, type FileSystem, Layer, Schema } from "effect";
 import { type GhCommandError, requireGhLogin, runGh } from "./runGh.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { readWorkspaceFile } from "../files/readWorkspaceFile.ts";
-import { isForkCheckout } from "../workspaces/forkBranch.ts";
+import { holdsForkCode } from "../workspaces/forkBranch.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { leavesRoot } from "../files/leavesRoot.ts";
 import { normalize } from "node:path";
@@ -169,13 +168,10 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			return current;
 		});
 
-		// A fork's code, stored at creation or seen now on the checked-out branch, as in an in-place workspace.
-		const holdsFork = (current: Workspace) => (current.fromFork ? Effect.succeed(true) : isForkCheckout(current.path));
-
 		// A fork's checkout can set core.hooksPath to its own tracked files, and Octopus never runs a fork's code
 		// unasked, so commits and pushes in one skip the hooks.
 		const hookArgs = (current: Workspace) =>
-			holdsFork(current).pipe(Effect.map((fork) => (fork ? ["-c", "core.hooksPath=/dev/null"] : [])));
+			holdsForkCode(current).pipe(Effect.map((fork) => (fork ? ["-c", "core.hooksPath=/dev/null"] : [])));
 
 		// The point where the workspace left its base branch. Without one (unrelated histories, a missing
 		// base branch) the diff falls back to HEAD and shows only uncommitted changes.
@@ -264,8 +260,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 							),
 						]);
 			const sections = parsePatch(patch);
-			const typeChanges = parseTypeChanges(nameStatus);
-			const expected = fitting.length + fitting.filter(({ changed }) => typeChanges.has(changed.path)).length;
+			const expected = fitting.length + fitting.filter(({ changed }) => changed.typeChanged).length;
 			if (sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
@@ -276,7 +271,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			if (sections.length === expected) {
 				let next = 0;
 				for (const { changed } of fitting) {
-					const parts = sections.slice(next, next + (typeChanges.has(changed.path) ? 2 : 1));
+					const parts = sections.slice(next, next + (changed.typeChanged ? 2 : 1));
 					next += parts.length;
 					hunksByPath.set(changed.path, { hunks: parts.flatMap((part) => part.hunks) });
 				}
@@ -285,7 +280,9 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const toDiffFile = ({ changed, count }: { changed: ChangedPath; count: LineCounts }) => {
 				const section = hunksByPath.get(changed.path);
 				return new DiffFile({
-					...changed,
+					path: changed.path,
+					oldPath: changed.oldPath,
+					status: changed.status,
 					additions: count.additions,
 					deletions: count.deletions,
 					content: count.binary
@@ -492,7 +489,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		) {
 			const current = yield* activeWorkspace(workspaceId);
 			// A fork's branch already has its pull request, and a new one would be opened from the wrong repository.
-			if (yield* holdsFork(current)) {
+			if (yield* holdsForkCode(current)) {
 				return yield* new ForkPullRequestError({ branch: current.branch });
 			}
 			// Checked first, so a missing login does not leave a pushed branch and no pull request.
@@ -652,7 +649,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const { branch } = current;
 			const number = yield* requirePullRequestNumber(current);
 			// A fork's branch lives in the fork, which Octopus does not push deletes to.
-			const fork = deleteBranch && (yield* holdsFork(current));
+			const fork = deleteBranch && (yield* holdsForkCode(current));
 			if (fork) {
 				yield* Effect.logInfo("Kept the fork's branch, which lives in the fork").pipe(
 					Effect.annotateLogs({ workspaceId }),

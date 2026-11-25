@@ -157,6 +157,7 @@ describe("ProjectService", () => {
 			GIT_CONFIG_KEY_2: "gpg.program",
 			GIT_CONFIG_VALUE_2: "false",
 		};
+		const previous = Object.fromEntries(Object.keys(isolated).map((key) => [key, process.env[key]]));
 		Object.assign(process.env, isolated);
 		const log = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -164,7 +165,10 @@ describe("ProjectService", () => {
 				return yield* runGit(created.path, ["log", "--format=%s by %an"]);
 			}),
 		).finally(() => {
-			for (const key of Object.keys(isolated)) delete process.env[key];
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 		});
 		expect(log).toBe("Initial commit by Octopus");
 	});
