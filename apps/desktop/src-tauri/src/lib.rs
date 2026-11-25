@@ -70,7 +70,12 @@ impl DaemonStatus {
 
 // The status an event from octopusd moves to, or None when the event does not change it. Only a starting
 // daemon becomes ready, so a later line that happens to look like the ready line cannot change the URL.
-fn status_after(event: &CommandEvent, token: &str, current: &DaemonStatus, failure: Option<&str>) -> Option<DaemonStatus> {
+fn status_after(
+  event: &CommandEvent,
+  token: &str,
+  current: &DaemonStatus,
+  failure: Option<&str>,
+) -> Option<DaemonStatus> {
   match event {
     CommandEvent::Stdout(line) if *current == DaemonStatus::Starting => String::from_utf8_lossy(line)
       .trim()
@@ -220,7 +225,9 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
       failure = failure_reason(&event).or(failure);
       let status = status_after(&event, &token, &daemon.status.borrow(), failure.as_deref());
       match &event {
-        CommandEvent::Stdout(line) if status.is_none() => log::info!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
+        CommandEvent::Stdout(line) if status.is_none() => {
+          log::info!("octopusd: {}", String::from_utf8_lossy(line).trim_end())
+        }
         CommandEvent::Stderr(line) => log::warn!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
         CommandEvent::Terminated(payload) => log::info!("octopusd exited: {payload:?}"),
         _ => {}
@@ -267,11 +274,7 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_opener::init())
-    .plugin(
-      tauri_plugin_log::Builder::default()
-        .level(log::LevelFilter::Info)
-        .build(),
-    )
+    .plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())
     .on_menu_event(|app, event| {
       if event.id() == CLOSE_WINDOW_ID
         && let Some(window) = app.webview_windows().values().find(|window| window.is_focused().unwrap_or(false))
@@ -450,12 +453,16 @@ mod tests {
     assert_eq!(reason.as_deref(), Some("Another Octopus is already running."));
     assert_eq!(failure_reason(&CommandEvent::Stdout(b"listening\n".to_vec())), None);
     let status = status_after(&exited(), "secret", &DaemonStatus::Starting, reason.as_deref());
-    assert_eq!(status.and_then(|status| status.connection()), Some(Err("Another Octopus is already running.".to_string())));
+    assert_eq!(
+      status.and_then(|status| status.connection()),
+      Some(Err("Another Octopus is already running.".to_string()))
+    );
   }
 
   #[test]
   fn the_login_environment_skips_startup_output_and_shell_variables() {
-    let output = b"Welcome!\n\0OCTOPUS_LOGIN_ENV\0PATH=/opt/bin:/usr/bin\0NOTE=two\nlines\0PWD=/home\0SHLVL=2\0EMPTY=\0";
+    let output =
+      b"Welcome!\n\0OCTOPUS_LOGIN_ENV\0PATH=/opt/bin:/usr/bin\0NOTE=two\nlines\0PWD=/home\0SHLVL=2\0EMPTY=\0";
     assert_eq!(
       parse_login_env(output),
       vec![
