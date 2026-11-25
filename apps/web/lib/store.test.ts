@@ -51,8 +51,9 @@ const daemon = {
 	listSessions: () => [session],
 	listAgents: () => {
 		agentLists++;
-		return [];
+		return [{ kind: "claude", availability: { status: "ready" }, defaultModel: "replay", models: [{ id: "replay" }] }];
 	},
+	createSession: pendingUpdate,
 	loadSessionHistory: () => [],
 	removeProject: () => undefined,
 	revertToMessage: () => [{ path: "README.md", change: "modified" }],
@@ -89,11 +90,13 @@ const {
 	failedSendsOf,
 	getState,
 	isConnectionDrop,
+	newChat,
 	reconnectDelay,
 	removeProject,
 	retryFailedSend,
 	renameSession,
 	revertToMessage,
+	selectSession,
 	sendMessage,
 	updateSessionSettings,
 	workingChats,
@@ -254,5 +257,28 @@ describe("workingChats", () => {
 		expect(of({ status: "idle" }, { status: "failed" })).toBe("");
 		expect(of({ status: "running" }, { status: "awaitingApproval" })).toBe("0 1");
 		expect(of({ status: "running", workspaceId: "other" })).toBe("");
+	});
+});
+
+describe("new chats", () => {
+	test("a chat that arrives after the user moved on does not take the selection", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, id: "t", createdAt: "2" });
+		const created = newChat("w");
+		selectSession("t");
+		settleUpdate({ ...session, id: "n", createdAt: "3" });
+		expect(await created).toBe("n");
+		expect(getState().selectedSessionId).toBe("t");
+		expect(getState().sessions.n).toBeDefined();
+	});
+
+	test("a chat that arrives while the selection stayed opens", async () => {
+		await boot();
+		await sleep(0);
+		const created = newChat("w");
+		settleUpdate({ ...session, id: "m", createdAt: "4" });
+		await created;
+		expect(getState().selectedSessionId).toBe("m");
 	});
 });

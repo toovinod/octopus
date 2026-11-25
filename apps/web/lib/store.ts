@@ -356,10 +356,15 @@ export const updateProjectScripts = async (projectId: string, setupScript: strin
 
 // Workspaces
 
+// Creating a chat or workspace takes a moment. If the user picked something else meanwhile, the new one waits in the
+// sidebar instead of pulling them back.
+const currentSelection = () => `${state.selectedWorkspaceId} ${state.selectedSessionId}`;
+
 export const createWorkspace = async (input: CreateWorkspaceInput) => {
+	const selection = currentSelection();
 	const workspace = await callDaemon((daemon) => daemon.createWorkspace(input));
 	setState((current) => ({ workspaces: { ...current.workspaces, [workspace.id]: workspace } }));
-	selectWorkspace(workspace.id);
+	if (currentSelection() === selection) selectWorkspace(workspace.id);
 	return workspace;
 };
 
@@ -483,6 +488,7 @@ export const newChat = async (
 		toast("No agent is available. Check Settings.", "info");
 		return null;
 	}
+	const selection = currentSelection();
 	const session = await attempt(() =>
 		callDaemon((daemon) =>
 			daemon.createSession({ workspaceId, agent: agent.kind, model: model.id, effort: model.defaultEffort }),
@@ -490,7 +496,7 @@ export const newChat = async (
 	);
 	if (session === null) return null;
 	setState((current) => ({ sessions: { ...current.sessions, [session.id]: session } }));
-	selectSession(session.id);
+	if (currentSelection() === selection) selectSession(session.id);
 	return session.id;
 };
 
