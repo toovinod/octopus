@@ -233,10 +233,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				})
 				.pipe(Effect.andThen(fs.chmod(worktreesDir, PRIVATE_DIRECTORY_MODE)), Effect.orDie);
 
-			const newSetupRun = Effect.fn("WorkspaceService.newSetupRun")(function* (owner: Project, workspaceId: string) {
-				if (owner.setupScript === null) {
-					return null;
-				}
+			const newSetupRun = Effect.fn("WorkspaceService.newSetupRun")(function* (workspaceId: string) {
 				const now = yield* nowIso;
 				return {
 					id: yield* newId,
@@ -244,8 +241,12 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					kind: "setup",
 					status: "pending",
 					attempts: 0,
+					lastError: null,
+					exitCode: null,
 					createdAt: now,
 					updatedAt: now,
+					startedAt: null,
+					finishedAt: null,
 				} satisfies ScriptRunRow;
 			});
 
@@ -286,7 +287,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						baseBranch: plan.baseBranch,
 						fromFork: plan.fromFork,
 					};
-					setupRun = plan.fromFork ? null : yield* newSetupRun(owner, id);
+					setupRun = plan.fromFork || owner.setupScript === null ? null : yield* newSetupRun(id);
 				} else {
 					const current = yield* runGit(owner.path, ["branch", "--show-current"]);
 					row = {
@@ -505,7 +506,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						const setupBefore = yield* database.query((db) =>
 							db.$count(scriptRun, and(eq(scriptRun.workspaceId, workspaceId), eq(scriptRun.kind, "setup"))),
 						);
-						setupRun = setupBefore > 0 ? yield* newSetupRun(owner, workspaceId) : null;
+						setupRun = setupBefore > 0 && owner.setupScript !== null ? yield* newSetupRun(workspaceId) : null;
 					}
 					const restored = yield* database.query((db) =>
 						db.transaction((tx) =>
@@ -678,23 +679,17 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (last !== undefined && (last.status === "pending" || last.status === "processing")) {
 						return last;
 					}
-					let scriptRunId: string;
+					let run: ScriptRun;
 					if (last !== undefined && (last.status === "failed" || last.status === "deadLetter")) {
-						scriptRunId = last.id;
-						yield* applyScriptRunEvent(scriptRunId, { _tag: "Retried" });
+						run = new ScriptRun({ ...last, ...(yield* applyScriptRunEvent(last.id, { _tag: "Retried" })) });
 					} else {
-						const setupRun = yield* newSetupRun(owner, workspaceId);
-						if (setupRun === null) {
-							return yield* new SetupScriptMissingError({ projectId: owner.id });
-						}
-						scriptRunId = setupRun.id;
+						const setupRun = yield* newSetupRun(workspaceId);
 						yield* database.query((db) => db.insert(scriptRun).values(setupRun));
+						run = new ScriptRun(setupRun);
 					}
-					yield* startSetupScript(scriptRunId, script, current.path);
-					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
-					const [row] = yield* database.query((db) => db.select().from(scriptRun).where(eq(scriptRun.id, scriptRunId)));
-					// The row was written just above and runs go only with their workspace.
-					return row === undefined ? yield* Effect.die("The setup run is missing") : new ScriptRun(row);
+					yield* startSetupScript(run.id, script, current.path);
+					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId: run.id }));
+					return run;
 				},
 				Semaphore.withPermit(runScriptLock),
 				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),

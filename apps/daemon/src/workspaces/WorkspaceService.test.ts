@@ -479,14 +479,15 @@ describe("WorkspaceService", () => {
 				yield* Effect.flatMap(ProjectService, (projects) =>
 					projects.updateScripts(project.id, { setupScript: "true", runScript: null }),
 				);
-				yield* workspaces.startSetupScriptRun(created.id);
+				const started = yield* workspaces.startSetupScriptRun(created.id);
 				const retried = yield* waitForScriptRun(created.id);
 				yield* workspaces.archive(created.id, { force: true });
 				const refused = yield* Effect.flip(workspaces.startSetupScriptRun(created.id));
-				return { failed, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
+				return { failed, started, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
 			}),
 		);
 		expect(result.failed?.status).toBe("failed");
+		expect(result.started).toMatchObject({ id: result.failed?.id, status: "pending", attempts: 0, lastError: null });
 		expect(result.retried).toMatchObject({ id: result.failed?.id, status: "completed", attempts: 0, lastError: null });
 		expect(result.runs).toHaveLength(1);
 		expect(result.refused._tag).toBe("WorkspaceArchivedError");
