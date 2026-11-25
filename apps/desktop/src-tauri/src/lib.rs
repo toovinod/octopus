@@ -3,10 +3,10 @@ use std::{
   process::{Command, Stdio},
   sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    mpsc, Mutex,
   },
   thread,
-  time::{Duration, Instant},
+  time::Duration,
 };
 
 use serde::Serialize;
@@ -146,38 +146,61 @@ fn generate_token() -> Result<String, getrandom::Error> {
   Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-// An app opened from Finder or a desktop launcher gets a minimal PATH without the user's
-// `claude`, `codex`, `node` or `gh`. Their login shell sets the real one.
-fn login_shell_path() -> Option<String> {
+// Printed before the environment, so anything the shell's startup files print is skipped.
+const ENV_MARKER: &[u8] = b"\0OCTOPUS_LOGIN_ENV\0";
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+// Far more than any real environment, so a runaway startup file cannot fill memory.
+const LOGIN_SHELL_OUTPUT_LIMIT: u64 = 1024 * 1024;
+// Describe the shell that printed them, not the daemon.
+const SHELL_SESSION_VARIABLES: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+// An app opened from Finder or a desktop launcher gets a minimal environment without the user's PATH (so no
+// `claude`, `codex`, `node` or `gh`), proxy settings or tool variables. Their login shell sets the real ones.
+fn login_shell_env() -> Option<Vec<(String, String)>> {
   let shell = std::env::var("SHELL").ok()?;
-  // Interactive too, because many people set PATH in .zshrc or .bashrc. Taking the last line
-  // skips anything the shell's startup files print.
-  let mut child = Command::new(shell)
-    .args(["-ilc", r#"printf '\n%s' "$PATH""#])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .ok()?;
-  let deadline = Instant::now() + Duration::from_secs(5);
-  while child.try_wait().ok()?.is_none() {
-    if Instant::now() > deadline {
-      let _ = child.kill();
-      return None;
-    }
-    thread::sleep(Duration::from_millis(20));
-  }
-  let mut output = String::new();
-  child.stdout.take()?.read_to_string(&mut output).ok()?;
-  output.lines().last().filter(|path| !path.is_empty()).map(str::to_string)
+  // Interactive too, because many people set PATH in .zshrc or .bashrc.
+  let mut command = Command::new(shell);
+  command.args(["-ilc", r#"printf '\0OCTOPUS_LOGIN_ENV\0'; env -0"#]);
+  let output = output_within(command, LOGIN_SHELL_TIMEOUT)?;
+  Some(parse_login_env(&output)).filter(|variables| !variables.is_empty())
+}
+
+// Reads on another thread: a startup file can leave a background process holding stdout open, and then
+// the read never ends. The deadline covers the read too, and the thread is left to finish on its own.
+fn output_within(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+  let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+  let stdout = child.stdout.take()?;
+  let (sender, receiver) = mpsc::channel();
+  thread::spawn(move || {
+    let mut output = Vec::new();
+    let read = stdout.take(LOGIN_SHELL_OUTPUT_LIMIT).read_to_end(&mut output).map(|_| output);
+    let _ = sender.send(read);
+  });
+  let output = receiver.recv_timeout(timeout);
+  let _ = child.kill();
+  let _ = child.wait();
+  output.ok()?.ok()
+}
+
+// `env -0` output after the marker: NAME=value entries, each ended by a NUL, values can hold newlines.
+fn parse_login_env(output: &[u8]) -> Vec<(String, String)> {
+  let Some(start) = output.windows(ENV_MARKER.len()).position(|window| window == ENV_MARKER) else {
+    return Vec::new();
+  };
+  output[start + ENV_MARKER.len()..]
+    .split(|byte| *byte == 0)
+    .filter_map(|entry| std::str::from_utf8(entry).ok()?.split_once('='))
+    .filter(|(name, _)| !name.is_empty() && !SHELL_SESSION_VARIABLES.contains(name))
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .collect()
 }
 
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::error::Error>> {
   let token = generate_token()?;
   let mut sidecar = app.shell().sidecar("octopusd")?;
-  match login_shell_path() {
-    Some(path) => sidecar = sidecar.env("PATH", path),
-    None => log::warn!("Could not read PATH from the login shell, so octopusd keeps the app's own PATH"),
+  match login_shell_env() {
+    Some(variables) => sidecar = sidecar.envs(variables),
+    None => log::warn!("Could not read the login shell's environment, so octopusd keeps the app's own"),
   }
   // A debug build loads the web dev server, so octopusd must accept that page's origin as well as the app's own.
   if cfg!(debug_assertions)
@@ -421,6 +444,33 @@ mod tests {
     assert_eq!(failure_reason(&CommandEvent::Stdout(b"listening\n".to_vec())), None);
     let status = status_after(&exited(), "secret", &DaemonStatus::Starting, reason.as_deref());
     assert_eq!(status.and_then(|status| status.connection()), Some(Err("Another Octopus is already running.".to_string())));
+  }
+
+  #[test]
+  fn the_login_environment_skips_startup_output_and_shell_variables() {
+    let output = b"Welcome!\n\0OCTOPUS_LOGIN_ENV\0PATH=/opt/bin:/usr/bin\0NOTE=two\nlines\0PWD=/home\0SHLVL=2\0EMPTY=\0";
+    assert_eq!(
+      parse_login_env(output),
+      vec![
+        ("PATH".to_string(), "/opt/bin:/usr/bin".to_string()),
+        ("NOTE".to_string(), "two\nlines".to_string()),
+        ("EMPTY".to_string(), String::new()),
+      ]
+    );
+    assert!(parse_login_env(b"PATH=/usr/bin\0").is_empty());
+  }
+
+  #[test]
+  fn reading_a_shell_gives_up_when_a_background_child_holds_its_output() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf done; sleep 30 &"]);
+    let started = std::time::Instant::now();
+    assert_eq!(output_within(command, Duration::from_millis(300)), None);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf done"]);
+    assert_eq!(output_within(command, Duration::from_secs(5)), Some(b"done".to_vec()));
   }
 
   #[test]
