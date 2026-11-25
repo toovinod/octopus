@@ -35,8 +35,20 @@ const snapshotTree = Effect.fn("snapshotTree")(function* (worktree: string) {
 	}).pipe(Effect.ensuring(Effect.ignore(fs.remove(temporary, { force: true }))));
 });
 
+// Each checkpoint keeps old copies of files alive in git, so a session keeps only its latest ones.
+export const CHECKPOINTS_PER_SESSION = 100;
+
 export const saveCheckpoint = Effect.fn("saveCheckpoint")(function* (worktree: string, ref: string) {
 	yield* runGit(worktree, ["update-ref", ref, yield* snapshotTree(worktree)]);
+	// Message ids are UUIDv7, so the session's refs sort oldest first.
+	const session = ref.slice(0, ref.lastIndexOf("/") + 1);
+	const saved = splitNul(yield* runGit(worktree, ["for-each-ref", "--format=%(refname)%00", session]))
+		.map((name) => name.trim())
+		.filter((name) => name !== `${session}before-revert`)
+		.sort();
+	for (const old of saved.slice(0, -CHECKPOINTS_PER_SESSION)) {
+		yield* runGit(worktree, ["update-ref", "-d", old]);
+	}
 });
 
 // The checkpoint's tree, or null when there is none, as for a message sent before checkpoints existed.
@@ -66,20 +78,42 @@ export const changesSince = Effect.fn("changesSince")(function* (worktree: strin
 	return { now, files };
 });
 
-// Puts the files back as the tree has them and removes files made since. Ignored files stay as they are.
-export const restoreCheckpoint = Effect.fn("restoreCheckpoint")(function* (worktree: string, checkpoint: string) {
+// Writes the tree's files, then removes files made since. Ignored files stay as they are, judged by the
+// .gitignore files just written back, so an agent that changed them cannot get .env or node_modules deleted.
+const writeTree = Effect.fnUntraced(function* (worktree: string, tree: string) {
 	const fs = yield* FileSystem.FileSystem;
-	const kept = new Set(splitNul(yield* runGit(worktree, ["ls-tree", "-r", "--name-only", "-z", checkpoint])));
-	const current = splitNul(yield* runGit(worktree, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]));
-	for (const path of current) {
-		if (!kept.has(path)) yield* fs.remove(join(worktree, path), { force: true });
-	}
 	const temporary = yield* gitPath(worktree, `octopus-index-${yield* newId}`);
 	yield* Effect.gen(function* () {
 		const env = { GIT_INDEX_FILE: temporary };
-		yield* runGit(worktree, ["read-tree", checkpoint], env);
+		yield* runGit(worktree, ["read-tree", tree], env);
 		yield* runGit(worktree, ["checkout-index", "--all", "--force"], env);
+		// Untracked against the tree in the temporary index. A nested repository shows as its folder.
+		const made = splitNul(yield* runGit(worktree, ["ls-files", "--others", "--exclude-standard", "-z"], env));
+		for (const path of made) {
+			yield* fs.remove(join(worktree, path), { recursive: true, force: true });
+		}
 	}).pipe(Effect.ensuring(Effect.ignore(fs.remove(temporary, { force: true }))));
+});
+
+// Puts the files back as the checkpoint has them. A revert that fails partway puts back `before`, the files
+// as they were, so the workspace is never left half reverted.
+export const restoreCheckpoint = Effect.fn("restoreCheckpoint")(function* (
+	worktree: string,
+	checkpoint: string,
+	before: string,
+) {
+	yield* writeTree(worktree, checkpoint).pipe(
+		Effect.onError(() =>
+			writeTree(worktree, before).pipe(
+				Effect.catch((cause) => Effect.logError("Could not undo a revert that failed partway", cause)),
+			),
+		),
+	);
+	// Changes staged after the checkpoint would otherwise stay staged over the reverted files.
+	const staged = splitNul(yield* runGit(worktree, ["diff-index", "--cached", "--name-only", "-z", checkpoint]));
+	if (staged.length > 0) {
+		yield* runGit(worktree, ["reset", "-q", "--", ...staged.map((path) => `:(literal)${path}`)]);
+	}
 });
 
 export const deleteCheckpoints = Effect.fn("deleteCheckpoints")(function* (repository: string, workspaceId: string) {

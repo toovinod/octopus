@@ -643,7 +643,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			const { now, files } = yield* changesSince(path, checkpoint);
 			// Kept so the revert itself can be undone with git.
 			yield* runGit(path, ["update-ref", beforeRevertRef(row.workspaceId, sessionId), now]);
-			yield* restoreCheckpoint(path, checkpoint);
+			yield* restoreCheckpoint(path, checkpoint, now);
 			yield* Effect.logInfo("Reverted a workspace to a checkpoint").pipe(
 				Effect.annotateLogs({ sessionId, messageId, files: files.length }),
 			);
