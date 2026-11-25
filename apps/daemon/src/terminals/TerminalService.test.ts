@@ -1,8 +1,8 @@
+import { LIVE_CHUNK, TerminalService, splitLiveOutput } from "./TerminalService.ts";
 import { ConfigProvider, Effect, FileSystem, Layer, Stream } from "effect";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { SCROLLBACK_MAX_LINES, Scrollback } from "./Scrollback.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
-import { TerminalService } from "./TerminalService.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { SecureRandom } from "effect/crypto";
@@ -122,6 +122,17 @@ describe("TerminalService", () => {
 			);
 		}).pipe(Effect.scoped, Effect.provide(BunServices.layer), Effect.runPromise);
 		expect(text).toContain("eager-output");
+	});
+});
+
+describe("splitLiveOutput", () => {
+	test("cuts large output into capped pieces, never inside a surrogate pair", () => {
+		const data = `${"a".repeat(LIVE_CHUNK - 1)}😀${"b".repeat(LIVE_CHUNK * 2)}`;
+		const pieces = splitLiveOutput(data);
+		expect(pieces.join("")).toBe(data);
+		expect(pieces.every((piece) => piece.length <= LIVE_CHUNK)).toBe(true);
+		expect(pieces[0]).toBe("a".repeat(LIVE_CHUNK - 1));
+		expect(splitLiveOutput("small")).toEqual(["small"]);
 	});
 });
 
