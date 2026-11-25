@@ -261,6 +261,7 @@ const Attachment = ({ sessionId, attachmentId }: { readonly sessionId: string; r
 	return src === null ? (
 		<div className="size-16 rounded-lg bg-muted" />
 	) : (
+		// biome-ignore lint/performance/noImgElement: a data URL in a static export, which next/image cannot optimize.
 		<img src={src} alt="" className="size-16 rounded-lg object-cover" />
 	);
 };

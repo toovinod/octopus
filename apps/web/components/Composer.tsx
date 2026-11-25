@@ -150,6 +150,7 @@ export const Composer = memo(
 						<div className="flex flex-wrap gap-2 px-3 pt-3">
 							{draft.images.map((image) => (
 								<div key={image.id} className="group relative">
+									{/* biome-ignore lint/performance/noImgElement: a blob URL in a static export, which next/image cannot optimize. */}
 									<img src={image.previewUrl} alt="" className="size-14 rounded-md border border-border object-cover" />
 									<Button
 										size="icon-xs"
