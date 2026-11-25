@@ -52,16 +52,22 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 	const runs = loaded.state === "ready" ? loaded.value : [];
 	const run = latest(runs, kind);
 	const running = run?.status === "processing" || run?.status === "pending";
+	// Run and Stop stay disabled until the daemon answers, so a double click sends one request.
+	const [busy, setBusy] = useState(false);
 
 	const start = async () => {
+		setBusy(true);
 		await callDaemon((daemon) => daemon.startRunScript({ workspaceId: workspace.id })).then(reload, (error: unknown) =>
 			toast(errorMessage(error)),
 		);
+		setBusy(false);
 	};
 	const stop = async () => {
+		setBusy(true);
 		await callDaemon((daemon) => daemon.stopRunScript({ workspaceId: workspace.id })).then(reload, (error: unknown) =>
 			toast(errorMessage(error)),
 		);
+		setBusy(false);
 	};
 
 	return (
@@ -87,12 +93,12 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 				</span>
 				{kind === "run" ? (
 					running ? (
-						<Button variant="secondary" size="xs" onClick={() => void stop()}>
+						<Button variant="secondary" size="xs" disabled={busy} onClick={() => void stop()}>
 							<SquareIcon className="size-3 fill-current" />
 							Stop
 						</Button>
 					) : (
-						<Button size="xs" variant="default" onClick={() => void start()}>
+						<Button size="xs" variant="default" disabled={busy} onClick={() => void start()}>
 							<PlayIcon />
 							Run
 						</Button>
