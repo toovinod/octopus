@@ -22,6 +22,8 @@ export const WorkspaceRpcHandlers = WorkspaceRpcs.toLayer(
 			getScriptRunOutput: ({ scriptRunId }) => Effect.succeed(workspaces.getScriptRunOutput(scriptRunId)),
 			startRunScript: ({ workspaceId }) =>
 				workspaces.startRunScript(workspaceId).pipe(orInternalError("start the run script")),
+			startSetupScript: ({ workspaceId }) =>
+				workspaces.startSetupScriptRun(workspaceId).pipe(orInternalError("start the setup script")),
 			stopRunScript: ({ workspaceId }) =>
 				workspaces.stopRunScript(workspaceId).pipe(orInternalError("stop the run script")),
 			watchScriptRuns: ({ workspaceId }) => workspaces.watchScriptRuns(workspaceId),

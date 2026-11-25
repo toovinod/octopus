@@ -433,6 +433,29 @@ describe("WorkspaceService", () => {
 		});
 	});
 
+	test("starts a failed setup script over when the user runs it again, and refuses once archived", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir, "exit 3");
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				const failed = yield* waitForScriptRun(created.id);
+				yield* Effect.flatMap(ProjectService, (projects) =>
+					projects.updateScripts(project.id, { setupScript: "true", runScript: null }),
+				);
+				yield* workspaces.startSetupScriptRun(created.id);
+				const retried = yield* waitForScriptRun(created.id);
+				yield* workspaces.archive(created.id, { force: true });
+				const refused = yield* Effect.flip(workspaces.startSetupScriptRun(created.id));
+				return { failed, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
+			}),
+		);
+		expect(result.failed?.status).toBe("failed");
+		expect(result.retried).toMatchObject({ id: result.failed?.id, status: "completed", attempts: 0, lastError: null });
+		expect(result.runs).toHaveLength(1);
+		expect(result.refused._tag).toBe("WorkspaceArchivedError");
+	});
+
 	test("a timed-out setup script is retried, then dead-lettered", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

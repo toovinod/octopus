@@ -20,6 +20,8 @@ export class Workspace extends Schema.Class<Workspace>("Workspace")({
 	baseBranch: Schema.String,
 	status: WorkspaceStatus,
 	pullRequestUrl: Schema.NullOr(Schema.String),
+	// A fork's pull request: anyone on GitHub can write its code, so its setup script waits for the user.
+	fromFork: Schema.Boolean,
 	createdAt: Schema.String,
 	archivedAt: Schema.NullOr(Schema.String),
 }) {}

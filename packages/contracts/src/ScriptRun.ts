@@ -24,6 +24,14 @@ export class ScriptRunOutput extends Schema.Class<ScriptRunOutput>("ScriptRunOut
 	output: Schema.String,
 }) {}
 
+export class SetupScriptMissingError extends Schema.TaggedError<SetupScriptMissingError>()("SetupScriptMissingError", {
+	projectId: Schema.String,
+}) {
+	override get message() {
+		return "This project has no setup script. Add one in the project settings.";
+	}
+}
+
 export class RunScriptMissingError extends Schema.TaggedError<RunScriptMissingError>()("RunScriptMissingError", {
 	projectId: Schema.String,
 }) {

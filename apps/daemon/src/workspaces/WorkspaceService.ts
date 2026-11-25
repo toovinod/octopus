@@ -12,9 +12,9 @@ import {
 	removeWorktree,
 	restoreArchiveStash,
 } from "./removeWorktree.ts";
+import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "@repo/contracts/ScriptRun";
 import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
-import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contracts/ScriptRun";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
@@ -91,7 +91,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			const runningScripts = yield* FiberMap.make<string>();
 			// Archiving runs git on the worktree folder, so two archives at once could both try to remove it.
 			const archiveLock = yield* Semaphore.make(1);
-			// Two quick clicks on Run must not start the run script twice.
+			// Two quick clicks on Run or Run setup must not start a script twice.
 			const runScriptLock = yield* Semaphore.make(1);
 			const outputs = new Map<string, ScriptOutput>();
 			// The process group of each running run script, by script run id, to find the ports it listens on.
@@ -642,6 +642,45 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				Effect.provide(services),
 			);
 
+			// The user's explicit start, the only way a fork's setup script runs. A failed run starts over.
+			const startSetupScriptRun = Effect.fn("WorkspaceService.startSetupScriptRun")(
+				function* (workspaceId: string) {
+					const current = yield* get(workspaceId);
+					if (current.status === "archived") {
+						return yield* new WorkspaceArchivedError({ workspaceId });
+					}
+					const owner = yield* projects.get(current.projectId);
+					const script = owner.setupScript;
+					if (script === null) {
+						return yield* new SetupScriptMissingError({ projectId: owner.id });
+					}
+					const last = (yield* listScriptRuns(workspaceId)).filter((run) => run.kind === "setup").at(-1);
+					if (last !== undefined && (last.status === "pending" || last.status === "processing")) {
+						return last;
+					}
+					let scriptRunId: string;
+					if (last !== undefined && (last.status === "failed" || last.status === "deadLetter")) {
+						scriptRunId = last.id;
+						yield* applyScriptRunEvent(scriptRunId, { _tag: "Retried" });
+					} else {
+						const setupRun = yield* newSetupRun(owner, workspaceId);
+						if (setupRun === null) {
+							return yield* new SetupScriptMissingError({ projectId: owner.id });
+						}
+						scriptRunId = setupRun.id;
+						yield* database.query((db) => db.insert(scriptRun).values(setupRun));
+					}
+					yield* startSetupScript(scriptRunId, script, current.path);
+					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
+					const [row] = yield* database.query((db) => db.select().from(scriptRun).where(eq(scriptRun.id, scriptRunId)));
+					// The row was written just above and runs go only with their workspace.
+					return row === undefined ? yield* Effect.die("The setup run is missing") : new ScriptRun(row);
+				},
+				Semaphore.withPermit(runScriptLock),
+				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),
+				Effect.provide(services),
+			);
+
 			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
 				const running = yield* findRunningRunScript(workspaceId);
 				const group = running === null ? undefined : runScriptGroups.get(running.id);
@@ -741,6 +780,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				getScriptRunOutput,
 				followScriptRunOutput,
 				startRunScript,
+				startSetupScriptRun,
 				stopRunScript,
 				watchScriptRuns,
 				watchRunScriptPorts,

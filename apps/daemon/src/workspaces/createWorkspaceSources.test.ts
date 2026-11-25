@@ -1,6 +1,6 @@
+import { runServiceTest, waitForScriptRun } from "../testing/runServiceTest.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
-import { runServiceTest } from "../testing/runServiceTest.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { WorkspaceService } from "./WorkspaceService.ts";
 import { describe, expect, test } from "bun:test";
@@ -200,6 +200,38 @@ esac`,
 		expect(result.branch).toBe("pr-9-main");
 		expect(result.runs).toEqual([]);
 		expect(result.fromFork).toBe(true);
+	});
+
+	test("runs a fork's setup script only when the user starts it", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const project = yield* Effect.flatMap(ProjectService, (projects) =>
+					Effect.flatMap(addProject(tempDir), (added) =>
+						projects.updateScripts(added.id, { setupScript: "echo set up", runScript: null }),
+					),
+				);
+				const executable = yield* fakeGh(
+					tempDir,
+					`case "$1 $2" in
+"pr view") echo '{"headRefName":"main","baseRefName":"main","isCrossRepository":true}' ;;
+"pr checkout") git checkout -q -b "$5" ;;
+esac`,
+				);
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces
+					.create({ kind: "pullRequest", projectId: project.id, number: 9 })
+					.pipe(Effect.provideService(GhSettings, { executable }));
+				const before = yield* workspaces.listScriptRuns(created.id);
+				const started = yield* workspaces.startSetupScriptRun(created.id);
+				const finished = yield* waitForScriptRun(created.id);
+				return { created, before, started, finished, output: workspaces.getScriptRunOutput(started.id).output };
+			}),
+		);
+		expect(result.created.fromFork).toBe(true);
+		expect(result.before).toEqual([]);
+		expect(result.started).toMatchObject({ kind: "setup" });
+		expect(result.finished).toMatchObject({ id: result.started.id, status: "completed" });
+		expect(result.output).toContain("set up");
 	});
 
 	test("a fork's branch stays a fork after its workspace is archived, and so does a branch made from it", async () => {

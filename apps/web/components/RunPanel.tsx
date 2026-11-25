@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { followReattaching } from "../lib/followReattaching.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
-import { openDialog, toast } from "../lib/store.ts";
+import { openDialog, toast, useAppState } from "../lib/store.ts";
 import { ExternalLinkIcon, PlayIcon, SquareIcon } from "lucide-react";
 import { openExternal } from "../lib/desktop.ts";
 import { Button } from "@repo/ui/components/button";
@@ -50,10 +50,26 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 	const runs = loaded.state === "ready" ? loaded.value : [];
 	const run = latest(runs, kind);
 	const running = run?.status === "processing" || run?.status === "pending";
+	const hasSetupScript = useAppState(
+		(current) => (current.projects[workspace.projectId]?.setupScript ?? null) !== null,
+	);
+	// A fork's code runs only after the user said so: its setup script never starts by itself, and Run asks first.
+	const [confirmingRun, setConfirmingRun] = useState(false);
+	const canStartSetup =
+		hasSetupScript &&
+		workspace.kind === "worktree" &&
+		(run === undefined || run.status === "failed" || run.status === "deadLetter");
 
 	const start = async () => {
+		setConfirmingRun(false);
 		await callDaemon((daemon) => daemon.startRunScript({ workspaceId: workspace.id })).then(reload, (error: unknown) =>
 			toast(errorMessage(error)),
+		);
+	};
+	const startSetup = async () => {
+		await callDaemon((daemon) => daemon.startSetupScript({ workspaceId: workspace.id })).then(
+			reload,
+			(error: unknown) => toast(errorMessage(error)),
 		);
 	};
 	const stop = async () => {
@@ -89,18 +105,43 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 							<SquareIcon className="size-3 fill-current" />
 							Stop
 						</Button>
+					) : confirmingRun ? (
+						<>
+							<span className="text-xs text-muted-foreground">Run the fork's code?</span>
+							<Button size="xs" variant="ghost" onClick={() => setConfirmingRun(false)}>
+								Cancel
+							</Button>
+							<Button size="xs" variant="destructive" onClick={() => void start()}>
+								Run anyway
+							</Button>
+						</>
 					) : (
-						<Button size="xs" variant="default" onClick={() => void start()}>
+						<Button
+							size="xs"
+							variant="default"
+							onClick={() => (workspace.fromFork ? setConfirmingRun(true) : void start())}
+						>
 							<PlayIcon />
 							Run
 						</Button>
 					)
+				) : canStartSetup ? (
+					<Button size="xs" variant="default" onClick={() => void startSetup()}>
+						<PlayIcon />
+						Run setup
+					</Button>
 				) : null}
 			</div>
 			{kind === "run" && running ? <RunScriptPorts workspaceId={workspace.id} /> : null}
 			{run === undefined ? (
 				<div className="flex flex-1 flex-col items-center justify-center gap-2 p-4 text-center text-xs text-muted-foreground">
-					<p>{kind === "run" ? "The run script has not run in this workspace." : "No setup script ran here."}</p>
+					<p>
+						{kind === "run"
+							? "The run script has not run in this workspace."
+							: workspace.fromFork && hasSetupScript
+								? "This workspace holds a fork's pull request, so its setup script waits until you have read the code and run it."
+								: "No setup script ran here."}
+					</p>
 					<Button
 						variant="secondary"
 						size="sm"
