@@ -417,15 +417,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			// Cancel pending approvals and record the interrupted turn before closing the process.
 			const interrupt =
 				!runtime.ending && isBusy(runtime.status)
-					? runtime.handle.interrupt.pipe(
-							Effect.timeoutOption(STOP_GRACE),
-							Effect.flatMap((dropped) =>
-								Effect.sync(() => {
-									runtime.unsent = Option.getOrElse(dropped, () => []);
-								}),
-							),
-							Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
-						)
+					? Effect.gen(function* () {
+							// Kept before the agent is asked, so a stop it fails or takes too long on still says which were not sent.
+							runtime.unsent = yield* runtime.handle.dropQueued;
+							yield* runtime.handle.interrupt.pipe(
+								Effect.timeoutOption(STOP_GRACE),
+								Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
+							);
+						})
 					: Effect.void;
 			yield* interrupt.pipe(
 				Effect.ensuring(Scope.close(runtime.scope, Exit.void).pipe(Effect.andThen(Deferred.await(runtime.done)))),
@@ -790,9 +789,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* getRow(sessionId);
 				return [];
 			}
-			const dropped = yield* runtime.handle.interrupt;
+			const dropped = yield* runtime.handle.dropQueued;
 			runtime.outstanding = Math.max(0, runtime.outstanding - dropped.length);
 			yield* refreshStatus(runtime);
+			// The messages are out of the queue already, so they go back to the user even when the agent fails to
+			// stop. The turn then keeps running, and the user can stop it again.
+			yield* runtime.handle.interrupt.pipe(
+				Effect.catch((error) => Effect.logWarning("Could not interrupt the agent", error)),
+			);
 			return dropped.map(({ text, images }) => ({
 				text,
 				images: images.map(({ mediaType, base64 }) => ({ mediaType, base64 })),

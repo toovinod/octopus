@@ -377,16 +377,15 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						yield* emit({ type: "question.resolved", requestId, outcome: { type: "answered", answers: stored } });
 						yield* pending.respond({ type: "answered", answers });
 					}),
+				// Messages waiting for their turn would start the moment the stopped turn ends, so a stop drops them
+				// first and hands them back.
+				dropQueued: Semaphore.withPermit(sendLock, dropQueued),
 				interrupt: Effect.gen(function* () {
-					// Messages waiting for their turn would start the moment the stopped turn ends, so a stop drops them
-					// first and hands them back.
-					const dropped = yield* Semaphore.withPermit(sendLock, dropQueued);
 					yield* cancelApprovals;
 					yield* cancelPlansAndQuestions;
 					if (Option.isSome(yield* Ref.get(currentTurn))) {
 						yield* driver.interruptTurn;
 					}
-					return dropped;
 				}),
 				updateSettings: driver.updateSettings,
 				listCommands: driver.listCommands,

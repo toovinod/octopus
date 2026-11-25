@@ -905,6 +905,63 @@ describe("SessionService", () => {
 		expect(result.filter((row) => row.type === "user.message")).toHaveLength(1);
 	});
 
+	describe("a stop the agent refuses", () => {
+		// A turn that keeps running, and an agent that fails every interrupt.
+		const replay = makeReplayAdapter(commandWithApproval);
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-stuck");
+					return yield* session.start({
+						startTurn: () => session.emit({ type: "message.completed", itemId: "working", text: "working" }),
+						steerTurn: () => Effect.succeed(false),
+						interruptTurn: Effect.fail(new AgentProtocolError({ message: "No active turn", cause: null })),
+						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
+					});
+				}),
+		};
+		const run = <A, E>(program: (sessionId: string) => Effect.Effect<A, E, Services>) =>
+			runInTempDir((tempDir) =>
+				withServices(
+					join(tempDir, "data"),
+					testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+				)(
+					Effect.gen(function* () {
+						const sessions = yield* SessionService;
+						const session = yield* addSession(tempDir);
+						yield* sessions.sendMessage(session.id, "first", [], false);
+						// The first turn has started once its message and output are stored, so the next message waits.
+						yield* waitForStored(session.id, 3);
+						yield* sessions.sendMessage(session.id, "then commit", [], false);
+						return yield* program(session.id);
+					}),
+				),
+			);
+
+		test("still hands back the queued messages", async () => {
+			const dropped = await run((sessionId) =>
+				Effect.flatMap(SessionService, (sessions) => sessions.interrupt(sessionId)),
+			);
+			expect(dropped).toEqual([{ text: "then commit", images: [] }]);
+		});
+
+		test("still says which queued messages were not sent when it stops the session", async () => {
+			const events = await run((sessionId) =>
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					yield* sessions.stop(sessionId);
+					return yield* storedEvents(sessionId);
+				}),
+			);
+			expect(events.map((row) => row.payload)).toContainEqual(
+				unsentNotice([{ id: "", text: "then commit", images: [] }]),
+			);
+		});
+	});
+
 	test("stopSession ends the process and the next message resumes with the native id", async () => {
 		const codex = spyOn(makeReplayAdapter(commandWithApproval));
 		const result = await runInTempDir((tempDir) =>

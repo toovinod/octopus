@@ -192,7 +192,8 @@ test("a stop drops the queued messages and hands them back", async () => {
 		yield* handle.sendMessage(userMessage("two"));
 		yield* handle.sendMessage(userMessage("three"));
 		yield* Effect.sleep("20 millis");
-		const dropped = yield* handle.interrupt;
+		const dropped = yield* handle.dropQueued;
+		yield* handle.interrupt;
 		yield* Effect.sleep("50 millis");
 		return [dropped.map(({ text }) => text), started] as const;
 	}).pipe(Effect.scoped, Effect.runPromise);
@@ -225,6 +226,7 @@ describe("makeAgentSession queued messages", () => {
 			yield* handle.sendMessage(userMessage("one"), discardInto(discarded, "one"));
 			yield* handle.sendMessage(userMessage("two"), discardInto(discarded, "two"));
 			yield* Effect.sleep("20 millis");
+			yield* handle.dropQueued;
 			yield* handle.interrupt;
 			return yield* handle.events.pipe(
 				Stream.takeUntil((event) => event.type === "turn.completed"),
@@ -246,7 +248,8 @@ describe("makeAgentSession queued messages", () => {
 			yield* Effect.sleep("20 millis");
 			yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
 			yield* Effect.sleep("20 millis");
-			const dropped = yield* handle.interrupt;
+			const dropped = yield* handle.dropQueued;
+			yield* handle.interrupt;
 			yield* Deferred.succeed(gate, undefined);
 			yield* Effect.sleep("50 millis");
 			return dropped.map(({ text }) => text);
