@@ -39,10 +39,15 @@ const daemonRuntime = ManagedRuntime.make(DaemonClientFromShell);
 // Must match DAEMON_STOPPED_EVENT in apps/desktop/src-tauri/src/lib.rs.
 const DAEMON_STOPPED_EVENT = "daemon-stopped";
 
-// Calls back when the desktop shell's daemon exits without the app quitting. Returns the function that stops listening.
-export const onDaemonStopped = (listener: () => void) => {
+const isReason = Schema.is(Schema.String);
+
+// Calls back when the desktop shell's daemon exits without the app quitting, with the daemon's own reason when it
+// printed one. Returns the function that stops listening.
+export const onDaemonStopped = (listener: (reason: string | null) => void) => {
 	if (!isTauri()) return () => {};
-	const unlisten = listen(DAEMON_STOPPED_EVENT, listener);
+	const unlisten = listen<unknown>(DAEMON_STOPPED_EVENT, (event) =>
+		listener(isReason(event.payload) ? event.payload : null),
+	);
 	return () => {
 		void unlisten.then((stop) => stop());
 	};

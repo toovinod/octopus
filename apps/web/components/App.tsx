@@ -1,4 +1,5 @@
-"use client";
+import { Predicate } from "effect";
+("use client");
 
 import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
@@ -64,18 +65,24 @@ const useQuitWarning = () => {
 	}, [warning]);
 };
 
+// null while the daemon runs; once it stops, the reason it gave, if any.
 const useDaemonStopped = () => {
-	const [stopped, setStopped] = useState(false);
-	useEffect(() => onDaemonStopped(() => setStopped(true)), []);
+	const [stopped, setStopped] = useState<{ reason: string | null } | null>(null);
+	useEffect(() => onDaemonStopped((reason) => setStopped({ reason })), []);
 	return stopped;
 };
 
 // The user restarts the daemon, never a timer, so a daemon that crashes on start does not restart in a loop.
-const DaemonStopped = () => {
+const DaemonStopped = ({ reason }: { reason: string | null }) => {
 	const [restart, setRestart] = useState<"idle" | "restarting" | "failed">("idle");
+	const [failure, setFailure] = useState(reason);
 	const onRestart = () => {
 		setRestart("restarting");
-		restartDaemon().catch(() => setRestart("failed"));
+		restartDaemon().catch((error: unknown) => {
+			// The shell rejects with the daemon's own reason when it printed one.
+			if (Predicate.isString(error)) setFailure(error);
+			setRestart("failed");
+		});
 	};
 	return (
 		<main className="flex h-full flex-col items-center justify-center gap-2 text-center">
@@ -86,6 +93,7 @@ const DaemonStopped = () => {
 					? "Octopus could not start its daemon again. Quit Octopus and open it again."
 					: "Agents and terminals that were running have stopped. Restart the daemon to reconnect."}
 			</p>
+			{failure === null ? null : <p className="max-w-sm text-sm text-muted-foreground">{failure}</p>}
 			<Button size="sm" className="mt-2" disabled={restart === "restarting"} onClick={onRestart}>
 				{restart === "restarting" ? "Restarting" : "Restart"}
 			</Button>
@@ -114,7 +122,7 @@ export const App = () => {
 		else panel.collapse();
 	}, [panelOpen, panelRef, hasWorkspace]);
 
-	if (daemonStopped) return <DaemonStopped />;
+	if (daemonStopped !== null) return <DaemonStopped reason={daemonStopped.reason} />;
 
 	if (connection.status === "connecting" || connection.status === "failed") {
 		return (
