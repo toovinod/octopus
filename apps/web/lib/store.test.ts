@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AgentSession } from "@repo/contracts/AgentSession";
+import { errorMessage, errorTag } from "./errorMessage.ts";
 import { draftOf, keepDraft } from "./drafts.ts";
 import type { Follow } from "./daemonRuntime.ts";
 import { toast as sonnerToast } from "sonner";
@@ -96,10 +97,9 @@ mock.module("./daemonRuntime.ts", () => ({
 		});
 		return () => {};
 	},
-	errorMessage: (error: { readonly message: string }) => error.message,
-	// mock.module replaces the module for every test file in the run, so this must behave like the real one.
-	errorTag: (error: unknown) =>
-		Predicate.hasProperty(error, "_tag") && Predicate.isString(error._tag) ? error._tag : null,
+	// mock.module replaces the module for every test file in the run, so these must be the real ones.
+	errorMessage,
+	errorTag,
 }));
 
 const {
