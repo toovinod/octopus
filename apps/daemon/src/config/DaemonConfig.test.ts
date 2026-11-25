@@ -1,6 +1,6 @@
 import { Duration, Effect, Option, Redacted, Stdio, Stream } from "effect";
+import { DaemonConfig, TAURI_ORIGINS } from "./DaemonConfig.ts";
 import { describe, expect, test } from "bun:test";
-import { DaemonConfig } from "./DaemonConfig.ts";
 
 const encoder = new TextEncoder();
 
@@ -38,6 +38,11 @@ describe("DaemonConfig", () => {
 		if (result._tag === "Success") {
 			expect(Redacted.value(result.success.token)).toBe("abc123");
 		}
+	});
+
+	test("allows only the desktop app's pages by default", async () => {
+		const result = await configFromStdin("abc\n");
+		expect(result).toMatchObject({ _tag: "Success", success: { allowedOrigins: TAURI_ORIGINS } });
 	});
 
 	test("fails when stdin closes without a token", async () => {

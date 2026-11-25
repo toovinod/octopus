@@ -18,6 +18,8 @@ export class AuthConfig extends Context.Service<
 		readonly webOrigin: string;
 		readonly secret: Redacted.Redacted<string>;
 		readonly databaseUrl: Redacted.Redacted<string>;
+		// The header the proxy in front of the API sets to the client's address, for rate limiting.
+		readonly ipAddressHeader: string;
 		readonly github: OAuthClient;
 		readonly google: OAuthClient;
 	}
@@ -30,6 +32,7 @@ export class AuthConfig extends Context.Service<
 				webOrigin: Config.String("WEB_ORIGIN"),
 				secret: Config.Redacted("BETTER_AUTH_SECRET"),
 				databaseUrl: Config.Redacted("DATABASE_URL"),
+				ipAddressHeader: Config.String("AUTH_IP_ADDRESS_HEADER").pipe(Config.withDefault("x-forwarded-for")),
 				github: oauthClient("GITHUB"),
 				google: oauthClient("GOOGLE"),
 			});

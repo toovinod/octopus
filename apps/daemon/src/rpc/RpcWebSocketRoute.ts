@@ -1,4 +1,4 @@
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { Effect, Layer, Redacted, Schema } from "effect";
 import { timingSafeEqual } from "node:crypto";
@@ -7,6 +7,7 @@ import { RpcServer } from "effect/rpc";
 const RpcConnectionParams = Schema.Struct({ token: Schema.String });
 
 const unauthorized = HttpServerResponse.empty({ status: 401 });
+const forbidden = HttpServerResponse.empty({ status: 403 });
 
 // Constant-time comparison so the token cannot be guessed from response timing.
 const isDaemonToken = (candidate: string, expected: Redacted.Redacted<string>) => {
@@ -16,10 +17,14 @@ const isDaemonToken = (candidate: string, expected: Redacted.Redacted<string>) =
 };
 
 // Browsers cannot set headers on a WebSocket, so the token travels as `?token=`.
+// Browsers do send Origin and apply no CORS to WebSockets, so a page is refused unless it is the app's own. A request
+// without Origin comes from a local program, not a page. Host must be our own address, so DNS rebinding gets nowhere.
 export const RpcWebSocketRoute = Layer.effect(
 	RpcServer.Protocol,
 	Effect.gen(function* () {
-		const { token } = yield* DaemonConfig;
+		const { token, allowedOrigins } = yield* DaemonConfig;
+		const { address } = yield* HttpServer.HttpServer;
+		const expectedHost = new URL(HttpServer.formatAddress(address)).host;
 		const router = yield* HttpRouter.HttpRouter;
 		const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
 
@@ -27,6 +32,13 @@ export const RpcWebSocketRoute = Layer.effect(
 			"GET",
 			"/rpc",
 			Effect.gen(function* () {
+				const { headers } = yield* HttpServerRequest.HttpServerRequest;
+				if (
+					headers.host !== expectedHost ||
+					(headers.origin !== undefined && !allowedOrigins.includes(headers.origin))
+				) {
+					return forbidden;
+				}
 				const params = yield* HttpServerRequest.schemaSearchParams(RpcConnectionParams);
 				if (!isDaemonToken(params.token, token)) {
 					return unauthorized;

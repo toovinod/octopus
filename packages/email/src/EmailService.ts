@@ -1,5 +1,5 @@
 import { type EmailMessage, type InvitationEmailInput, invitationEmail } from "./invitationEmail.ts";
-import { Config, Context, Effect, Layer, Redacted, Ref, Schema } from "effect";
+import { Config, Context, Effect, Layer, Redacted, Ref, Schedule, Schema } from "effect";
 import { Resend } from "resend";
 
 export class EmailSendError extends Schema.TaggedError<EmailSendError>()("EmailSendError", {
@@ -15,6 +15,16 @@ const retryableResendErrors: ReadonlySet<string> = new Set([
 	"application_error",
 	"internal_server_error",
 ]);
+
+// A rate limit or an outage at Resend passes, and the idempotency key makes sending again safe.
+export const retryRetryableSends = <A, R>(send: Effect.Effect<A, EmailSendError, R>) =>
+	send.pipe(
+		Effect.retry({
+			schedule: Schedule.exponential("1 second").pipe(Schedule.jittered),
+			times: 4,
+			while: (error) => error.retryable,
+		}),
+	);
 
 export class EmailService extends Context.Service<
 	EmailService,
@@ -47,7 +57,7 @@ export class EmailService extends Context.Service<
 						cause: response.error,
 					});
 				}
-			});
+			}, retryRetryableSends);
 
 			return EmailService.of({ sendInvitation });
 		}),

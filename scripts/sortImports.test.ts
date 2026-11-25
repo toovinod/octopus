@@ -23,6 +23,25 @@ describe("sortImports", () => {
 		);
 	});
 
+	test("ends an import with a trailing comment or no semicolon at its own line", () => {
+		const source = lines(
+			'import { a } from "./a.ts"; // the a module',
+			'import { longer } from "./longer.ts"',
+			'import data from "./data.json" with { type: "json" };',
+			"const notAnImport = 1;",
+			"export const y = 2;",
+		);
+		expect(sortImports(source)).toBe(
+			lines(
+				'import data from "./data.json" with { type: "json" };',
+				'import { a } from "./a.ts"; // the a module',
+				'import { longer } from "./longer.ts"',
+				"const notAnImport = 1;",
+				"export const y = 2;",
+			),
+		);
+	});
+
 	test("breaks ties by name, so the order is stable", () => {
 		const source = lines('import { b } from "./b.ts";', 'import { a } from "./a.ts";');
 		expect(sortImports(source)).toBe(lines('import { a } from "./a.ts";', 'import { b } from "./b.ts";'));

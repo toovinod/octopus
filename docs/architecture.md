@@ -54,7 +54,9 @@ It never authenticates Claude or Codex, and Octopus never sends agent credential
 - Octopus never reads, copies, refreshes or proxies OAuth tokens for either provider. We do not use the Codex "external tokens" login mode.
 - Without a stored choice, an agent uses `apiKey` when a key is stored and `subscription` otherwise.
 - `checkAuth` reports `loggedIn`, `loggedOut` or `unknown`, plus an account label when the CLI prints one.
-- **Account switching.** Credentials are keyed by provider and account label in the keychain. A session records which credential it started with. Switching the active credential affects new sessions only; running sessions keep theirs until they end.
+- **Keychain layout.** The keychain holds one API key per agent: service `app.octopus.agent`, account `claude` or `codex`. Saving a key replaces that agent's key, and removing it deletes the entry.
+- **Changing a key.** The daemon reads the key when it starts an agent process and passes it in that process's environment. A process that is already running keeps the key it started with; the new key applies to agent processes started afterwards.
+- **Account switching.** Octopus keeps no list of accounts, so switching between several keys or logins is not supported. **Open:** if we add it, key credentials by agent and account label, and record on each session which one it started with.
 - **Expiry and revocation.** API keys do not expire, but they can be revoked. A provider auth failure is a permanent error (`AgentAuthError`), which stops the turn and asks the user to fix the credential. Subscription logins refresh inside the CLI; Octopus only sees the result through `checkAuth`.
 
 ### 2.3 Cloud workspaces
@@ -240,7 +242,7 @@ It changed these decisions:
 
 - `octopusd` exits when its stdin closes, which section 3.1 asked for. Until the `shutdown` RPC exists, quitting closes stdin instead of killing the daemon.
 - The Claude adapter runs the user's own `claude` from PATH. Octopus does not embed or extract the SDK's bundled CLI.
-- The shell starts `octopusd` with the PATH of the user's login shell, because an app opened from Finder cannot otherwise find `claude`, `codex` or `node`.
+- The shell starts `octopusd` with the environment of the user's login shell (PATH, proxy and tool variables), because an app opened from Finder cannot otherwise find `claude`, `codex` or `node`.
 - Terminals spawn with `detached: true` and are stopped by signalling their process group.
 - A crash of `octopusd` itself leaves children running until the next start, which stops them from the process registry (section 3.3).
 

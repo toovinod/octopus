@@ -3,10 +3,10 @@ use std::{
   process::{Command, Stdio},
   sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    mpsc, Mutex,
   },
   thread,
-  time::{Duration, Instant},
+  time::Duration,
 };
 
 use serde::Serialize;
@@ -23,6 +23,9 @@ use tokio::sync::watch;
 // Must match READY_LINE_PREFIX in apps/daemon/src/server/DaemonServer.ts.
 const READY_LINE_PREFIX: &str = "OCTOPUS_DAEMON_READY ";
 
+// Must match FAILED_LINE_PREFIX in apps/daemon/src/server/runDaemon.ts.
+const FAILED_LINE_PREFIX: &str = "OCTOPUS_DAEMON_FAILED ";
+
 // Longer than octopusd's own 8 second shutdown deadline, so a daemon that is still stopping its
 // children is not cut off. Only a daemon that hangs past its own deadline gets killed.
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
@@ -37,11 +40,12 @@ struct DaemonConnection {
 }
 
 // A stopped daemon has no connection, so nothing hands out the URL and token of a process that is gone.
+// It keeps the reason octopusd gave for failing, when it gave one, to show the user.
 #[derive(Clone, Debug, PartialEq)]
 enum DaemonStatus {
   Starting,
   Ready(DaemonConnection),
-  Stopped,
+  Stopped(Option<String>),
 }
 
 impl DaemonStatus {
@@ -50,13 +54,13 @@ impl DaemonStatus {
     match self {
       DaemonStatus::Starting => None,
       DaemonStatus::Ready(connection) => Some(Ok(connection.clone())),
-      DaemonStatus::Stopped => Some(Err("The daemon stopped".to_string())),
+      DaemonStatus::Stopped(reason) => Some(Err(reason.clone().unwrap_or_else(|| "The daemon stopped".to_string()))),
     }
   }
 
   // Only a stopped daemon is started again, so two restart calls never run two daemons on one data dir.
   fn begin_restart(&mut self) -> bool {
-    if *self != DaemonStatus::Stopped {
+    if !matches!(self, DaemonStatus::Stopped(_)) {
       return false;
     }
     *self = DaemonStatus::Starting;
@@ -64,17 +68,29 @@ impl DaemonStatus {
   }
 }
 
-// The status an event from octopusd moves to, or None when the event does not change it.
-fn status_after(event: &CommandEvent, token: &str) -> Option<DaemonStatus> {
+// The status an event from octopusd moves to, or None when the event does not change it. Only a starting
+// daemon becomes ready, so a later line that happens to look like the ready line cannot change the URL.
+fn status_after(
+  event: &CommandEvent,
+  token: &str,
+  current: &DaemonStatus,
+  failure: Option<&str>,
+) -> Option<DaemonStatus> {
   match event {
-    CommandEvent::Stdout(line) => String::from_utf8_lossy(line)
+    CommandEvent::Stdout(line) if *current == DaemonStatus::Starting => String::from_utf8_lossy(line)
       .trim()
       .strip_prefix(READY_LINE_PREFIX)
       .map(|url| DaemonStatus::Ready(DaemonConnection { url: url.to_string(), token: token.to_string() })),
     // The plugin sends this only after it reaped the process, so the old octopusd and its data dir lock are gone.
-    CommandEvent::Terminated(_) => Some(DaemonStatus::Stopped),
+    CommandEvent::Terminated(_) => Some(DaemonStatus::Stopped(failure.map(str::to_string))),
     _ => None,
   }
+}
+
+// The user-facing reason octopusd prints before it exits with an error.
+fn failure_reason(event: &CommandEvent) -> Option<String> {
+  let CommandEvent::Stdout(line) = event else { return None };
+  String::from_utf8_lossy(line).trim().strip_prefix(FAILED_LINE_PREFIX).map(str::to_string)
 }
 
 struct Daemon {
@@ -135,38 +151,67 @@ fn generate_token() -> Result<String, getrandom::Error> {
   Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-// An app opened from Finder or a desktop launcher gets a minimal PATH without the user's
-// `claude`, `codex`, `node` or `gh`. Their login shell sets the real one.
-fn login_shell_path() -> Option<String> {
+// Printed before the environment, so anything the shell's startup files print is skipped.
+const ENV_MARKER: &[u8] = b"\0OCTOPUS_LOGIN_ENV\0";
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+// Far more than any real environment, so a runaway startup file cannot fill memory.
+const LOGIN_SHELL_OUTPUT_LIMIT: u64 = 1024 * 1024;
+// Describe the shell that printed them, not the daemon.
+const SHELL_SESSION_VARIABLES: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+// An app opened from Finder or a desktop launcher gets a minimal environment without the user's PATH (so no
+// `claude`, `codex`, `node` or `gh`), proxy settings or tool variables. Their login shell sets the real ones.
+fn login_shell_env() -> Option<Vec<(String, String)>> {
   let shell = std::env::var("SHELL").ok()?;
-  // Interactive too, because many people set PATH in .zshrc or .bashrc. Taking the last line
-  // skips anything the shell's startup files print.
-  let mut child = Command::new(shell)
-    .args(["-ilc", r#"printf '\n%s' "$PATH""#])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .ok()?;
-  let deadline = Instant::now() + Duration::from_secs(5);
-  while child.try_wait().ok()?.is_none() {
-    if Instant::now() > deadline {
-      let _ = child.kill();
-      return None;
-    }
-    thread::sleep(Duration::from_millis(20));
-  }
-  let mut output = String::new();
-  child.stdout.take()?.read_to_string(&mut output).ok()?;
-  output.lines().last().filter(|path| !path.is_empty()).map(str::to_string)
+  // Interactive too, because many people set PATH in .zshrc or .bashrc.
+  let mut command = Command::new(shell);
+  command.args(["-ilc", r#"printf '\0OCTOPUS_LOGIN_ENV\0'; env -0"#]);
+  let output = output_within(command, LOGIN_SHELL_TIMEOUT)?;
+  Some(parse_login_env(&output)).filter(|variables| !variables.is_empty())
+}
+
+// Reads on another thread: a startup file can leave a background process holding stdout open, and then
+// the read never ends. The deadline covers the read too, and the thread is left to finish on its own.
+fn output_within(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+  let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+  let stdout = child.stdout.take()?;
+  let (sender, receiver) = mpsc::channel();
+  thread::spawn(move || {
+    let mut output = Vec::new();
+    let read = stdout.take(LOGIN_SHELL_OUTPUT_LIMIT).read_to_end(&mut output).map(|_| output);
+    let _ = sender.send(read);
+  });
+  let output = receiver.recv_timeout(timeout);
+  let _ = child.kill();
+  let _ = child.wait();
+  output.ok()?.ok()
+}
+
+// `env -0` output after the marker: NAME=value entries, each ended by a NUL, values can hold newlines.
+fn parse_login_env(output: &[u8]) -> Vec<(String, String)> {
+  let Some(start) = output.windows(ENV_MARKER.len()).position(|window| window == ENV_MARKER) else {
+    return Vec::new();
+  };
+  output[start + ENV_MARKER.len()..]
+    .split(|byte| *byte == 0)
+    .filter_map(|entry| std::str::from_utf8(entry).ok()?.split_once('='))
+    .filter(|(name, _)| !name.is_empty() && !SHELL_SESSION_VARIABLES.contains(name))
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .collect()
 }
 
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::error::Error>> {
   let token = generate_token()?;
   let mut sidecar = app.shell().sidecar("octopusd")?;
-  match login_shell_path() {
-    Some(path) => sidecar = sidecar.env("PATH", path),
-    None => log::warn!("Could not read PATH from the login shell, so octopusd keeps the app's own PATH"),
+  match login_shell_env() {
+    Some(variables) => sidecar = sidecar.envs(variables),
+    None => log::warn!("Could not read the login shell's environment, so octopusd keeps the app's own"),
+  }
+  // A debug build loads the web dev server, so octopusd must accept that page's origin as well as the app's own.
+  if cfg!(debug_assertions)
+    && let Some(dev_url) = &app.config().build.dev_url
+  {
+    sidecar = sidecar.env("OCTOPUS_DAEMON_DEV_ORIGIN", dev_url.origin().ascii_serialization());
   }
   let (mut events, mut child) = sidecar.spawn()?;
   // Through stdin, not the environment: agents, scripts and git inherit the daemon's environment.
@@ -174,21 +219,25 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
 
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
+    let mut failure = None;
     while let Some(event) = events.recv().await {
-      let status = status_after(&event, &token);
+      let daemon = app.state::<Daemon>();
+      failure = failure_reason(&event).or(failure);
+      let status = status_after(&event, &token, &daemon.status.borrow(), failure.as_deref());
       match &event {
-        CommandEvent::Stdout(line) if status.is_none() => log::info!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
+        CommandEvent::Stdout(line) if status.is_none() => {
+          log::info!("octopusd: {}", String::from_utf8_lossy(line).trim_end())
+        }
         CommandEvent::Stderr(line) => log::warn!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
         CommandEvent::Terminated(payload) => log::info!("octopusd exited: {payload:?}"),
         _ => {}
       }
       let Some(status) = status else { continue };
-      let stopped = status == DaemonStatus::Stopped;
-      let daemon = app.state::<Daemon>();
+      let stopped = matches!(status, DaemonStatus::Stopped(_));
       daemon.status.send_replace(status);
       // Quitting stops octopusd on purpose, so only an unexpected exit tells the webview.
       if stopped && !daemon.quitting.load(Ordering::SeqCst) {
-        let _ = app.emit(DAEMON_STOPPED_EVENT, ());
+        let _ = app.emit(DAEMON_STOPPED_EVENT, failure.clone());
       }
     }
   });
@@ -209,7 +258,7 @@ fn start_daemon(app: tauri::AppHandle) {
       }
       Err(error) => {
         log::error!("Could not start octopusd: {error}");
-        daemon.status.send_replace(DaemonStatus::Stopped);
+        daemon.status.send_replace(DaemonStatus::Stopped(None));
       }
     }
   });
@@ -218,15 +267,14 @@ fn start_daemon(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // First, so a second launch hands over to the running app before it starts a second daemon on the same
+    // data dir, which would fail and leave that window stuck on "The daemon stopped".
+    .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_windows(app)))
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_opener::init())
-    .plugin(
-      tauri_plugin_log::Builder::default()
-        .level(log::LevelFilter::Info)
-        .build(),
-    )
+    .plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())
     .on_menu_event(|app, event| {
       if event.id() == CLOSE_WINDOW_ID
         && let Some(window) = app.webview_windows().values().find(|window| window.is_focused().unwrap_or(false))
@@ -268,16 +316,20 @@ pub fn run() {
       }
       // A click on the dock icon brings back the window that closing hid.
       #[cfg(target_os = "macos")]
-      RunEvent::Reopen { has_visible_windows: false, .. } => {
-        for window in app.webview_windows().values() {
-          let _ = window.show();
-          let _ = window.set_focus();
-        }
-      }
+      RunEvent::Reopen { has_visible_windows: false, .. } => show_windows(app),
       // In case the app exits without asking first. A crash closes stdin too.
       RunEvent::Exit => drop(take_daemon_child(app)),
       _ => {}
     });
+}
+
+// Brings back windows that closing hid, in front of other apps.
+fn show_windows(app: &tauri::AppHandle) {
+  for window in app.webview_windows().values() {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+  }
 }
 
 const CLOSE_WINDOW_ID: &str = "close-window";
@@ -349,7 +401,7 @@ fn quit(app: &tauri::AppHandle) {
   let mut status = daemon.status.subscribe();
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
-    let stopped = status.wait_for(|status| *status == DaemonStatus::Stopped);
+    let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
     if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
       log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
       // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
@@ -369,19 +421,70 @@ mod tests {
     DaemonConnection { url: "http://127.0.0.1:4799".to_string(), token: "secret".to_string() }
   }
 
+  fn exited() -> CommandEvent {
+    CommandEvent::Terminated(TerminatedPayload { code: Some(1), signal: None })
+  }
+
   #[test]
   fn the_ready_line_makes_the_daemon_ready() {
     let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_READY http://127.0.0.1:4799\n".to_vec());
-    assert_eq!(status_after(&line, "secret"), Some(DaemonStatus::Ready(connection())));
-    assert_eq!(status_after(&CommandEvent::Stdout(b"listening\n".to_vec()), "secret"), None);
+    let starting = DaemonStatus::Starting;
+    assert_eq!(status_after(&line, "secret", &starting, None), Some(DaemonStatus::Ready(connection())));
+    assert_eq!(status_after(&CommandEvent::Stdout(b"listening\n".to_vec()), "secret", &starting, None), None);
+  }
+
+  #[test]
+  fn a_ready_line_after_start_up_changes_nothing() {
+    let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_READY http://evil.example\n".to_vec());
+    assert_eq!(status_after(&line, "secret", &DaemonStatus::Ready(connection()), None), None);
   }
 
   #[test]
   fn an_exited_daemon_stops_handing_out_its_connection() {
-    let exited = CommandEvent::Terminated(TerminatedPayload { code: Some(1), signal: None });
-    let status = status_after(&exited, "secret");
-    assert_eq!(status, Some(DaemonStatus::Stopped));
+    let status = status_after(&exited(), "secret", &DaemonStatus::Ready(connection()), None);
+    assert_eq!(status, Some(DaemonStatus::Stopped(None)));
     assert!(matches!(status.and_then(|status| status.connection()), Some(Err(_))));
+  }
+
+  #[test]
+  fn a_daemon_that_failed_says_why() {
+    let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_FAILED Another Octopus is already running.\n".to_vec());
+    let reason = failure_reason(&line);
+    assert_eq!(reason.as_deref(), Some("Another Octopus is already running."));
+    assert_eq!(failure_reason(&CommandEvent::Stdout(b"listening\n".to_vec())), None);
+    let status = status_after(&exited(), "secret", &DaemonStatus::Starting, reason.as_deref());
+    assert_eq!(
+      status.and_then(|status| status.connection()),
+      Some(Err("Another Octopus is already running.".to_string()))
+    );
+  }
+
+  #[test]
+  fn the_login_environment_skips_startup_output_and_shell_variables() {
+    let output =
+      b"Welcome!\n\0OCTOPUS_LOGIN_ENV\0PATH=/opt/bin:/usr/bin\0NOTE=two\nlines\0PWD=/home\0SHLVL=2\0EMPTY=\0";
+    assert_eq!(
+      parse_login_env(output),
+      vec![
+        ("PATH".to_string(), "/opt/bin:/usr/bin".to_string()),
+        ("NOTE".to_string(), "two\nlines".to_string()),
+        ("EMPTY".to_string(), String::new()),
+      ]
+    );
+    assert!(parse_login_env(b"PATH=/usr/bin\0").is_empty());
+  }
+
+  #[test]
+  fn reading_a_shell_gives_up_when_a_background_child_holds_its_output() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf done; sleep 30 &"]);
+    let started = std::time::Instant::now();
+    assert_eq!(output_within(command, Duration::from_millis(300)), None);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf done"]);
+    assert_eq!(output_within(command, Duration::from_secs(5)), Some(b"done".to_vec()));
   }
 
   #[test]
@@ -392,7 +495,7 @@ mod tests {
 
   #[test]
   fn only_a_stopped_daemon_restarts() {
-    let mut stopped = DaemonStatus::Stopped;
+    let mut stopped = DaemonStatus::Stopped(None);
     assert!(stopped.begin_restart());
     assert_eq!(stopped, DaemonStatus::Starting);
     assert!(stopped.connection().is_none());
