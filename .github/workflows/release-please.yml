@@ -96,11 +96,33 @@ jobs:
         if: runner.os == 'macOS'
         run: bun run tauri build --no-bundle
         working-directory: apps/desktop
+      # Bundling signs the app and octopusd with the Developer ID and notarizes them when the secrets are set.
+      # The secrets reach this step only, not the steps that run third-party code.
       - name: Bundle the macOS disk image
         if: runner.os == 'macOS'
         working-directory: apps/desktop
         shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          signing_variables=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID)
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            # Tauri treats a set but empty variable as a certificate to import, so unset them all.
+            unset "${signing_variables[@]}"
+            echo "::notice::APPLE_CERTIFICATE is not set, so this build is not signed or notarized."
+          else
+            for name in "${signing_variables[@]}"; do
+              if [ -z "${!name}" ]; then
+                echo "::error::APPLE_CERTIFICATE is set but $name is not. Set every signing secret, or none."
+                exit 1
+              fi
+            done
+          fi
           bundle_log=$(mktemp)
           trap 'rm -f "$bundle_log"' EXIT
           for attempt in 1 2 3; do
