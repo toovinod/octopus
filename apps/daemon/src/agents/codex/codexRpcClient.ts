@@ -1,4 +1,4 @@
-import { type Cause, Context, Deferred, Duration, Effect, Queue, Schema, Stream } from "effect";
+import { type Cause, Context, Deferred, Duration, Effect, Queue, Result, Schema, Stream } from "effect";
 import { type AgentError, AgentProcessError, AgentProtocolError } from "../AgentAdapter.ts";
 import { type ChildProcess, ChildProcessSpawner } from "effect/process";
 import { toAgentError } from "../toAgentError.ts";
@@ -18,8 +18,9 @@ const IncomingMessage = Schema.Union([
 		method: Schema.String,
 		params: Schema.optionalKey(Schema.Unknown),
 	}),
+	// A reply to a request Codex could not even parse has a null id.
 	Schema.Struct({
-		id: RequestId,
+		id: Schema.NullOr(RequestId),
 		error: Schema.Struct({ code: Schema.Number, message: Schema.String }),
 	}),
 	Schema.Struct({ id: RequestId, result: Schema.Unknown }),
@@ -49,6 +50,7 @@ export interface CodexRpcClient {
 }
 
 export const METHOD_NOT_FOUND = -32601;
+export const INVALID_PARAMS = -32602;
 
 export const CodexRequestSettings = Context.Reference<{
 	// How long Codex may take to answer a request. Every app-server request is answered at once, turns
@@ -83,15 +85,12 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	const handleLine = (line: string) =>
 		Effect.gen(function* () {
 			if (line.trim() === "") return;
-			const message = yield* decodeLine(line).pipe(
-				Effect.mapError(
-					(cause) =>
-						new AgentProtocolError({
-							message: "Codex sent a line Octopus could not read.",
-							cause,
-						}),
-				),
-			);
+			// One line Octopus cannot read, like stray output from a newer Codex, must not end the session.
+			const decoded = yield* Effect.result(decodeLine(line));
+			if (Result.isFailure(decoded)) {
+				return yield* Effect.logWarning("Skipping a line from Codex that Octopus could not read", decoded.failure);
+			}
+			const message = decoded.success;
 			if ("method" in message) {
 				yield* Queue.offer(
 					incoming,
@@ -109,6 +108,11 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 							},
 				);
 				return;
+			}
+			if (message.id === null) {
+				return yield* Effect.logWarning("Codex reported an error for no request").pipe(
+					Effect.annotateLogs({ error: "error" in message ? message.error.message : "" }),
+				);
 			}
 			const deferred = pending.get(message.id);
 			if (deferred === undefined) {

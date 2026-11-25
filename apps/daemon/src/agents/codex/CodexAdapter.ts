@@ -26,12 +26,19 @@ import {
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
+	type AgentProtocolError,
 	CodexVersionMismatchError,
 	type SessionSettings,
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
-import { type CodexIncoming, type CodexRpcClient, METHOD_NOT_FOUND, makeCodexRpcClient } from "./codexRpcClient.ts";
+import {
+	type CodexIncoming,
+	type CodexRpcClient,
+	INVALID_PARAMS,
+	METHOD_NOT_FOUND,
+	makeCodexRpcClient,
+} from "./codexRpcClient.ts";
 import { Context, Effect, Exit, FiberHandle, Layer, Option, Predicate, PubSub, Ref, Scope, Stream } from "effect";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
 import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
@@ -454,6 +461,28 @@ const handleServerRequest = Effect.fnUntraced(function* (
 	}
 });
 
+// A newer Codex can change the shape of a message. Skipping it keeps the chat going, and a request still
+// gets an answer, so Codex is never left waiting.
+const skipUnreadable = Effect.fnUntraced(function* (
+	session: AgentSession,
+	client: CodexRpcClient,
+	message: CodexIncoming,
+	error: AgentProtocolError,
+) {
+	yield* Effect.logWarning("Skipping a Codex message Octopus could not read", error).pipe(
+		Effect.annotateLogs({ method: message.method }),
+	);
+	if (message._tag === "request") {
+		yield* client.respondError(message.id, INVALID_PARAMS, `Octopus could not read ${message.method}`);
+	}
+	yield* session.emit({
+		type: "error",
+		message:
+			"Codex sent a message Octopus could not read, so Octopus skipped it. Update Octopus if this keeps happening.",
+		willRetry: false,
+	});
+});
+
 // Codex runs its own ChatGPT sign-in, which Claude has no equivalent for.
 export interface CodexAgentAdapter extends AgentAdapter {
 	// Returns the URL to open. Codex stores the tokens itself when the user finishes.
@@ -599,6 +628,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 									? handleNotification(session, currentTurn, plans, message.method, message.params)
 									: handleServerRequest(session, client, processId, message),
 							),
+							Effect.catchTag("AgentProtocolError", (error) => skipUnreadable(session, client, message, error)),
 						),
 					),
 					Effect.andThen(session.end),

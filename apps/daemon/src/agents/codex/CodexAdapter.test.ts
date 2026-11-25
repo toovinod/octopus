@@ -165,6 +165,18 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
 	});
 
+	test("skips messages it cannot read, answers such a request with an error, and keeps the session", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("garbled"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.filter((event) => event.type === "error")).toHaveLength(2);
+		expect(events.find((event) => event.type === "message.completed")).toMatchObject({ text: "error -32602" });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
 	test("cuts huge diffs, each and per event, with a marker", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {

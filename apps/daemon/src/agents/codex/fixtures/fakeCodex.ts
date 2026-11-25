@@ -175,6 +175,20 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("garbled")) {
+		// What a newer or misbehaving Codex might send: a stray line, a notification and a request whose shapes
+		// changed, and the null-id reply JSON-RPC gives to a line it could not parse.
+		out.write("not json\n");
+		notify("item/completed", { threadId, turnId, item: { id: "x" } });
+		const answer = await ask(400, "item/commandExecution/requestApproval", { threadId, turnId });
+		send({ id: null, error: { code: -32700, message: "Parse error" } });
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: `error ${answer.error?.code}` },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("big diff")) {
 		// A rewritten lockfile: diffs far bigger than a chat should hold.
 		const change = (path: string) => ({ path, kind: { type: "update", move_path: null }, diff: "+".repeat(150_000) });
