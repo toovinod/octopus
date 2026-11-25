@@ -36,6 +36,7 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
+import { makeProcessId } from "./makeProcessId.ts";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
 // down instead of growing memory.
@@ -196,8 +197,13 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 		),
 	);
 
+	// A turn the agent never named gets a fresh id, so the chat shows each failure as its own notice.
+	const syntheticTurnId = Effect.map(makeProcessId, (id) => `octopus-${id}`);
+
 	const failTurn = (error: AgentError) =>
-		emit({ type: "turn.completed", turnId: "notStarted", result: { status: "failed", message: error.message } });
+		Effect.flatMap(syntheticTurnId, (turnId) =>
+			emit({ type: "turn.completed", turnId, result: { status: "failed", message: error.message } }),
+		);
 
 	// Returns once the running turn has sent nothing for the idle timeout, outside approvals, then stops it.
 	const watchTurn = (driver: TurnDriver, done: Deferred.Deferred<void>) =>
@@ -219,8 +225,16 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			);
 			const ended = yield* Deferred.await(done).pipe(Effect.timeoutOption(interruptGrace));
 			if (Option.isNone(ended)) {
-				yield* Effect.logWarning("The agent did not end a stopped turn, so the session ended it");
-				yield* emit({ type: "turn.completed", turnId: "notCompleted", result: { status: "failed", message } });
+				yield* Effect.logWarning("The agent did not end a stopped turn, so the session ended it and stops the agent");
+				const turnId = yield* syntheticTurnId;
+				// The agent may still end that turn later, which could not be told apart from the next turn's end, and
+				// it may keep running it where no interrupt reaches. Ending the session stops the agent, and the next
+				// message starts it again. Completing the turn ends this race, so both happen as one step.
+				yield* Effect.uninterruptible(
+					emit({ type: "turn.completed", turnId, result: { status: "failed", message } }).pipe(
+						Effect.andThen(Queue.end(events)),
+					),
+				);
 			}
 		});
 

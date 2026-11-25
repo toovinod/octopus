@@ -1,6 +1,6 @@
 import { type AgentSession, makeAgentSession, TurnWatchdogSettings } from "./makeAgentSession.ts";
 import type { AgentEvent, QuestionOutcome, PlanOutcome } from "@repo/contracts/AgentEvent";
-import type { AgentSessionHandle } from "./AgentAdapter.ts";
+import { AgentProtocolError, type AgentSessionHandle } from "./AgentAdapter.ts";
 import { Duration, Effect, Option, Stream } from "effect";
 import { userMessage } from "../testing/userMessage.ts";
 import { describe, expect, test } from "bun:test";
@@ -64,14 +64,39 @@ describe("makeAgentSession turn watchdog", () => {
 		]);
 	});
 
-	test("ends the turn itself when the agent ignores the interrupt", async () => {
-		const results = await runQuietAgent(
+	test("ends the turn itself when the agent ignores the interrupt, then ends the session", async () => {
+		const events = await runQuietAgent(
 			() => Effect.void,
-			(handle) => handle.sendMessage(userMessage("hi")).pipe(Effect.andThen(turnResults(handle))),
+			// Collects until the session ends, so a late end of the stopped turn can never complete a later one.
+			(handle) => handle.sendMessage(userMessage("hi")).pipe(Effect.andThen(Stream.runCollect(handle.events))),
 		);
-		expect(results).toEqual([
-			{ type: "turn.completed", turnId: "notCompleted", result: { status: "failed", message: stalledMessage } },
-		]);
+		expect(events.at(-1)).toEqual({
+			type: "turn.completed",
+			turnId: expect.stringMatching(/^octopus-/),
+			result: { status: "failed", message: stalledMessage },
+		});
+	});
+
+	test("each turn that fails to start gets its own id, so one notice never replaces another", async () => {
+		const results = await Effect.gen(function* () {
+			const session = yield* makeAgentSession(capabilities);
+			const handle: AgentSessionHandle = yield* session.start({
+				startTurn: () => Effect.fail(new AgentProtocolError({ message: "rejected", cause: null })),
+				steerTurn: () => Effect.void,
+				interruptTurn: Effect.void,
+				updateSettings: () => Effect.void,
+				listCommands: Effect.succeed([]),
+			});
+			yield* handle.sendMessage(userMessage("one"));
+			yield* handle.sendMessage(userMessage("two"));
+			return yield* handle.events.pipe(
+				Stream.filter((event) => event.type === "turn.completed"),
+				Stream.take(2),
+				Stream.runCollect,
+			);
+		}).pipe(Effect.scoped, Effect.runPromise);
+		const ids = results.map((event) => (event.type === "turn.completed" ? event.turnId : ""));
+		expect(new Set(ids).size).toBe(2);
 	});
 
 	test("keeps a turn that is still sending events, or waiting on the user", async () => {

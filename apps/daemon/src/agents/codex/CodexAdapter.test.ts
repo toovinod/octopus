@@ -273,7 +273,7 @@ describe("CodexAdapter", () => {
 		);
 		expect(first).toEqual({
 			type: "turn.completed",
-			turnId: "notStarted",
+			turnId: expect.stringMatching(/^octopus-/),
 			result: {
 				status: "failed",
 				message: "Codex did not answer turn/start in time. Try again, and stop the chat if it keeps happening.",
