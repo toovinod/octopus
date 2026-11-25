@@ -21,7 +21,8 @@ import {
 	updateSessionSettings,
 	useAppState,
 } from "../lib/store.ts";
-import { type DraftImage, MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
+import { MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
+import { type Draft, draftOf, keepDraft } from "../lib/drafts.ts";
 import { memo, useEffect, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
@@ -41,14 +42,6 @@ import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
 import { cn } from "@repo/ui/lib/utils";
 
-interface Draft {
-	readonly text: string;
-	readonly images: ReadonlyArray<DraftImage>;
-}
-
-// Drafts outlive the composer, so switching chats and back keeps what was typed.
-const drafts = new Map<string, Draft>();
-
 // Memoized with only the chat fields it shows, so streamed output does not re-render it.
 export const Composer = memo(
 	({
@@ -62,7 +55,7 @@ export const Composer = memo(
 		readonly usage: ChatState["usage"];
 		readonly rateLimit: ChatState["rateLimit"];
 	}) => {
-		const [draft, setDraft] = useState<Draft>(() => drafts.get(session.id) ?? { text: "", images: [] });
+		const [draft, setDraft] = useState<Draft>(() => draftOf(session.id));
 		const [dragging, setDragging] = useState(false);
 		const textRef = useRef<HTMLTextAreaElement>(null);
 		const fileRef = useRef<HTMLInputElement>(null);
@@ -85,7 +78,7 @@ export const Composer = memo(
 		}, [token?.start, token?.query]);
 
 		useEffect(() => {
-			drafts.set(session.id, draft);
+			keepDraft(session.id, draft);
 		}, [session.id, draft]);
 
 		useEffect(() => {

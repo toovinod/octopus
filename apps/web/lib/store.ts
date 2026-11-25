@@ -18,6 +18,7 @@ import type { Workspace } from "@repo/contracts/Workspace";
 import type { Project } from "@repo/contracts/Project";
 import type { DraftImage } from "./images.ts";
 import { useSyncExternalStore } from "react";
+import { releaseDrafts } from "./drafts.ts";
 import { toast as showToast } from "sonner";
 import { Redacted } from "effect";
 
@@ -321,6 +322,7 @@ export const removeProject = async (projectId: string) => {
 	for (const [sessionId, sends] of Object.entries(state.failedSends)) {
 		if (removed.has(sessionWorkspace(sessionId) ?? "")) releaseImages(sends.flatMap((send) => send.images));
 	}
+	releaseDrafts(Object.keys(state.sessions).filter((sessionId) => removed.has(sessionWorkspace(sessionId) ?? "")));
 	setState((current) => ({
 		projects: without(current.projects, projectId),
 		workspaces: kept(current.workspaces, (workspaceId) => workspaceId),
@@ -364,6 +366,11 @@ export const createWorkspace = async (input: CreateWorkspaceInput) => {
 // Fails with the daemon's error, so the caller can offer to force past unsaved work.
 export const archiveWorkspace = async (workspaceId: string, force: boolean) => {
 	const archived = await callDaemon((daemon) => daemon.archiveWorkspace({ workspaceId, force }));
+	releaseDrafts(
+		Object.values(state.sessions)
+			.filter((session) => session.workspaceId === workspaceId)
+			.map((session) => session.id),
+	);
 	setState((current) => ({
 		workspaces: { ...current.workspaces, [workspaceId]: archived },
 		...(current.selectedWorkspaceId === workspaceId ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),

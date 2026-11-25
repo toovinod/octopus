@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AgentSession } from "@repo/contracts/AgentSession";
+import { draftOf, keepDraft } from "./drafts.ts";
 import type { Follow } from "./daemonRuntime.ts";
 import { Predicate } from "effect";
 
@@ -192,7 +193,9 @@ describe("removing a project", () => {
 		expect(getState().selectedSessionId).toBe("s");
 		expect(getState().chat?.sessionId).toBe("s");
 
+		keepDraft("s", { text: "half a thought", images: [] });
 		expect(await removeProject("p")).toBe(true);
+		expect(draftOf("s").text).toBe("");
 		const state = getState();
 		expect(state.projects).toEqual({});
 		expect(state.workspaces).toEqual({});
