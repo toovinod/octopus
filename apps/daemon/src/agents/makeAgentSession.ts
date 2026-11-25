@@ -37,12 +37,21 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
-import { makeProcessId } from "./makeProcessId.ts";
+import { makeUniqueId } from "./makeUniqueId.ts";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
 // down instead of growing memory.
 const EVENT_BUFFER = 256;
 export const MAX_QUEUED_MESSAGES = 8;
+
+// Shown for queued messages the agent never got, so none of them goes missing without a word.
+export const unsentNotice = (messages: ReadonlyArray<UserMessage>): AgentEvent => ({
+	type: "error",
+	message: `The agent stopped, so Octopus did not send ${messages.length === 1 ? "this queued message" : "these queued messages"}: ${messages
+		.map(({ text, images }) => `"${text || `${images.length} ${images.length === 1 ? "image" : "images"}`}"`)
+		.join(", ")}`,
+	willRetry: false,
+});
 
 export const TurnWatchdogSettings = Context.Reference<{
 	// A turn that sends no event for this long is stopped and fails, so a hung agent cannot hold the
@@ -101,12 +110,15 @@ export interface AgentSession {
 
 export const makeAgentSession = Effect.fnUntraced(function* (capabilities: AgentCapabilities) {
 	const events = yield* Queue.bounded<AgentEvent, AgentError | Cause.Done>(EVENT_BUFFER);
-	yield* Effect.addFinalizer(() => Queue.end(events));
+	yield* Effect.addFinalizer(() => endWith(Queue.end(events)));
 	const nativeId = yield* Deferred.make<string, AgentError>();
-	const inbox = yield* Queue.bounded<{ readonly message: UserMessage; readonly beforeTurn: Effect.Effect<void> }>(
-		MAX_QUEUED_MESSAGES,
-	);
-	// Checking room, storing the message and queueing it happen as one step, so history order matches.
+	const inbox = yield* Queue.bounded<{
+		readonly message: UserMessage;
+		readonly beforeTurn: Effect.Effect<void>;
+		readonly discard: Effect.Effect<void>;
+	}>(MAX_QUEUED_MESSAGES);
+	// Sending, starting, dropping a queued message and ending the session each happen as one step under it, so a
+	// message is either stored and started, or dropped and handed back, never both or neither.
 	const sendLock = yield* Semaphore.make(1);
 	const currentTurn = yield* Ref.make(Option.none<Deferred.Deferred<void>>());
 	const lastEventAt = yield* Ref.make(0);
@@ -156,11 +168,37 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			return offered;
 		});
 
-	const fail = (error: AgentError) =>
-		Effect.gen(function* () {
-			yield* Deferred.fail(nativeId, error);
-			yield* Queue.fail(events, error);
+	const recordMessage = (message: UserMessage) =>
+		emit({
+			type: "user.message",
+			itemId: message.id,
+			text: message.text,
+			attachments: message.images.map(({ id, mediaType }) => ({ id, mediaType })),
 		});
+
+	// Messages still waiting for their turn never reached the agent, so they leave nothing in history.
+	// Callers hold the send lock.
+	const dropQueued = Effect.gen(function* () {
+		const dropped = yield* Queue.clear(inbox);
+		yield* Effect.forEach(dropped, ({ discard }) => discard, { discard: true });
+		return dropped.map(({ message }) => message);
+	});
+
+	// Queued messages can never run once the session ends, so the chat says which ones were not sent.
+	const endWith = (close: Effect.Effect<unknown>) =>
+		Effect.gen(function* () {
+			const dropped = yield* dropQueued;
+			if (dropped.length > 0) yield* emit(unsentNotice(dropped));
+			yield* close;
+		}).pipe(Semaphore.withPermit(sendLock), Effect.uninterruptible);
+
+	const fail = (error: AgentError) =>
+		endWith(
+			Effect.gen(function* () {
+				yield* Deferred.fail(nativeId, error);
+				yield* Queue.fail(events, error);
+			}),
+		);
 
 	const resolve = (requestId: string, outcome: ApprovalOutcome) =>
 		emit({ type: "approval.resolved", requestId, outcome });
@@ -204,7 +242,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	);
 
 	// A turn the agent never named gets a fresh id, so the chat shows each failure as its own notice.
-	const syntheticTurnId = Effect.map(makeProcessId, (id) => `octopus-${id}`);
+	const syntheticTurnId = Effect.map(makeUniqueId, (id) => `octopus-${id}`);
 
 	const failTurn = (error: AgentError) =>
 		Effect.flatMap(syntheticTurnId, (turnId) =>
@@ -236,7 +274,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				// The agent may still end that turn later, which could not be told apart from the next turn's end, and
 				// it may keep running it where no interrupt reaches. Ending the session stops the agent, and the next
 				// message starts it again. Completing the turn ends this race, so both happen as one step.
-				yield* Effect.uninterruptible(
+				yield* endWith(
 					emit({ type: "turn.completed", turnId, result: { status: "failed", message } }).pipe(
 						Effect.andThen(Queue.end(events)),
 					),
@@ -247,8 +285,17 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	const start = (driver: TurnDriver) =>
 		Effect.gen(function* () {
 			yield* Effect.gen(function* () {
-				const { message, beforeTurn } = yield* Queue.take(inbox);
-				yield* beforeTurn;
+				const next = yield* Queue.peek(inbox);
+				yield* next.beforeTurn;
+				// Still queued until now, so a stop during beforeTurn drops it rather than starting it. Stored only
+				// now, so history holds just the messages the agent got.
+				const started = yield* Effect.gen(function* () {
+					if (Queue.sizeUnsafe(inbox) === 0 || (yield* Queue.peek(inbox)) !== next) return false;
+					yield* Queue.take(inbox);
+					return yield* recordMessage(next.message);
+				}).pipe(Semaphore.withPermit(sendLock));
+				if (!started) return;
+				const { message } = next;
 				const done = yield* Deferred.make<void>();
 				yield* Ref.set(currentTurn, Option.some(done));
 				yield* Ref.set(lastEventAt, yield* Clock.currentTimeMillis);
@@ -266,44 +313,28 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				events: Stream.fromQueue(events),
 				sendMessage: (message, options) =>
 					Effect.gen(function* () {
+						// A session that ended, as when its process exits while the message is on its way, can never run it.
+						const stopped = new AgentProcessError({
+							message: "The agent stopped before it took the message. Send it again.",
+							cause: null,
+						});
+						if (events.state._tag !== "Open") return yield* stopped;
 						const running = Option.isSome(yield* Ref.get(currentTurn));
 						const steer = options?.steer && capabilities.steerWhileRunning && running;
-						if (!steer && Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
-							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
-						}
 						// A new message replaces an unanswered plan or question, as typing past the prompt does in both CLIs.
 						yield* cancelPlansAndQuestions;
-						// A session that ended, as when its process exits while the message is on its way, can never run it.
-						const recordMessage = emit({
-							type: "user.message",
-							itemId: message.id,
-							text: message.text,
-							attachments: message.images.map(({ id, mediaType }) => ({ id, mediaType })),
-						}).pipe(
-							Effect.flatMap((stored) =>
-								stored
-									? Effect.void
-									: Effect.fail(
-											new AgentProcessError({
-												message: "The agent stopped before it took the message. Send it again.",
-												cause: null,
-											}),
-										),
-							),
-						);
 						// Recorded only once the agent took it, so a rejected steer leaves no message in history
 						// that the agent never saw, and the caller can safely drop its images.
 						const beforeTurn = options?.beforeTurn ?? Effect.void;
 						// A steer that falls back to queueing runs it again before its own turn.
 						if (steer && (yield* beforeTurn.pipe(Effect.andThen(driver.steerTurn(message))))) {
-							yield* recordMessage;
+							if (!(yield* recordMessage(message))) return yield* stopped;
 							return "steered" as const;
 						}
 						if (Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
 							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
 						}
-						yield* recordMessage;
-						Queue.offerUnsafe(inbox, { message, beforeTurn });
+						Queue.offerUnsafe(inbox, { message, beforeTurn, discard: options?.discard ?? Effect.void });
 						return "queued" as const;
 					}).pipe(Semaphore.withPermit(sendLock)),
 				respondToApproval: (requestId, decision) =>
@@ -349,13 +380,13 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				interrupt: Effect.gen(function* () {
 					// Messages waiting for their turn would start the moment the stopped turn ends, so a stop drops them
 					// first and hands them back.
-					const dropped = yield* Queue.clear(inbox);
+					const dropped = yield* Semaphore.withPermit(sendLock, dropQueued);
 					yield* cancelApprovals;
 					yield* cancelPlansAndQuestions;
 					if (Option.isSome(yield* Ref.get(currentTurn))) {
 						yield* driver.interruptTurn;
 					}
-					return dropped.map(({ message }) => message);
+					return dropped;
 				}),
 				updateSettings: driver.updateSettings,
 				listCommands: driver.listCommands,
@@ -391,7 +422,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				}
 			}),
 		fail,
-		end: Effect.asVoid(Queue.end(events)),
+		end: endWith(Queue.end(events)),
 		start,
 	} satisfies AgentSession;
 });

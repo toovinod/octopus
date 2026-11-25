@@ -806,7 +806,9 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 								// The caller keeps the stored settings when this fails, so claude goes back to them too.
 								Effect.tapError(() =>
 									setModelAndEffort(previous).pipe(
-										Effect.catch((error) => Effect.logWarning("Could not restore the chat's settings", error)),
+										Effect.catchTag("AgentProcessError", (error) =>
+											Effect.logWarning("Could not restore the chat's settings", error),
+										),
 									),
 								),
 							);

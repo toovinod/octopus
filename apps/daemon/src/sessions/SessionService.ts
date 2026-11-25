@@ -31,6 +31,7 @@ import {
 	type SessionSettings,
 	type StartSessionInput,
 	type UserImage,
+	type UserMessage,
 } from "../agents/AgentAdapter.ts";
 import {
 	type Cause,
@@ -80,6 +81,7 @@ import { CredentialStore } from "../agents/CredentialStore.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
+import { unsentNotice } from "../agents/makeAgentSession.ts";
 import { holdsForkCode } from "../workspaces/forkBranch.ts";
 import { SessionEvent } from "@repo/contracts/SessionEvent";
 import type { ChildProcessSpawner } from "effect/process";
@@ -116,6 +118,8 @@ interface Runtime {
 	nextSequence: number;
 	// Turns sent and not yet completed, including queued ones.
 	outstanding: number;
+	// Queued messages a stop dropped with nobody to hand them back to, for the chat to say they were not sent.
+	unsent: ReadonlyArray<UserMessage>;
 	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
 	readonly approvals: Map<string, Cancellation>;
 	// The status when no turn or approval is pending.
@@ -287,6 +291,37 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const publish = (event: SessionEvent) =>
 			PubSub.publish(events, { event, bytes: Buffer.byteLength(JSON.stringify(event.event)) });
 
+		// The sequence the next stored event of a session takes.
+		const nextSequenceOf = Effect.fnUntraced(function* (sessionId: string) {
+			const [stored] = yield* database.query((db) =>
+				db
+					.select({ last: max(sessionEvent.sequence) })
+					.from(sessionEvent)
+					.where(eq(sessionEvent.sessionId, sessionId)),
+			);
+			return (stored?.last ?? -1) + 1;
+		});
+
+		// Stores events at consecutive sequences from first.
+		const insertEvents = Effect.fnUntraced(function* (
+			sessionId: string,
+			first: number,
+			events: ReadonlyArray<AgentEvent>,
+			createdAt: string,
+		) {
+			const values = yield* Effect.forEach(events, (event, index) =>
+				Effect.map(newId, (id) => ({
+					id,
+					sessionId,
+					sequence: first + index,
+					type: event.type,
+					payload: event,
+					createdAt,
+				})),
+			);
+			yield* database.query((db) => db.insert(sessionEvent).values(values));
+		}, Effect.provide(services));
+
 		// Stored events are written before they are published, so a subscriber never misses one.
 		const record = Effect.fnUntraced(function* (runtime: Runtime, event: AgentEvent) {
 			const { sessionId } = runtime;
@@ -295,10 +330,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				return yield* publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
 			}
 			const sequence = runtime.nextSequence;
-			const id = yield* newId;
-			yield* database.query((db) =>
-				db.insert(sessionEvent).values({ id, sessionId, sequence, type: event.type, payload: event, createdAt }),
-			);
+			yield* insertEvents(sessionId, sequence, [event], createdAt);
 			runtime.nextSequence++;
 			yield* publish(new SessionEvent({ sessionId, sequence, event, createdAt }));
 			switch (event.type) {
@@ -341,6 +373,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* Scope.close(runtime.scope, Exit.void);
 				// Nothing can answer what the process left open, so history closes it instead of offering it forever.
 				for (const cancellation of [...runtime.approvals.values()]) yield* record(runtime, cancellation);
+				if (runtime.unsent.length > 0) yield* record(runtime, unsentNotice(runtime.unsent));
 				if (runtime.outstanding > 0) {
 					const turnId = yield* newId.pipe(Effect.provide(services));
 					yield* record(runtime, { type: "turn.completed", turnId, result: { status: "interrupted" } });
@@ -386,6 +419,11 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				!runtime.ending && isBusy(runtime.status)
 					? runtime.handle.interrupt.pipe(
 							Effect.timeoutOption(STOP_GRACE),
+							Effect.flatMap((dropped) =>
+								Effect.sync(() => {
+									runtime.unsent = Option.getOrElse(dropped, () => []);
+								}),
+							),
 							Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
 						)
 					: Effect.void;
@@ -516,12 +554,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
 					})
 					.pipe(Scope.provide(scope), Effect.mapError(toUnavailable(row.agent)));
-				const [stored] = yield* database.query((db) =>
-					db
-						.select({ last: max(sessionEvent.sequence) })
-						.from(sessionEvent)
-						.where(eq(sessionEvent.sessionId, row.id)),
-				);
+				const nextSequence = yield* nextSequenceOf(row.id);
 				const created: Runtime = {
 					sessionId: row.id,
 					workspaceId: row.workspaceId,
@@ -531,8 +564,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					done: yield* Deferred.make<void>(),
 					ending: false,
 					idleSince: clock.currentTimeNanosUnsafe(),
-					nextSequence: (stored?.last ?? -1) + 1,
+					nextSequence,
 					outstanding: 0,
+					unsent: [],
 					approvals: new Map(),
 					resting: isBusy(row.status) ? "idle" : row.status,
 					status: row.status,
@@ -570,6 +604,12 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}
 		});
 
+		// A file left behind only costs disk space, so the caller goes on, but the failure is logged.
+		const removeImage = (path: string) =>
+			fs
+				.remove(path)
+				.pipe(Effect.catchTag("PlatformError", (cause) => Effect.logWarning("Could not remove a stored image", cause)));
+
 		// Written to disk before the agent sees them: Codex reads them from there, and history shows them later.
 		const storeImages = Effect.fnUntraced(function* (sessionId: string, images: ReadonlyArray<ImageData>) {
 			if (images.length === 0) return [];
@@ -587,7 +627,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				}),
 			).pipe(
 				// The message is never sent then, so nothing will ask for the images already written.
-				Effect.onError(() => Effect.forEach(written, (path) => Effect.ignore(fs.remove(path)), { discard: true })),
+				Effect.onError(() => Effect.forEach(written, removeImage, { discard: true })),
 			);
 		}, Effect.provide(services));
 
@@ -620,7 +660,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* refreshStatus(runtime);
 				// Taken when the message's turn starts, so a queued message's checkpoint holds the turns before it.
 				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
-				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn }).pipe(
+				// A queued message dropped before its turn is never stored, so nothing will ask for its images.
+				const discard = Effect.forEach(message.images, ({ path }) => removeImage(path), { discard: true });
+				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn, discard }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>
@@ -631,7 +673,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 									runtime.outstanding = Math.max(0, runtime.outstanding - 1);
 									yield* refreshStatus(runtime);
 									// The message was not stored, so nothing will ever ask for its images.
-									yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
+									yield* Effect.forEach(message.images, ({ path }) => removeImage(path));
 								}),
 					),
 				);
@@ -741,7 +783,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.answerQuestion(requestId, answers);
 		});
 
-		// Returns the text of the queued messages it dropped, so the user can send them again.
+		// Returns the queued messages it dropped, with their images, so the user can send them again.
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
 			const runtime = runtimes.get(sessionId);
 			if (runtime === undefined) {
@@ -751,7 +793,10 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			const dropped = yield* runtime.handle.interrupt;
 			runtime.outstanding = Math.max(0, runtime.outstanding - dropped.length);
 			yield* refreshStatus(runtime);
-			return dropped.map(({ text }) => text);
+			return dropped.map(({ text, images }) => ({
+				text,
+				images: images.map(({ mediaType, base64 }) => ({ mediaType, base64 })),
+			}));
 		});
 
 		const stop = Effect.fn("SessionService.stop")(
@@ -1162,25 +1207,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				...open.values(),
 				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
 			];
-			const [stored] = yield* database.query((db) =>
-				db
-					.select({ last: max(sessionEvent.sequence) })
-					.from(sessionEvent)
-					.where(eq(sessionEvent.sessionId, sessionId)),
-			);
-			const first = (stored?.last ?? -1) + 1;
-			const createdAt = yield* nowIso;
-			const values = yield* Effect.forEach(closing, (event, index) =>
-				Effect.map(newId, (id) => ({
-					id,
-					sessionId,
-					sequence: first + index,
-					type: event.type,
-					payload: event,
-					createdAt,
-				})),
-			);
-			yield* database.query((db) => db.insert(sessionEvent).values(values));
+			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso);
 		}, Effect.provide(services));
 
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
@@ -1216,7 +1243,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				const workspaceIds = new Set(rows.map(({ id }) => id));
 				yield* stopRuntimes((runtime) => workspaceIds.has(runtime.workspaceId));
 			},
-			Effect.catch((error) => Effect.logError("Could not stop the agents of a project that lost its trust", error)),
+			Effect.catchTag("LocalDatabaseError", (error) =>
+				Effect.logError("Could not stop the agents of a project that lost its trust", error),
+			),
 		);
 		yield* projects.trustRevoked.pipe(Stream.runForEach(stopProject), Effect.forkScoped);
 

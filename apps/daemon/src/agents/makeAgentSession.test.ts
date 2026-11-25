@@ -1,7 +1,7 @@
-import { type AgentSession, makeAgentSession, TurnWatchdogSettings } from "./makeAgentSession.ts";
+import { type AgentSession, makeAgentSession, TurnWatchdogSettings, unsentNotice } from "./makeAgentSession.ts";
+import { AgentProtocolError, type AgentSessionHandle, type UserMessage } from "./AgentAdapter.ts";
 import type { AgentEvent, QuestionOutcome, PlanOutcome } from "@repo/contracts/AgentEvent";
-import { AgentProtocolError, type AgentSessionHandle } from "./AgentAdapter.ts";
-import { Duration, Effect, Option, Stream } from "effect";
+import { Deferred, Duration, Effect, Option, Stream } from "effect";
 import { userMessage } from "../testing/userMessage.ts";
 import { describe, expect, test } from "bun:test";
 
@@ -198,6 +198,98 @@ test("a stop drops the queued messages and hands them back", async () => {
 	}).pipe(Effect.scoped, Effect.runPromise);
 	expect(dropped).toEqual(["two", "three"]);
 	expect(started).toEqual(["one"]);
+});
+
+describe("makeAgentSession queued messages", () => {
+	// An agent that starts every turn and then goes quiet, and ends its turn when interrupted.
+	const quietDriver = (session: AgentSession, started: Array<string>) => ({
+		startTurn: (message: UserMessage) => Effect.sync(() => void started.push(message.text)),
+		steerTurn: () => Effect.succeed(true),
+		interruptTurn: session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }),
+		updateSettings: () => Effect.void,
+		listCommands: Effect.succeed([]),
+	});
+
+	const discardInto = (discarded: Array<string>, text: string) => ({
+		discard: Effect.sync(() => void discarded.push(text)),
+	});
+
+	const storedMessages = (events: ReadonlyArray<AgentEvent>) =>
+		events.flatMap((event) => (event.type === "user.message" ? [event.text] : []));
+
+	test("a queued message is stored only once its turn starts, so one a stop drops leaves no trace", async () => {
+		const discarded: Array<string> = [];
+		const events = await Effect.gen(function* () {
+			const session = yield* makeAgentSession(capabilities);
+			const handle: AgentSessionHandle = yield* session.start(quietDriver(session, []));
+			yield* handle.sendMessage(userMessage("one"), discardInto(discarded, "one"));
+			yield* handle.sendMessage(userMessage("two"), discardInto(discarded, "two"));
+			yield* Effect.sleep("20 millis");
+			yield* handle.interrupt;
+			return yield* handle.events.pipe(
+				Stream.takeUntil((event) => event.type === "turn.completed"),
+				Stream.runCollect,
+			);
+		}).pipe(Effect.scoped, Effect.runPromise);
+		expect(storedMessages(events)).toEqual(["one"]);
+		expect(discarded).toEqual(["two"]);
+	});
+
+	test("a stop while a queued message's beforeTurn runs drops it instead of starting it", async () => {
+		const started: Array<string> = [];
+		const dropped = await Effect.gen(function* () {
+			const session = yield* makeAgentSession(capabilities);
+			const handle: AgentSessionHandle = yield* session.start(quietDriver(session, started));
+			const gate = yield* Deferred.make<void>();
+			yield* handle.sendMessage(userMessage("one"));
+			yield* handle.sendMessage(userMessage("two"), { beforeTurn: Deferred.await(gate) });
+			yield* Effect.sleep("20 millis");
+			yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+			yield* Effect.sleep("20 millis");
+			const dropped = yield* handle.interrupt;
+			yield* Deferred.succeed(gate, undefined);
+			yield* Effect.sleep("50 millis");
+			return dropped.map(({ text }) => text);
+		}).pipe(Effect.scoped, Effect.runPromise);
+		expect(dropped).toEqual(["two"]);
+		expect(started).toEqual(["one"]);
+	});
+
+	test("the watchdog giving up on a turn says which queued messages were not sent", async () => {
+		const discarded: Array<string> = [];
+		const events = await runQuietAgent(
+			() => Effect.void,
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("one"));
+					yield* handle.sendMessage(userMessage("two"), discardInto(discarded, "two"));
+					return yield* Stream.runCollect(handle.events);
+				}),
+		);
+		expect(storedMessages(events)).toEqual(["one"]);
+		expect(events).toContainEqual(unsentNotice([userMessage("two")]));
+		expect(events.at(-1)?.type).toBe("turn.completed");
+		expect(discarded).toEqual(["two"]);
+	});
+
+	test("a session that ends with queued messages says which were not sent", async () => {
+		const discarded: Array<string> = [];
+		const events = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("one"));
+					yield* handle.sendMessage(userMessage("two"), discardInto(discarded, "two"));
+					yield* handle.sendMessage(userMessage("three"), discardInto(discarded, "three"));
+					yield* Effect.sleep("20 millis");
+					yield* session.end;
+					return yield* Stream.runCollect(handle.events);
+				}),
+		);
+		expect(storedMessages(events)).toEqual(["one"]);
+		expect(events.at(-1)).toEqual(unsentNotice([userMessage("two"), userMessage("three")]));
+		expect(discarded).toEqual(["two", "three"]);
+	});
 });
 
 describe("makeAgentSession plans", () => {

@@ -62,7 +62,7 @@ import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
-import { makeProcessId } from "../makeProcessId.ts";
+import { makeUniqueId } from "../makeUniqueId.ts";
 import { toAgentError } from "../toAgentError.ts";
 
 const CODEX_VERSION = codexVersionFile.trim();
@@ -622,7 +622,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
-				const processId = yield* makeProcessId;
+				const processId = yield* makeUniqueId;
 				const currentTurn = yield* Ref.make(idle);
 				const plans: PlanTracking = {
 					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
