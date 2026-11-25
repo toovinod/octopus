@@ -43,7 +43,10 @@ export const createAuth = ({
 			},
 		},
 		hooks: { after: leaveOrganizationHook(publishMembershipEvent) },
+		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
+		rateLimit: { enabled: true },
 		advanced: {
+			ipAddress: { ipAddressHeaders: [config.ipAddressHeader] },
 			// The web app is a static site on its own origin that calls the API with credentials.
 			defaultCookieAttributes: { sameSite: "none", secure: true },
 		},
