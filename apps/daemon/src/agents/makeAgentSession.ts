@@ -2,9 +2,19 @@ import {
 	type AgentCapabilities,
 	type AgentCommand,
 	ApprovalNotFoundError,
+	QuestionNotFoundError,
 	PlanNotFoundError,
 	SessionBusyError,
 } from "@repo/contracts/AgentSession";
+import type {
+	AgentEvent,
+	ApprovalDecision,
+	ApprovalOutcome,
+	QuestionOutcome,
+	QuestionAnswers,
+	PlanAnswer,
+	PlanOutcome,
+} from "@repo/contracts/AgentEvent";
 import {
 	type AgentError,
 	type AgentSessionHandle,
@@ -26,13 +36,6 @@ import {
 	Semaphore,
 	Stream,
 } from "effect";
-import type {
-	AgentEvent,
-	ApprovalDecision,
-	ApprovalOutcome,
-	PlanAnswer,
-	PlanOutcome,
-} from "@repo/contracts/AgentEvent";
 
 // Events wait here until the consumer reads them. A full buffer slows the agent reader
 // down instead of growing memory.
@@ -58,6 +61,10 @@ type PlanRequest = Omit<Extract<AgentEvent, { type: "plan.proposed" }>, "type">;
 // Returns the message to send next, if the agent waits for one after its plan.
 type RespondToPlan = (outcome: PlanOutcome) => Effect.Effect<Option.Option<string>, AgentError>;
 
+type QuestionRequest = Omit<Extract<AgentEvent, { type: "question.asked" }>, "type">;
+
+type RespondToQuestions = (outcome: QuestionOutcome) => Effect.Effect<void, AgentError>;
+
 // What each adapter does to drive its agent. The session below owns everything else:
 // the event buffer, turn queue, pending approvals and the native id.
 export interface TurnDriver {
@@ -74,6 +81,9 @@ export interface AgentSession {
 	proposePlan(request: PlanRequest, respond: RespondToPlan): Effect.Effect<void>;
 	// For an agent that withdraws its own plan. Does nothing once the plan is answered.
 	cancelPlan(requestId: string): Effect.Effect<void, AgentError>;
+	askQuestions(request: QuestionRequest, respond: RespondToQuestions): Effect.Effect<void>;
+	// For an agent that withdraws its own questions. Does nothing once they are answered.
+	cancelQuestions(requestId: string): Effect.Effect<void, AgentError>;
 	// For an agent that withdraws its own request. Does nothing once the request is answered.
 	cancelApproval(requestId: string): Effect.Effect<void, AgentError>;
 	setNativeSessionId(id: string): Effect.Effect<void>;
@@ -109,8 +119,15 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			readonly respond: RespondToPlan;
 		}
 	>();
-	// A plan or an approval waiting on the user, so a quiet turn is not a stalled one.
-	const waitingOnUser = () => approvals.size > 0 || plans.size > 0;
+	const questions = new Map<
+		string,
+		{
+			readonly questions: QuestionRequest["questions"];
+			readonly respond: RespondToQuestions;
+		}
+	>();
+	// An approval, plan or question waiting on the user, so a quiet turn is not a stalled one.
+	const waitingOnUser = () => approvals.size > 0 || plans.size > 0 || questions.size > 0;
 
 	const emit = (agentEvent: AgentEvent) =>
 		Effect.gen(function* () {
@@ -158,7 +175,21 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			yield* plan.respond({ type: "cancelled" });
 		});
 
-	const cancelPlans = Effect.suspend(() => Effect.forEach([...plans.keys()], cancelPlan, { discard: true }));
+	const cancelQuestions = (requestId: string) =>
+		Effect.gen(function* () {
+			const pending = questions.get(requestId);
+			if (pending === undefined) return;
+			questions.delete(requestId);
+			yield* emit({ type: "question.resolved", requestId, outcome: { type: "cancelled" } });
+			yield* pending.respond({ type: "cancelled" });
+		});
+
+	// A plan and questions both end when the user moves on, so they are cancelled together.
+	const cancelPlansAndQuestions = Effect.suspend(() =>
+		Effect.forEach([...plans.keys()], cancelPlan, { discard: true }).pipe(
+			Effect.andThen(Effect.forEach([...questions.keys()], cancelQuestions, { discard: true })),
+		),
+	);
 
 	const failTurn = (error: AgentError) =>
 		emit({ type: "turn.completed", turnId: "notStarted", result: { status: "failed", message: error.message } });
@@ -214,8 +245,8 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						if (!steer && Queue.sizeUnsafe(inbox) >= MAX_QUEUED_MESSAGES) {
 							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
 						}
-						// A new message replaces an unanswered plan, as typing past the plan prompt does in both CLIs.
-						yield* cancelPlans;
+						// A new message replaces an unanswered plan or question, as typing past the prompt does in both CLIs.
+						yield* cancelPlansAndQuestions;
 						const recordMessage = emit({
 							type: "user.message",
 							itemId: message.id,
@@ -260,9 +291,22 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						yield* emit({ type: "plan.resolved", requestId, outcome: answer });
 						return yield* plan.respond(answer);
 					}),
+				answerQuestion: (requestId, answers: QuestionAnswers) =>
+					Effect.gen(function* () {
+						const pending = questions.get(requestId);
+						if (pending === undefined) {
+							return yield* new QuestionNotFoundError({ requestId });
+						}
+						questions.delete(requestId);
+						const stored = Object.fromEntries(
+							Object.entries(answers).filter(([id]) => !pending.questions.some((q) => q.id === id && q.secret)),
+						);
+						yield* emit({ type: "question.resolved", requestId, outcome: { type: "answered", answers: stored } });
+						yield* pending.respond({ type: "answered", answers });
+					}),
 				interrupt: Effect.gen(function* () {
 					yield* cancelApprovals;
-					yield* cancelPlans;
+					yield* cancelPlansAndQuestions;
 					if (Option.isSome(yield* Ref.get(currentTurn))) {
 						yield* driver.interruptTurn;
 					}
@@ -286,6 +330,12 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				yield* emit({ type: "plan.proposed", ...request });
 			}),
 		cancelPlan,
+		askQuestions: (request, respond) =>
+			Effect.gen(function* () {
+				questions.set(request.requestId, { questions: request.questions, respond });
+				yield* emit({ type: "question.asked", ...request });
+			}),
+		cancelQuestions,
 		nativeSessionId: Deferred.await(nativeId),
 		setNativeSessionId: (id) =>
 			Effect.gen(function* () {

@@ -1,4 +1,12 @@
-import type { AgentEvent, ApprovalDecision, ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
+import type {
+	AgentEvent,
+	AgentQuestion,
+	ApprovalDecision,
+	ApprovalOutcome,
+	PlanOutcome,
+	QuestionOutcome,
+	ToolCall,
+} from "@repo/contracts/AgentEvent";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import type { AgentMode } from "@repo/contracts/AgentSession";
 
@@ -40,6 +48,13 @@ export type ChatItem =
 			readonly choices: ReadonlyArray<AgentMode>;
 			readonly outcome: PlanOutcome | null;
 	  }
+	| {
+			readonly kind: "question";
+			readonly key: string;
+			readonly requestId: string;
+			readonly questions: ReadonlyArray<AgentQuestion>;
+			readonly outcome: QuestionOutcome | null;
+	  }
 	| { readonly kind: "notice"; readonly key: string; readonly tone: "error" | "warning"; readonly text: string };
 
 export interface ChatState {
@@ -55,6 +70,8 @@ export interface ChatState {
 	readonly earlierOutcomes: Readonly<Record<string, ApprovalOutcome>>;
 	// The same for plans.
 	readonly earlierPlanOutcomes: Readonly<Record<string, PlanOutcome>>;
+	// And for questions.
+	readonly earlierQuestionOutcomes: Readonly<Record<string, QuestionOutcome>>;
 	readonly usage: { readonly contextTokens: number; readonly contextWindow: number | null } | null;
 	readonly rateLimit: RateLimit | null;
 }
@@ -67,6 +84,7 @@ export const emptyChat = (sessionId: string): ChatState => ({
 	firstSequence: null,
 	earlierOutcomes: {},
 	earlierPlanOutcomes: {},
+	earlierQuestionOutcomes: {},
 	usage: null,
 	rateLimit: null,
 });
@@ -77,7 +95,8 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 	// Copied only when a new item arrives. Most batches are deltas to a message that already has a position.
 	let positions = state.positions;
 	let ownPositions: Record<string, number> | null = null;
-	let { lastSequence, firstSequence, earlierOutcomes, earlierPlanOutcomes, usage, rateLimit } = state;
+	let { lastSequence, firstSequence, earlierOutcomes, earlierPlanOutcomes, earlierQuestionOutcomes, usage, rateLimit } =
+		state;
 
 	const put = (item: ChatItem) => {
 		const at = positions[item.key];
@@ -178,6 +197,21 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 				else earlierPlanOutcomes = { ...earlierPlanOutcomes, [event.requestId]: event.outcome };
 				break;
 			}
+			case "question.asked":
+				put({
+					kind: "question",
+					key: `question:${event.requestId}`,
+					requestId: event.requestId,
+					questions: event.questions,
+					outcome: null,
+				});
+				break;
+			case "question.resolved": {
+				const current = find(`question:${event.requestId}`);
+				if (current?.kind === "question") put({ ...current, outcome: event.outcome });
+				else earlierQuestionOutcomes = { ...earlierQuestionOutcomes, [event.requestId]: event.outcome };
+				break;
+			}
 			case "turn.completed":
 				for (const [index, item] of items.entries()) {
 					if ((item.kind === "assistant" || item.kind === "reasoning") && item.streaming) {
@@ -220,6 +254,7 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 		firstSequence,
 		earlierOutcomes,
 		earlierPlanOutcomes,
+		earlierQuestionOutcomes,
 		usage,
 		rateLimit,
 	};
@@ -254,6 +289,13 @@ export const prependEvents = (state: ChatState, older: ReadonlyArray<SessionEven
 		if (at !== undefined && item?.kind === "plan") items[at] = { ...item, outcome };
 		else unmatchedPlans[requestId] = outcome;
 	}
+	const unmatchedQuestions: Record<string, QuestionOutcome> = {};
+	for (const [requestId, outcome] of Object.entries(state.earlierQuestionOutcomes)) {
+		const at = positions[`question:${requestId}`];
+		const item = at === undefined ? undefined : items[at];
+		if (at !== undefined && item?.kind === "question") items[at] = { ...item, outcome };
+		else unmatchedQuestions[requestId] = outcome;
+	}
 	return {
 		...state,
 		items,
@@ -261,6 +303,7 @@ export const prependEvents = (state: ChatState, older: ReadonlyArray<SessionEven
 		firstSequence: earlier.firstSequence ?? state.firstSequence,
 		earlierOutcomes: { ...earlier.earlierOutcomes, ...unmatched },
 		earlierPlanOutcomes: { ...earlier.earlierPlanOutcomes, ...unmatchedPlans },
+		earlierQuestionOutcomes: { ...earlier.earlierQuestionOutcomes, ...unmatchedQuestions },
 		usage: state.usage ?? earlier.usage,
 		rateLimit: state.rateLimit ?? earlier.rateLimit,
 	};

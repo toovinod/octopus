@@ -56,6 +56,12 @@ export const makeReplayAdapter = (recording: Recording): AgentAdapter => ({
 					if ((yield* Deferred.await(answered)) === "cancelled") {
 						return yield* Effect.interrupt;
 					}
+				} else if (event.type === "question.asked") {
+					// Plays questions the way Claude asks them: inside the turn, which goes on once they are answered.
+					const answered = yield* Deferred.make<void>();
+					const { type: _, ...request } = event;
+					yield* session.askQuestions(request, () => Deferred.succeed(answered, undefined));
+					yield* Deferred.await(answered);
 				} else if (event.type === "plan.proposed") {
 					// Plays a plan the way Codex offers one: after the turn, waiting for the next message.
 					const { type: _, ...request } = event;
@@ -71,7 +77,8 @@ export const makeReplayAdapter = (recording: Recording): AgentAdapter => ({
 				} else if (
 					event.type !== "session.started" &&
 					event.type !== "approval.resolved" &&
-					event.type !== "plan.resolved"
+					event.type !== "plan.resolved" &&
+					event.type !== "question.resolved"
 				) {
 					yield* session.emit(event);
 				}

@@ -14,6 +14,7 @@ import {
 	LoginNotPendingError,
 	ModeNotAllowedError,
 	PlanNotFoundError,
+	QuestionNotFoundError,
 	type ImageData,
 	ImageMediaType,
 	ImagesNotSupportedError,
@@ -61,7 +62,13 @@ import {
 	restoreCheckpoint,
 	saveCheckpoint,
 } from "../checkpoints/workspaceCheckpoints.ts";
-import { AgentEvent, type ApprovalDecision, isLiveOnly, type PlanAnswer } from "@repo/contracts/AgentEvent";
+import {
+	AgentEvent,
+	type ApprovalDecision,
+	type QuestionAnswers,
+	isLiveOnly,
+	type PlanAnswer,
+} from "@repo/contracts/AgentEvent";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
 import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { CheckpointNotFoundError, WorkspaceAgentsBusyError } from "@repo/contracts/Checkpoint";
@@ -277,11 +284,13 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				case "approval.resolved":
 					runtime.approvals.delete(event.requestId);
 					break;
-				// A plan waits on the user like an approval does, so the chat shows it needs them.
+				// A plan or a question waits on the user like an approval does, so the chat shows it needs them.
 				case "plan.proposed":
+				case "question.asked":
 					runtime.approvals.add(event.requestId);
 					break;
 				case "plan.resolved":
+				case "question.resolved":
 					runtime.approvals.delete(event.requestId);
 					break;
 				case "turn.completed":
@@ -671,6 +680,19 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* updateSettings(sessionId, { model: row.model, effort: row.effort, mode: answer.mode });
 			}
 			if (Option.isSome(next)) yield* sendMessage(sessionId, next.value, [], false);
+		});
+
+		const answerQuestion = Effect.fn("SessionService.answerQuestion")(function* (
+			sessionId: string,
+			requestId: string,
+			answers: QuestionAnswers,
+		) {
+			const runtime = runtimes.get(sessionId);
+			if (runtime === undefined) {
+				yield* getRow(sessionId);
+				return yield* new QuestionNotFoundError({ requestId });
+			}
+			yield* runtime.handle.answerQuestion(requestId, answers);
 		});
 
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
@@ -1085,6 +1107,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			// It can send the next message, so like sendMessage it may not race an archive.
 			respondToPlan: (...args: Parameters<typeof respondToPlan>) =>
 				Effect.flatMap(getRow(args[0]), (row) => workspaceLock.starting(row.workspaceId, respondToPlan(...args))),
+			answerQuestion,
 			interrupt,
 			stop,
 			stopWorkspace,

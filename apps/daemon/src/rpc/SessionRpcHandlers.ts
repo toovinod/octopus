@@ -27,6 +27,8 @@ export const SessionRpcHandlers = SessionRpcs.toLayer(
 				sessions.respondToApproval(sessionId, requestId, decision).pipe(orInternalError("answer the approval")),
 			respondToPlan: ({ sessionId, requestId, answer }) =>
 				sessions.respondToPlan(sessionId, requestId, answer).pipe(orInternalError("answer the plan")),
+			answerQuestion: ({ sessionId, requestId, answers }) =>
+				sessions.answerQuestion(sessionId, requestId, answers).pipe(orInternalError("answer the questions")),
 			interruptSession: ({ sessionId }) => sessions.interrupt(sessionId).pipe(orInternalError("stop the turn")),
 			stopSession: ({ sessionId }) => sessions.stop(sessionId).pipe(orInternalError("stop the agent")),
 			loadSessionHistory: ({ sessionId, beforeSequence, limit }) =>

@@ -120,6 +120,14 @@ export class PlanNotFoundError extends Schema.TaggedError<PlanNotFoundError>()("
 	}
 }
 
+export class QuestionNotFoundError extends Schema.TaggedError<QuestionNotFoundError>()("QuestionNotFoundError", {
+	requestId: Schema.String,
+}) {
+	override get message() {
+		return "These questions were already answered, or their turn was stopped.";
+	}
+}
+
 export class AgentUnavailableError extends Schema.TaggedError<AgentUnavailableError>()("AgentUnavailableError", {
 	agent: AgentKind,
 	availability: AgentAvailability,

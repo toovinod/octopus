@@ -16,13 +16,14 @@ import {
 	AgentUnavailableError,
 	ApprovalNotFoundError,
 	PlanNotFoundError,
+	QuestionNotFoundError,
 	ResubscribeRequiredError,
 	SessionBusyError,
 	SessionNotFoundError,
 } from "./AgentSession.ts";
 import { CheckpointChange, CheckpointNotFoundError, WorkspaceAgentsBusyError } from "./Checkpoint.ts";
+import { ApprovalDecision, QuestionAnswers, PlanAnswer } from "./AgentEvent.ts";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "./Workspace.ts";
-import { ApprovalDecision, PlanAnswer } from "./AgentEvent.ts";
 import { DaemonInternalError } from "./DaemonInternalError.ts";
 import { SessionEvent } from "./SessionEvent.ts";
 import { GitTimeoutError } from "./Git.ts";
@@ -168,6 +169,10 @@ export class SessionRpcs extends RpcGroup.make(
 			WorkspaceArchivedError,
 			DaemonInternalError,
 		]),
+	}),
+	Rpc.make("answerQuestion", {
+		payload: { sessionId: Schema.String, requestId: Schema.String, answers: QuestionAnswers },
+		error: Schema.Union([SessionNotFoundError, QuestionNotFoundError, DaemonInternalError]),
 	}),
 	// Stops the running turn and keeps the agent process.
 	Rpc.make("interruptSession", {

@@ -1,5 +1,5 @@
 import { type AgentSession, makeAgentSession, TurnWatchdogSettings } from "./makeAgentSession.ts";
-import type { AgentEvent, PlanOutcome } from "@repo/contracts/AgentEvent";
+import type { AgentEvent, QuestionOutcome, PlanOutcome } from "@repo/contracts/AgentEvent";
 import type { AgentSessionHandle } from "./AgentAdapter.ts";
 import { Duration, Effect, Option, Stream } from "effect";
 import { userMessage } from "../testing/userMessage.ts";
@@ -163,5 +163,61 @@ describe("makeAgentSession plans", () => {
 			{ type: "plan.resolved", requestId: "plan-1", outcome: { type: "cancelled" } },
 			{ type: "plan.resolved", requestId: "plan-1", outcome: { type: "cancelled" } },
 		]);
+	});
+});
+
+describe("makeAgentSession questions", () => {
+	const request = {
+		requestId: "q-1",
+		itemId: "q-1",
+		questions: [
+			{ id: "db", header: "DB", question: "Which?", options: [], multiSelect: false, allowsOther: true, secret: false },
+			{ id: "key", header: "Key", question: "Key?", options: [], multiSelect: false, allowsOther: true, secret: true },
+		],
+	};
+
+	const questionEvents = (handle: AgentSessionHandle, count: number) =>
+		handle.events.pipe(
+			Stream.filter((event) => event.type === "question.asked" || event.type === "question.resolved"),
+			Stream.take(count),
+			Stream.runCollect,
+		);
+
+	test("passes every answer to the agent once, and stores none for a secret question", async () => {
+		const outcomes: Array<QuestionOutcome> = [];
+		const result = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* session.askQuestions(request, (outcome) => Effect.sync(() => void outcomes.push(outcome)));
+					yield* handle.answerQuestion("q-1", { db: ["SQLite"], key: ["s3cret"] });
+					const again = yield* handle.answerQuestion("q-1", { db: ["SQLite"] }).pipe(Effect.flip);
+					return { again: again._tag, events: yield* questionEvents(handle, 2) };
+				}),
+		);
+		expect(outcomes).toEqual([{ type: "answered", answers: { db: ["SQLite"], key: ["s3cret"] } }]);
+		expect(result.again).toBe("QuestionNotFoundError");
+		expect(result.events.at(-1)).toEqual({
+			type: "question.resolved",
+			requestId: "q-1",
+			outcome: { type: "answered", answers: { db: ["SQLite"] } },
+		});
+	});
+
+	test("a new message or a stop cancels waiting questions", async () => {
+		const outcomes: Array<QuestionOutcome> = [];
+		await runQuietAgent(
+			(session) => session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }),
+			(handle, session) =>
+				Effect.gen(function* () {
+					const ask = session.askQuestions(request, (outcome) => Effect.sync(() => void outcomes.push(outcome)));
+					yield* ask;
+					yield* handle.sendMessage(userMessage("never mind"));
+					yield* ask;
+					yield* handle.interrupt;
+					return yield* questionEvents(handle, 4);
+				}),
+		);
+		expect(outcomes).toEqual([{ type: "cancelled" }, { type: "cancelled" }]);
 	});
 });

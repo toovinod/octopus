@@ -13,10 +13,19 @@ import {
 	WrenchIcon,
 	XIcon,
 } from "lucide-react";
-import type { ApprovalDecision, ApprovalOutcome, PlanAnswer, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
-import { openDialog, respondToApproval, respondToPlan } from "../lib/store.ts";
+import type {
+	AgentQuestion,
+	ApprovalDecision,
+	ApprovalOutcome,
+	PlanAnswer,
+	PlanOutcome,
+	QuestionAnswers,
+	ToolCall,
+} from "@repo/contracts/AgentEvent";
+import { answerQuestion, openDialog, respondToApproval, respondToPlan } from "../lib/store.ts";
 import type { AgentMode } from "@repo/contracts/AgentSession";
 import { Textarea } from "@repo/ui/components/textarea";
+import { Input } from "@repo/ui/components/input";
 import { modeLabels } from "../lib/agentModes.ts";
 import type { ChatItem } from "../lib/chatReducer.ts";
 import { callDaemon } from "../lib/daemonRuntime.ts";
@@ -78,6 +87,8 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 			return <ApprovalCard item={item} sessionId={sessionId} />;
 		case "plan":
 			return <PlanCard item={item} sessionId={sessionId} />;
+		case "question":
+			return <QuestionCard item={item} sessionId={sessionId} />;
 		case "notice":
 			return (
 				<div
@@ -403,6 +414,116 @@ const PlanCard = ({
 						</Button>
 					</div>
 				</>
+			) : null}
+		</div>
+	);
+};
+
+// The picked options plus any typed answer. A single-choice question takes one or the other.
+const questionAnswer = (question: AgentQuestion, picked: ReadonlyArray<string>, typed: string) => {
+	const text = typed.trim();
+	if (question.multiSelect) return text === "" ? picked : [...picked, text];
+	return text === "" ? picked.slice(0, 1) : [text];
+};
+
+const QuestionCard = ({
+	item,
+	sessionId,
+}: {
+	readonly item: Extract<ChatItem, { kind: "question" }>;
+	readonly sessionId: string;
+}) => {
+	const [sending, setSending] = useState(false);
+	const [picked, setPicked] = useState<Record<string, ReadonlyArray<string>>>({});
+	const [typed, setTyped] = useState<Record<string, string>>({});
+	const answers: QuestionAnswers = Object.fromEntries(
+		item.questions.map((question) => [
+			question.id,
+			questionAnswer(question, picked[question.id] ?? [], typed[question.id] ?? ""),
+		]),
+	);
+	const complete = item.questions.every((question) => (answers[question.id] ?? []).length > 0);
+	const pick = (question: AgentQuestion, label: string) => {
+		const current = picked[question.id] ?? [];
+		const next = question.multiSelect
+			? current.includes(label)
+				? current.filter((item) => item !== label)
+				: [...current, label]
+			: [label];
+		setPicked({ ...picked, [question.id]: next });
+		if (!question.multiSelect) setTyped({ ...typed, [question.id]: "" });
+	};
+	const submit = async () => {
+		setSending(true);
+		await answerQuestion(sessionId, item.requestId, answers);
+		setSending(false);
+	};
+	const { outcome } = item;
+	const waiting = outcome === null;
+	return (
+		<div
+			className={cn(
+				"flex flex-col gap-3 rounded-lg border px-3 py-2.5",
+				waiting ? "border-attention/50 bg-attention/5" : "border-border bg-card",
+			)}
+		>
+			<span className={cn("text-xs", waiting ? "font-medium text-attention" : "text-muted-foreground")}>
+				{waiting ? "The agent has a question" : outcome.type === "answered" ? "Answered" : "Not answered"}
+			</span>
+			{item.questions.map((question) => (
+				<div key={question.id} className="flex flex-col gap-1.5">
+					<span className="text-xs text-muted-foreground">{question.header}</span>
+					<p className="text-sm">{question.question}</p>
+					{waiting ? (
+						<>
+							{question.options.length === 0 ? null : (
+								<div className="flex flex-wrap gap-1.5">
+									{question.options.map((option) => (
+										<Button
+											key={option.label}
+											size="sm"
+											variant={(picked[question.id] ?? []).includes(option.label) ? "default" : "secondary"}
+											aria-pressed={(picked[question.id] ?? []).includes(option.label)}
+											aria-label={option.label}
+											title={option.description}
+											disabled={sending}
+											onClick={() => pick(question, option.label)}
+										>
+											{option.label}
+										</Button>
+									))}
+								</div>
+							)}
+							{question.allowsOther ? (
+								<Input
+									type={question.secret ? "password" : "text"}
+									value={typed[question.id] ?? ""}
+									onChange={(event) => {
+										setTyped({ ...typed, [question.id]: event.target.value });
+										if (!question.multiSelect && event.target.value !== "") {
+											setPicked({ ...picked, [question.id]: [] });
+										}
+									}}
+									placeholder={question.options.length === 0 ? "Your answer" : "Or type your own answer"}
+									aria-label={question.question}
+									className="h-8 text-sm"
+									disabled={sending}
+								/>
+							) : null}
+						</>
+					) : outcome.type === "answered" ? (
+						<p className="border-l-2 pl-2 text-xs text-muted-foreground">
+							{question.secret ? "Hidden" : (outcome.answers[question.id] ?? []).join(", ")}
+						</p>
+					) : null}
+				</div>
+			))}
+			{waiting ? (
+				<div>
+					<Button size="sm" disabled={sending || !complete} onClick={() => void submit()}>
+						Answer
+					</Button>
+				</div>
 			) : null}
 		</div>
 	);

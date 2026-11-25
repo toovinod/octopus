@@ -43,7 +43,13 @@ import {
 	type AgentModel,
 	LoginNotPendingError,
 } from "@repo/contracts/AgentSession";
-import type { ApprovalDecision, ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
+import type {
+	ApprovalDecision,
+	ApprovalOutcome,
+	QuestionOutcome,
+	PlanOutcome,
+	ToolCall,
+} from "@repo/contracts/AgentEvent";
 import { BashInput, ClaudeAuthStatus, ClaudeMessage, FileInput } from "./claudeMessages.ts";
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import { stopProcessGroup } from "../../processes/stopProcessGroup.ts";
@@ -215,6 +221,35 @@ const toToolCall = (name: string, input: unknown): ToolCall => {
 // Claude calls this tool to leave plan mode. Octopus shows the plan as its own card, not as a tool call.
 const EXIT_PLAN_MODE = "ExitPlanMode";
 
+// Claude calls this tool to ask the user questions. Octopus shows them as their own card too.
+const ASK_USER_QUESTION = "AskUserQuestion";
+
+const AskUserQuestionInput = Schema.Struct({
+	questions: Schema.Array(
+		Schema.Struct({
+			question: Schema.String,
+			header: Schema.String,
+			options: Schema.Array(Schema.Struct({ label: Schema.String, description: Schema.String })),
+			multiSelect: Schema.Boolean,
+		}),
+	),
+});
+const decodeQuestions = Schema.decodeUnknownOption(AskUserQuestionInput);
+
+// Claude keys answers by the question's text and joins several picked labels with commas, as its own prompt does.
+// It always takes a typed answer in place of the options.
+const toQuestionPermissionResult = (
+	outcome: QuestionOutcome,
+	input: Record<string, unknown>,
+	questions: (typeof AskUserQuestionInput.Type)["questions"],
+): PermissionResult => {
+	if (outcome.type === "cancelled") return { behavior: "deny", message: "The user did not answer the questions." };
+	const answers = Object.fromEntries(
+		questions.map((question, index) => [question.question, (outcome.answers[`q${index}`] ?? []).join(", ")]),
+	);
+	return { behavior: "allow", updatedInput: { ...input, answers } };
+};
+
 // The modes a plan may be built in, in the order Claude Code offers them. Full access needs a trusted project.
 const buildModes = (trusted: boolean): ReadonlyArray<AgentMode> =>
 	(["auto", "acceptEdits", "ask", "fullAccess"] as const).filter(
@@ -301,7 +336,8 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	const finishedBlocks = yield* Ref.make({ messageId: "", count: 0 });
 	const tools = new Map<string, ToolCall>();
 	// ExitPlanMode calls, which show as plan cards instead of tool calls.
-	const planTools = new Set<string>();
+	// Tool calls shown as a plan or question card instead.
+	const cardTools = new Set<string>();
 	const interrupting = yield* Ref.make(false);
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
@@ -379,8 +415,8 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 							});
 						}
 					} else if ("name" in block) {
-						if (block.name === EXIT_PLAN_MODE) {
-							planTools.add(block.id);
+						if (block.name === EXIT_PLAN_MODE || block.name === ASK_USER_QUESTION) {
+							cardTools.add(block.id);
 							continue;
 						}
 						const tool = toToolCall(block.name, block.input);
@@ -400,7 +436,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 				if (typeof content === "string") return;
 				for (const block of content) {
 					if (!("tool_use_id" in block)) continue;
-					if (planTools.delete(block.tool_use_id)) continue;
+					if (cardTools.delete(block.tool_use_id)) continue;
 					const tool = tools.get(block.tool_use_id) ?? {
 						kind: "other",
 						name: "unknown",
@@ -613,10 +649,45 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 						return toPlanPermissionResult(outcome, toolInput);
 					});
 
+				const askQuestions = (
+					toolInput: Record<string, unknown>,
+					questions: (typeof AskUserQuestionInput.Type)["questions"],
+					request: Parameters<CanUseTool>[2],
+				) =>
+					Effect.gen(function* () {
+						const answered = yield* Deferred.make<QuestionOutcome>();
+						yield* session.askQuestions(
+							{
+								requestId: request.toolUseID,
+								itemId: request.toolUseID,
+								questions: questions.map((question, index) => ({
+									id: `q${index}`,
+									header: question.header,
+									question: question.question,
+									options: question.options.map(({ label, description }) => ({ label, description })),
+									multiSelect: question.multiSelect,
+									allowsOther: true,
+									secret: false,
+								})),
+							},
+							(outcome) => Deferred.succeed(answered, outcome),
+						);
+						const withdraw = () => Effect.runForkWith(context)(session.cancelQuestions(request.toolUseID));
+						if (request.signal.aborted) withdraw();
+						request.signal.addEventListener("abort", withdraw, { once: true });
+						const outcome = yield* Deferred.await(answered).pipe(
+							Effect.ensuring(Effect.sync(() => request.signal.removeEventListener("abort", withdraw))),
+						);
+						return toQuestionPermissionResult(outcome, toolInput, questions);
+					});
+
 				const canUseTool: CanUseTool = (toolName, toolInput, request) =>
 					runPromise(
 						Effect.gen(function* () {
 							if (toolName === EXIT_PLAN_MODE) return yield* proposePlan(toolInput, request);
+							// Input Octopus cannot read falls back to a plain approval, so the turn is never stuck.
+							const questions = toolName === ASK_USER_QUESTION ? decodeQuestions(toolInput) : Option.none();
+							if (Option.isSome(questions)) return yield* askQuestions(toolInput, questions.value.questions, request);
 							const suggestions = sessionAllowRules(request.suggestions ?? []);
 							const choices: ReadonlyArray<ApprovalDecision> =
 								suggestions.length > 0 && !request.suppressAlwaysAllowRule

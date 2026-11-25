@@ -290,10 +290,54 @@ describe("CodexAdapter", () => {
 		expect(id).toBe("thread-old");
 	});
 
-	test("declines unsupported server requests with method not found", async () => {
+	test("asks request_user_input questions, and stores no answer to a secret one", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("ask me"));
+				const asked = yield* takeUntil(handle, "question.asked");
+				yield* handle.answerQuestion("300", { db: ["Postgres"], token: ["s3cret"] });
+				return [...asked, ...(yield* takeUntil(handle, "turn.completed"))];
+			}),
+		);
+		expect(events.find((event) => event.type === "question.asked")).toEqual({
+			type: "question.asked",
+			requestId: "300",
+			itemId: "input-1",
+			questions: [
+				{
+					id: "db",
+					header: "Database",
+					question: "Which database?",
+					options: [{ label: "SQLite", description: "Local file" }],
+					multiSelect: false,
+					allowsOther: true,
+					secret: false,
+				},
+				{
+					id: "token",
+					header: "Token",
+					question: "Paste the token",
+					options: [],
+					multiSelect: false,
+					allowsOther: true,
+					secret: true,
+				},
+			],
+		});
+		expect(events.find((event) => event.type === "question.resolved")).toEqual({
+			type: "question.resolved",
+			requestId: "300",
+			outcome: { type: "answered", answers: { db: ["Postgres"] } },
+		});
+		expect(events.find((event) => event.type === "message.completed")).toMatchObject({
+			text: JSON.stringify({ answers: { db: { answers: ["Postgres"] }, token: { answers: ["s3cret"] } } }),
+		});
+	});
+
+	test("declines unsupported server requests with method not found", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("elicit"));
 				return yield* takeUntil(handle, "turn.completed");
 			}),
 		);

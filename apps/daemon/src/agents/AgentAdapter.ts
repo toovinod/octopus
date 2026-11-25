@@ -7,10 +7,11 @@ import {
 	AgentKind,
 	AgentMode,
 	type ApprovalNotFoundError,
+	type QuestionNotFoundError,
 	type PlanNotFoundError,
 	type SessionBusyError,
 } from "@repo/contracts/AgentSession";
-import type { AgentEvent, ApprovalDecision, PlanAnswer } from "@repo/contracts/AgentEvent";
+import type { AgentEvent, ApprovalDecision, QuestionAnswers, PlanAnswer } from "@repo/contracts/AgentEvent";
 import { type Effect, type Option, Schema, type Scope, type Stream } from "effect";
 
 export const StartSessionInput = Schema.Struct({
@@ -135,7 +136,8 @@ export interface AgentSessionHandle {
 	respondToApproval(requestId: string, decision: ApprovalDecision): Effect.Effect<void, ApprovalError>;
 	// Returns the message the caller must send next, for an agent that waits for one after its plan.
 	respondToPlan(requestId: string, answer: PlanAnswer): Effect.Effect<Option.Option<string>, PlanError>;
-	// Cancels pending approvals first, then stops the running turn.
+	answerQuestion(requestId: string, answers: QuestionAnswers): Effect.Effect<void, AgentError | QuestionNotFoundError>;
+	// Cancels pending approvals, plans and questions first, then stops the running turn.
 	readonly interrupt: Effect.Effect<void, AgentError>;
 	// Applies from the next turn.
 	updateSettings(settings: SessionSettings): Effect.Effect<void, AgentError>;

@@ -198,8 +198,34 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
-	if (text.includes("ask")) {
-		const answer = await ask(200, "item/tool/requestUserInput", {
+	if (text.includes("ask me")) {
+		const answer = await ask(300, "item/tool/requestUserInput", {
+			threadId,
+			turnId,
+			itemId: "input-1",
+			isBlocking: true,
+			autoResolutionMs: null,
+			questions: [
+				{
+					id: "db",
+					header: "Database",
+					question: "Which database?",
+					isOther: true,
+					isSecret: false,
+					options: [{ label: "SQLite", description: "Local file" }],
+				},
+				{ id: "token", header: "Token", question: "Paste the token", isOther: false, isSecret: true, options: null },
+			],
+		});
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(answer.result) },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
+	if (text.includes("elicit")) {
+		const answer = await ask(200, "mcpServer/elicitation/request", {
 			threadId,
 			turnId,
 		});

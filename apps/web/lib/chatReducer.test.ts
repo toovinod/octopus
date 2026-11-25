@@ -204,3 +204,41 @@ describe("plans", () => {
 		expect(joined.earlierPlanOutcomes).toEqual({});
 	});
 });
+
+describe("questions", () => {
+	const question = {
+		id: "q0",
+		header: "DB",
+		question: "Which database?",
+		options: [{ label: "SQLite", description: "Local file" }],
+		multiSelect: false,
+		allowsOther: true,
+		secret: false,
+	};
+
+	test("shows asked questions and their answers, also across a page boundary", () => {
+		nextSequence = 1;
+		const newer = applyEvents(emptyChat("s"), [
+			stored({
+				type: "question.resolved",
+				requestId: "r1",
+				outcome: { type: "answered", answers: { q0: ["SQLite"] } },
+			}),
+		]);
+		expect(newer.earlierQuestionOutcomes).toEqual({ r1: { type: "answered", answers: { q0: ["SQLite"] } } });
+		nextSequence = 0;
+		const joined = prependEvents(newer, [
+			stored({ type: "question.asked", requestId: "r1", itemId: "r1", questions: [question] }),
+		]);
+		expect(joined.items).toEqual([
+			{
+				kind: "question",
+				key: "question:r1",
+				requestId: "r1",
+				questions: [question],
+				outcome: { type: "answered", answers: { q0: ["SQLite"] } },
+			},
+		]);
+		expect(joined.earlierQuestionOutcomes).toEqual({});
+	});
+});

@@ -7,6 +7,7 @@ import {
 	decodeCodex,
 	ErrorNotification,
 	FileChangeApprovalParams,
+	UserInputParams,
 	ItemNotification,
 	LoginCompleted,
 	LoginResponse,
@@ -401,6 +402,35 @@ const handleServerRequest = Effect.fnUntraced(function* (
 					choices: approvalChoices,
 				},
 				respond,
+			);
+		}
+		case "item/tool/requestUserInput": {
+			const params = yield* decodeCodex(UserInputParams)(request.params);
+			return yield* session.askQuestions(
+				{
+					requestId,
+					itemId: params.itemId,
+					questions: params.questions.map((question) => ({
+						id: question.id,
+						header: question.header,
+						question: question.question,
+						options: question.options ?? [],
+						multiSelect: false,
+						// A question with no options takes typed text only.
+						allowsOther: question.isOther || (question.options ?? []).length === 0,
+						secret: question.isSecret,
+					})),
+				},
+				// Unanswered questions get empty answers, so Codex goes on without them.
+				(outcome) =>
+					client.respond(request.id, {
+						answers: Object.fromEntries(
+							Object.entries(outcome.type === "answered" ? outcome.answers : {}).map(([id, answers]) => [
+								id,
+								{ answers },
+							]),
+						),
+					}),
 			);
 		}
 		default:

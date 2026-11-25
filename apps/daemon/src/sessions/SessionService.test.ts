@@ -313,6 +313,55 @@ describe("SessionService", () => {
 		expect(implement).toMatchObject({ type: "user.message", text: "Implement the plan." });
 	});
 
+	test("waits on the user while questions are open, and the turn goes on once they are answered", async () => {
+		const recording: Recording = {
+			kind: "claude",
+			nativeSessionId: "claude-questions",
+			turns: [
+				[
+					{
+						type: "question.asked",
+						requestId: "q-1",
+						itemId: "q-1",
+						questions: [
+							{
+								id: "q0",
+								header: "DB",
+								question: "Which database?",
+								options: [{ label: "SQLite", description: "" }],
+								multiSelect: false,
+								allowsOther: true,
+								secret: false,
+							},
+						],
+					},
+					{ type: "message.completed", itemId: "msg-1", text: "Using SQLite." },
+					{ type: "turn.completed", turnId: "t1", result: { status: "completed" } },
+				],
+			],
+		};
+		const stored = await runWithRecording(recording, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "ask me", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				yield* sessions.answerQuestion(session.id, "q-1", { q0: ["SQLite"] });
+				yield* waitForStored(session.id, 6);
+				yield* waitForStatus(session.id, "idle");
+				return yield* storedEvents(session.id);
+			}),
+		);
+		expect(stored.map((row) => row.type)).toEqual([
+			"session.started",
+			"user.message",
+			"question.asked",
+			"question.resolved",
+			"message.completed",
+			"turn.completed",
+		]);
+	});
+
 	test("pages stored history backwards, and a subscription after the latest page joins it", async () => {
 		// session.started, the user message and 8 agent events: sequences 0 to 9.
 		const recording: Recording = { kind: "codex", nativeSessionId: "thread-pages", turns: [messages("first", 7)] };

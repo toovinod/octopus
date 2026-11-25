@@ -21,6 +21,31 @@ export type PlanAnswer = typeof PlanAnswer.Type;
 export const PlanOutcome = Schema.Union([...PlanAnswer.members, Schema.Struct({ type: Schema.Literal("cancelled") })]);
 export type PlanOutcome = typeof PlanOutcome.Type;
 
+// A question the agent asks before it goes on, as Claude's AskUserQuestion and Codex's request_user_input do.
+export const AgentQuestion = Schema.Struct({
+	id: Schema.String,
+	header: Schema.String,
+	question: Schema.String,
+	options: Schema.Array(Schema.Struct({ label: Schema.String, description: Schema.String })),
+	multiSelect: Schema.Boolean,
+	// The user may type their own answer instead of picking an option.
+	allowsOther: Schema.Boolean,
+	// The answer is a secret, so it is passed to the agent but never stored.
+	secret: Schema.Boolean,
+});
+export type AgentQuestion = typeof AgentQuestion.Type;
+
+// The picked option labels or typed text, by question id.
+export const QuestionAnswers = Schema.Record(Schema.String, Schema.Array(Schema.String));
+export type QuestionAnswers = typeof QuestionAnswers.Type;
+
+// Answers to secret questions are left out. Cancelled as for a plan.
+export const QuestionOutcome = Schema.Union([
+	Schema.Struct({ type: Schema.Literal("answered"), answers: QuestionAnswers }),
+	Schema.Struct({ type: Schema.Literal("cancelled") }),
+]);
+export type QuestionOutcome = typeof QuestionOutcome.Type;
+
 export const FileChange = Schema.Struct({
 	path: Schema.String,
 	kind: Schema.Literals(["add", "delete", "update"]),
@@ -150,6 +175,18 @@ export const AgentEvent = Schema.Union([
 		type: Schema.Literal("plan.resolved"),
 		requestId: Schema.String,
 		outcome: PlanOutcome,
+	}),
+	// Questions the agent waits on before it goes on.
+	Schema.Struct({
+		type: Schema.Literal("question.asked"),
+		requestId: Schema.String,
+		itemId: Schema.String,
+		questions: Schema.Array(AgentQuestion),
+	}),
+	Schema.Struct({
+		type: Schema.Literal("question.resolved"),
+		requestId: Schema.String,
+		outcome: QuestionOutcome,
 	}),
 	// The agent changed its own mode, as Claude does when the user approves a plan.
 	Schema.Struct({

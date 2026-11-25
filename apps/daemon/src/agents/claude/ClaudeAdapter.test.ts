@@ -196,6 +196,49 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
 						continue;
 					}
+					if (text.includes("ask me")) {
+						const input = {
+							questions: [
+								{
+									question: "Which database?",
+									header: "Database",
+									options: [
+										{ label: "SQLite", description: "Local file" },
+										{ label: "Postgres", description: "Server" },
+									],
+									multiSelect: false,
+								},
+								{
+									question: "Which checks?",
+									header: "Checks",
+									options: [
+										{ label: "Lint", description: "Biome" },
+										{ label: "Tests", description: "bun test" },
+									],
+									multiSelect: true,
+								},
+							],
+						};
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_q", content: [{ type: "tool_use", id: "toolu_q", name: "AskUserQuestion", input }] },
+						};
+						const permission = await options.canUseTool?.("AskUserQuestion", input, {
+							signal: new AbortController().signal,
+							toolUseID: "toolu_q",
+							requestId: "req_q",
+						});
+						if (!permission) return;
+						permissions.push(permission);
+						yield {
+							type: "user",
+							parent_tool_use_id: null,
+							message: { content: [{ type: "tool_result", tool_use_id: "toolu_q", content: "Answered." }] },
+						};
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("plan the work")) {
 						// Claude Code passes the plan file's contents in the tool's input.
 						const input = { plan: "1. Add tests\n2. Fix the bug", planFilePath: "/home/.claude/plans/fix.md" };
@@ -552,6 +595,75 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(choices).toEqual(["auto", "acceptEdits", "ask"]);
 		expect(permissions).toEqual([{ behavior: "deny", message: "Use a queue instead." }]);
+	});
+
+	test("shows AskUserQuestion as questions and answers it the way Claude Code's own prompt does", async () => {
+		const permissions: Array<PermissionResult> = [];
+		const events = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("ask me"));
+					const asked = yield* takeUntil(handle, "question.asked");
+					yield* handle.answerQuestion("toolu_q", { q0: ["Use DuckDB"], q1: ["Lint", "Tests"] });
+					return [...asked, ...(yield* takeUntil(handle, "turn.completed"))];
+				}),
+			{ permissions },
+		);
+		expect(events.filter((event) => event.type.startsWith("tool."))).toEqual([]);
+		expect(events.find((event) => event.type === "question.asked")).toEqual({
+			type: "question.asked",
+			requestId: "toolu_q",
+			itemId: "toolu_q",
+			questions: [
+				{
+					id: "q0",
+					header: "Database",
+					question: "Which database?",
+					options: [
+						{ label: "SQLite", description: "Local file" },
+						{ label: "Postgres", description: "Server" },
+					],
+					multiSelect: false,
+					allowsOther: true,
+					secret: false,
+				},
+				{
+					id: "q1",
+					header: "Checks",
+					question: "Which checks?",
+					options: [
+						{ label: "Lint", description: "Biome" },
+						{ label: "Tests", description: "bun test" },
+					],
+					multiSelect: true,
+					allowsOther: true,
+					secret: false,
+				},
+			],
+		});
+		expect(permissions).toEqual([
+			{
+				behavior: "allow",
+				updatedInput: expect.objectContaining({
+					answers: { "Which database?": "Use DuckDB", "Which checks?": "Lint, Tests" },
+				}),
+			},
+		]);
+	});
+
+	test("stopping the turn tells Claude the questions went unanswered", async () => {
+		const permissions: Array<PermissionResult> = [];
+		await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("ask me"));
+					yield* takeUntil(handle, "question.asked");
+					yield* handle.interrupt;
+					yield* takeUntil(handle, "turn.completed");
+				}),
+			{ permissions },
+		);
+		expect(permissions).toEqual([{ behavior: "deny", message: "The user did not answer the questions." }]);
 	});
 
 	test("rejects allowForSession when the SDK offers no session rule", async () => {
