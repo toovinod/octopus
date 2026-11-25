@@ -46,6 +46,12 @@ const takeUntil = (handle: AgentSessionHandle, type: AgentEvent["type"]) =>
 		Stream.runCollect,
 	);
 
+// Codex numbers its requests from 0 in every app-server, so Octopus prefixes them with the process.
+const requestIdOf = (events: ReadonlyArray<AgentEvent>) => {
+	const event = events.at(-1);
+	return event !== undefined && "requestId" in event ? event.requestId : "";
+};
+
 describe("CodexAdapter", () => {
 	test("reports the login from account/read", async () => {
 		const status = await runWithCodex(checkAuth);
@@ -164,13 +170,13 @@ describe("CodexAdapter", () => {
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("approve this"));
 				const before = yield* takeUntil(handle, "approval.requested");
-				yield* handle.respondToApproval("100", "allowOnce");
+				yield* handle.respondToApproval(requestIdOf(before), "allowOnce");
 				return [before.at(-1), yield* takeUntil(handle, "turn.completed")];
 			}),
 		);
 		expect(requested).toEqual({
 			type: "approval.requested",
-			requestId: "100",
+			requestId: expect.stringMatching(/:100$/),
 			itemId: "cmd-1",
 			kind: "command",
 			summary: "bun test",
@@ -178,7 +184,7 @@ describe("CodexAdapter", () => {
 			choices: ["allowOnce", "allowForSession", "deny"],
 		});
 		expect(rest).toEqual([
-			{ type: "approval.resolved", requestId: "100", outcome: "allowOnce" },
+			{ type: "approval.resolved", requestId: expect.stringMatching(/:100$/), outcome: "allowOnce" },
 			{
 				type: "tool.completed",
 				itemId: "cmd-1",
@@ -194,6 +200,21 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test("a resumed chat's approvals never reuse the ids of an earlier app-server", async () => {
+		const askOnce = (input: StartSessionInput) =>
+			runSession(
+				(handle) =>
+					Effect.gen(function* () {
+						yield* handle.sendMessage(userMessage("approve this"));
+						return requestIdOf(yield* takeUntil(handle, "approval.requested"));
+					}),
+				input,
+			);
+		const first = await askOnce(newSession);
+		const second = await askOnce({ ...newSession, resumeId: "thread-new" });
+		expect(second).not.toBe(first);
+	});
+
 	test("interrupt cancels a pending approval, then interrupts the turn", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
@@ -204,7 +225,7 @@ describe("CodexAdapter", () => {
 			}),
 		);
 		expect(events).toEqual([
-			{ type: "approval.resolved", requestId: "100", outcome: "cancelled" },
+			{ type: "approval.resolved", requestId: expect.stringMatching(/:100$/), outcome: "cancelled" },
 			{
 				type: "turn.completed",
 				turnId: "turn-1",
@@ -313,13 +334,13 @@ describe("CodexAdapter", () => {
 			Effect.gen(function* () {
 				yield* handle.sendMessage(userMessage("ask me"));
 				const asked = yield* takeUntil(handle, "question.asked");
-				yield* handle.answerQuestion("300", { db: ["Postgres"], token: ["s3cret"] });
+				yield* handle.answerQuestion(requestIdOf(asked), { db: ["Postgres"], token: ["s3cret"] });
 				return [...asked, ...(yield* takeUntil(handle, "turn.completed"))];
 			}),
 		);
 		expect(events.find((event) => event.type === "question.asked")).toEqual({
 			type: "question.asked",
-			requestId: "300",
+			requestId: expect.stringMatching(/:300$/),
 			itemId: "input-1",
 			questions: [
 				{
@@ -344,7 +365,7 @@ describe("CodexAdapter", () => {
 		});
 		expect(events.find((event) => event.type === "question.resolved")).toEqual({
 			type: "question.resolved",
-			requestId: "300",
+			requestId: expect.stringMatching(/:300$/),
 			outcome: { type: "answered", answers: { db: ["Postgres"] } },
 		});
 		expect(events.find((event) => event.type === "message.completed")).toMatchObject({

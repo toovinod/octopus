@@ -56,6 +56,7 @@ import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
+import { makeProcessId } from "../makeProcessId.ts";
 import { toAgentError } from "../toAgentError.ts";
 
 const CODEX_VERSION = codexVersionFile.trim();
@@ -371,10 +372,11 @@ const handleNotification = Effect.fnUntraced(function* (
 const handleServerRequest = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
+	processId: string,
 	request: Extract<CodexIncoming, { _tag: "request" }>,
 ) {
 	const respond = (outcome: ApprovalOutcome) => client.respond(request.id, { decision: codexDecisions[outcome] });
-	const requestId = `${request.id}`;
+	const requestId = `${processId}:${request.id}`;
 	switch (request.method) {
 		case "item/commandExecution/requestApproval": {
 			const params = yield* decodeCodex(CommandApprovalParams)(request.params);
@@ -561,6 +563,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
+				const processId = yield* makeProcessId;
 				const currentTurn = yield* Ref.make(idle);
 				const plans: PlanTracking = {
 					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
@@ -586,7 +589,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							Effect.andThen(
 								message._tag === "notification"
 									? handleNotification(session, currentTurn, plans, message.method, message.params)
-									: handleServerRequest(session, client, message),
+									: handleServerRequest(session, client, processId, message),
 							),
 						),
 					),
