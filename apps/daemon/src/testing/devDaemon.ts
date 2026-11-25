@@ -1,8 +1,8 @@
 import devChatTurns from "./fixtures/devChatTurns.json" with { type: "json" };
 import { makeReplayAdapter } from "../agents/replay/ReplayAdapter.ts";
+import { Console, Effect, Layer, Redacted, Schema } from "effect";
 import { testAgentServices } from "./testAgentServices.ts";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
-import { Effect, Layer, Redacted, Schema } from "effect";
 import { AgentEvent } from "@repo/contracts/AgentEvent";
 import { runDaemon } from "../server/runDaemon.ts";
 
@@ -13,7 +13,8 @@ const turns = Schema.decodeUnknownSync(Schema.Array(Schema.Array(AgentEvent)))(d
 const PrintDaemonUrl = Layer.effectDiscard(
 	Effect.gen(function* () {
 		const { port, token } = yield* DaemonConfig;
-		yield* Effect.logInfo(
+		// User-facing output, not a log: the URL holds the token, which must never reach the logger.
+		yield* Console.log(
 			`NEXT_PUBLIC_OCTOPUS_DAEMON_URL="ws://127.0.0.1:${port}/rpc?token=${Redacted.value(token)}" bun run --cwd apps/web dev`,
 		);
 	}),
