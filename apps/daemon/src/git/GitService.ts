@@ -35,7 +35,6 @@ import {
 	parseNameStatus,
 	parseNumstat,
 	parsePatch,
-	parseTypeChanges,
 	parseStatus,
 	untrackedHunks,
 } from "./parseGitOutput.ts";
@@ -261,8 +260,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 							),
 						]);
 			const sections = parsePatch(patch);
-			const typeChanges = parseTypeChanges(nameStatus);
-			const expected = fitting.length + fitting.filter(({ changed }) => typeChanges.has(changed.path)).length;
+			const expected = fitting.length + fitting.filter(({ changed }) => changed.typeChanged).length;
 			if (sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
@@ -273,7 +271,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			if (sections.length === expected) {
 				let next = 0;
 				for (const { changed } of fitting) {
-					const parts = sections.slice(next, next + (typeChanges.has(changed.path) ? 2 : 1));
+					const parts = sections.slice(next, next + (changed.typeChanged ? 2 : 1));
 					next += parts.length;
 					hunksByPath.set(changed.path, { hunks: parts.flatMap((part) => part.hunks) });
 				}
@@ -282,7 +280,9 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const toDiffFile = ({ changed, count }: { changed: ChangedPath; count: LineCounts }) => {
 				const section = hunksByPath.get(changed.path);
 				return new DiffFile({
-					...changed,
+					path: changed.path,
+					oldPath: changed.oldPath,
+					status: changed.status,
 					additions: count.additions,
 					deletions: count.deletions,
 					content: count.binary

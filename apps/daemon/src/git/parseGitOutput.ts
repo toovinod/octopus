@@ -7,6 +7,8 @@ export interface ChangedPath {
 	readonly path: string;
 	readonly oldPath: string | null;
 	readonly status: DiffFileStatus;
+	// From a file to a symlink, say. The patch shows it as two sections: the old file deleted, then the new one added.
+	readonly typeChanged: boolean;
 }
 
 const statusFromLetter = (letter: string): DiffFileStatus => {
@@ -30,25 +32,22 @@ export const parseNameStatus = (output: string): ReadonlyArray<ChangedPath> => {
 	for (let index = 0; index < tokens.length; ) {
 		const letter = tokens[index]?.charAt(0) ?? "";
 		if (letter === "R" || letter === "C") {
-			changed.push({ oldPath: tokens[index + 1] ?? "", path: tokens[index + 2] ?? "", status: "renamed" });
+			changed.push({
+				oldPath: tokens[index + 1] ?? "",
+				path: tokens[index + 2] ?? "",
+				status: "renamed",
+				typeChanged: false,
+			});
 			index += 3;
 		} else {
-			changed.push({ oldPath: null, path: tokens[index + 1] ?? "", status: statusFromLetter(letter) });
+			changed.push({
+				oldPath: null,
+				path: tokens[index + 1] ?? "",
+				status: statusFromLetter(letter),
+				typeChanged: letter === "T",
+			});
 			index += 2;
 		}
-	}
-	return changed;
-};
-
-// The paths of `git diff --name-status -z` whose type changed, as from a file to a symlink. The patch shows
-// each of them as two sections: the old file deleted, then the new one added.
-export const parseTypeChanges = (output: string): ReadonlySet<string> => {
-	const tokens = output.split("\0").filter((token) => token !== "");
-	const changed = new Set<string>();
-	for (let index = 0; index < tokens.length; ) {
-		const letter = tokens[index]?.charAt(0) ?? "";
-		if (letter === "T") changed.add(tokens[index + 1] ?? "");
-		index += letter === "R" || letter === "C" ? 3 : 2;
 	}
 	return changed;
 };
