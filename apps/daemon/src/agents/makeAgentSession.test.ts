@@ -155,6 +155,28 @@ test("a message sent after the session ended fails instead of being lost", async
 	expect(error._tag).toBe("AgentProcessError");
 });
 
+test("runs a queued message's beforeTurn only once the turn ahead of it has ended", async () => {
+	const steps: Array<string> = [];
+	await Effect.gen(function* () {
+		const session = yield* makeAgentSession(capabilities);
+		const handle: AgentSessionHandle = yield* session.start({
+			startTurn: (message) => Effect.sync(() => void steps.push(`start ${message.text}`)),
+			steerTurn: () => Effect.succeed(true),
+			interruptTurn: Effect.void,
+			updateSettings: () => Effect.void,
+			listCommands: Effect.succeed([]),
+		});
+		const beforeTurn = (text: string) => Effect.sync(() => void steps.push(`before ${text}`));
+		yield* handle.sendMessage(userMessage("one"), { beforeTurn: beforeTurn("one") });
+		yield* handle.sendMessage(userMessage("two"), { beforeTurn: beforeTurn("two") });
+		yield* Effect.sleep("50 millis");
+		steps.push("end one");
+		yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+		yield* Effect.sleep("50 millis");
+	}).pipe(Effect.scoped, Effect.runPromise);
+	expect(steps).toEqual(["before one", "start one", "end one", "before two", "start two"]);
+});
+
 describe("makeAgentSession plans", () => {
 	const plan = { requestId: "plan-1", itemId: "plan-1", text: "1. Add tests", choices: ["auto", "ask"] } as const;
 

@@ -550,7 +550,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			);
 		}, Effect.provide(services));
 
-		// Saved before the agent sees the message, so "Revert to here" can undo everything from it on.
+		// Saved just before the agent sees the message, so "Revert to here" can undo everything from it on.
 		// A failure only costs that checkpoint, so the message still goes.
 		const saveTurnCheckpoint = Effect.fnUntraced(
 			function* (sessionId: string, messageId: string) {
@@ -571,14 +571,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					text,
 					images: yield* storeImages(sessionId, images),
 				};
-				yield* saveTurnCheckpoint(sessionId, message.id);
 				// The process may have ended while the message was prepared. Its runtime is gone then, and the
 				// message goes to a new one.
 				const runtime = current.ending ? yield* ensureRuntime(sessionId) : current;
 				// Counted before sending, so the turn's own completion can never arrive first.
 				runtime.outstanding++;
 				yield* refreshStatus(runtime);
-				const sent = yield* runtime.handle.sendMessage(message, { steer }).pipe(
+				// Taken when the message's turn starts, so a queued message's checkpoint holds the turns before it.
+				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
+				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>

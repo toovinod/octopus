@@ -103,7 +103,9 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	const events = yield* Queue.bounded<AgentEvent, AgentError | Cause.Done>(EVENT_BUFFER);
 	yield* Effect.addFinalizer(() => Queue.end(events));
 	const nativeId = yield* Deferred.make<string, AgentError>();
-	const inbox = yield* Queue.bounded<UserMessage>(MAX_QUEUED_MESSAGES);
+	const inbox = yield* Queue.bounded<{ readonly message: UserMessage; readonly beforeTurn: Effect.Effect<void> }>(
+		MAX_QUEUED_MESSAGES,
+	);
 	// Checking room, storing the message and queueing it happen as one step, so history order matches.
 	const sendLock = yield* Semaphore.make(1);
 	const currentTurn = yield* Ref.make(Option.none<Deferred.Deferred<void>>());
@@ -245,7 +247,8 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	const start = (driver: TurnDriver) =>
 		Effect.gen(function* () {
 			yield* Effect.gen(function* () {
-				const message = yield* Queue.take(inbox);
+				const { message, beforeTurn } = yield* Queue.take(inbox);
+				yield* beforeTurn;
 				const done = yield* Deferred.make<void>();
 				yield* Ref.set(currentTurn, Option.some(done));
 				yield* Ref.set(lastEventAt, yield* Clock.currentTimeMillis);
@@ -290,7 +293,9 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						);
 						// Recorded only once the agent took it, so a rejected steer leaves no message in history
 						// that the agent never saw, and the caller can safely drop its images.
-						if (steer && (yield* driver.steerTurn(message))) {
+						const beforeTurn = options?.beforeTurn ?? Effect.void;
+						// A steer that falls back to queueing runs it again before its own turn.
+						if (steer && (yield* beforeTurn.pipe(Effect.andThen(driver.steerTurn(message))))) {
 							yield* recordMessage;
 							return "steered" as const;
 						}
@@ -298,7 +303,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 							return yield* new SessionBusyError({ queued: MAX_QUEUED_MESSAGES });
 						}
 						yield* recordMessage;
-						Queue.offerUnsafe(inbox, message);
+						Queue.offerUnsafe(inbox, { message, beforeTurn });
 						return "queued" as const;
 					}).pipe(Semaphore.withPermit(sendLock)),
 				respondToApproval: (requestId, decision) =>
