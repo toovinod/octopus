@@ -23,6 +23,9 @@ use tokio::sync::watch;
 // Must match READY_LINE_PREFIX in apps/daemon/src/server/DaemonServer.ts.
 const READY_LINE_PREFIX: &str = "OCTOPUS_DAEMON_READY ";
 
+// Must match FAILED_LINE_PREFIX in apps/daemon/src/server/runDaemon.ts.
+const FAILED_LINE_PREFIX: &str = "OCTOPUS_DAEMON_FAILED ";
+
 // Longer than octopusd's own 8 second shutdown deadline, so a daemon that is still stopping its
 // children is not cut off. Only a daemon that hangs past its own deadline gets killed.
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
@@ -37,11 +40,12 @@ struct DaemonConnection {
 }
 
 // A stopped daemon has no connection, so nothing hands out the URL and token of a process that is gone.
+// It keeps the reason octopusd gave for failing, when it gave one, to show the user.
 #[derive(Clone, Debug, PartialEq)]
 enum DaemonStatus {
   Starting,
   Ready(DaemonConnection),
-  Stopped,
+  Stopped(Option<String>),
 }
 
 impl DaemonStatus {
@@ -50,13 +54,13 @@ impl DaemonStatus {
     match self {
       DaemonStatus::Starting => None,
       DaemonStatus::Ready(connection) => Some(Ok(connection.clone())),
-      DaemonStatus::Stopped => Some(Err("The daemon stopped".to_string())),
+      DaemonStatus::Stopped(reason) => Some(Err(reason.clone().unwrap_or_else(|| "The daemon stopped".to_string()))),
     }
   }
 
   // Only a stopped daemon is started again, so two restart calls never run two daemons on one data dir.
   fn begin_restart(&mut self) -> bool {
-    if *self != DaemonStatus::Stopped {
+    if !matches!(self, DaemonStatus::Stopped(_)) {
       return false;
     }
     *self = DaemonStatus::Starting;
@@ -64,17 +68,24 @@ impl DaemonStatus {
   }
 }
 
-// The status an event from octopusd moves to, or None when the event does not change it.
-fn status_after(event: &CommandEvent, token: &str) -> Option<DaemonStatus> {
+// The status an event from octopusd moves to, or None when the event does not change it. Only a starting
+// daemon becomes ready, so a later line that happens to look like the ready line cannot change the URL.
+fn status_after(event: &CommandEvent, token: &str, current: &DaemonStatus, failure: Option<&str>) -> Option<DaemonStatus> {
   match event {
-    CommandEvent::Stdout(line) => String::from_utf8_lossy(line)
+    CommandEvent::Stdout(line) if *current == DaemonStatus::Starting => String::from_utf8_lossy(line)
       .trim()
       .strip_prefix(READY_LINE_PREFIX)
       .map(|url| DaemonStatus::Ready(DaemonConnection { url: url.to_string(), token: token.to_string() })),
     // The plugin sends this only after it reaped the process, so the old octopusd and its data dir lock are gone.
-    CommandEvent::Terminated(_) => Some(DaemonStatus::Stopped),
+    CommandEvent::Terminated(_) => Some(DaemonStatus::Stopped(failure.map(str::to_string))),
     _ => None,
   }
+}
+
+// The user-facing reason octopusd prints before it exits with an error.
+fn failure_reason(event: &CommandEvent) -> Option<String> {
+  let CommandEvent::Stdout(line) = event else { return None };
+  String::from_utf8_lossy(line).trim().strip_prefix(FAILED_LINE_PREFIX).map(str::to_string)
 }
 
 struct Daemon {
@@ -180,8 +191,11 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
 
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
+    let mut failure = None;
     while let Some(event) = events.recv().await {
-      let status = status_after(&event, &token);
+      let daemon = app.state::<Daemon>();
+      failure = failure_reason(&event).or(failure);
+      let status = status_after(&event, &token, &daemon.status.borrow(), failure.as_deref());
       match &event {
         CommandEvent::Stdout(line) if status.is_none() => log::info!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
         CommandEvent::Stderr(line) => log::warn!("octopusd: {}", String::from_utf8_lossy(line).trim_end()),
@@ -189,12 +203,11 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
         _ => {}
       }
       let Some(status) = status else { continue };
-      let stopped = status == DaemonStatus::Stopped;
-      let daemon = app.state::<Daemon>();
+      let stopped = matches!(status, DaemonStatus::Stopped(_));
       daemon.status.send_replace(status);
       // Quitting stops octopusd on purpose, so only an unexpected exit tells the webview.
       if stopped && !daemon.quitting.load(Ordering::SeqCst) {
-        let _ = app.emit(DAEMON_STOPPED_EVENT, ());
+        let _ = app.emit(DAEMON_STOPPED_EVENT, failure.clone());
       }
     }
   });
@@ -215,7 +228,7 @@ fn start_daemon(app: tauri::AppHandle) {
       }
       Err(error) => {
         log::error!("Could not start octopusd: {error}");
-        daemon.status.send_replace(DaemonStatus::Stopped);
+        daemon.status.send_replace(DaemonStatus::Stopped(None));
       }
     }
   });
@@ -355,7 +368,7 @@ fn quit(app: &tauri::AppHandle) {
   let mut status = daemon.status.subscribe();
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
-    let stopped = status.wait_for(|status| *status == DaemonStatus::Stopped);
+    let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
     if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
       log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
       // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
@@ -375,19 +388,39 @@ mod tests {
     DaemonConnection { url: "http://127.0.0.1:4799".to_string(), token: "secret".to_string() }
   }
 
+  fn exited() -> CommandEvent {
+    CommandEvent::Terminated(TerminatedPayload { code: Some(1), signal: None })
+  }
+
   #[test]
   fn the_ready_line_makes_the_daemon_ready() {
     let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_READY http://127.0.0.1:4799\n".to_vec());
-    assert_eq!(status_after(&line, "secret"), Some(DaemonStatus::Ready(connection())));
-    assert_eq!(status_after(&CommandEvent::Stdout(b"listening\n".to_vec()), "secret"), None);
+    let starting = DaemonStatus::Starting;
+    assert_eq!(status_after(&line, "secret", &starting, None), Some(DaemonStatus::Ready(connection())));
+    assert_eq!(status_after(&CommandEvent::Stdout(b"listening\n".to_vec()), "secret", &starting, None), None);
+  }
+
+  #[test]
+  fn a_ready_line_after_start_up_changes_nothing() {
+    let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_READY http://evil.example\n".to_vec());
+    assert_eq!(status_after(&line, "secret", &DaemonStatus::Ready(connection()), None), None);
   }
 
   #[test]
   fn an_exited_daemon_stops_handing_out_its_connection() {
-    let exited = CommandEvent::Terminated(TerminatedPayload { code: Some(1), signal: None });
-    let status = status_after(&exited, "secret");
-    assert_eq!(status, Some(DaemonStatus::Stopped));
+    let status = status_after(&exited(), "secret", &DaemonStatus::Ready(connection()), None);
+    assert_eq!(status, Some(DaemonStatus::Stopped(None)));
     assert!(matches!(status.and_then(|status| status.connection()), Some(Err(_))));
+  }
+
+  #[test]
+  fn a_daemon_that_failed_says_why() {
+    let line = CommandEvent::Stdout(b"OCTOPUS_DAEMON_FAILED Another Octopus is already running.\n".to_vec());
+    let reason = failure_reason(&line);
+    assert_eq!(reason.as_deref(), Some("Another Octopus is already running."));
+    assert_eq!(failure_reason(&CommandEvent::Stdout(b"listening\n".to_vec())), None);
+    let status = status_after(&exited(), "secret", &DaemonStatus::Starting, reason.as_deref());
+    assert_eq!(status.and_then(|status| status.connection()), Some(Err("Another Octopus is already running.".to_string())));
   }
 
   #[test]
@@ -398,7 +431,7 @@ mod tests {
 
   #[test]
   fn only_a_stopped_daemon_restarts() {
-    let mut stopped = DaemonStatus::Stopped;
+    let mut stopped = DaemonStatus::Stopped(None);
     assert!(stopped.begin_restart());
     assert_eq!(stopped, DaemonStatus::Starting);
     assert!(stopped.connection().is_none());

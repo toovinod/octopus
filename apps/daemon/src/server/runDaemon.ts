@@ -1,15 +1,18 @@
+import { Cause, Console, Effect, Exit, Layer, Option, type Stdio } from "effect";
 import { gitTimeoutSettingsFromConfig } from "../git/GitTimeoutSettings.ts";
 import { BunRuntime, BunServices, BunStdio } from "@effect/platform-bun";
 import type { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import type { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import type { CredentialStore } from "../agents/CredentialStore.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
-import { Cause, Effect, Exit, Layer, type Stdio } from "effect";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { Shutdown } from "../shutdown/Shutdown.ts";
 import { DaemonServer } from "./DaemonServer.ts";
 
 type Agents = ClaudeAdapter | CodexAdapter | CredentialStore;
+
+// The desktop shell reads this line on stdout to tell the user why the daemon stopped.
+export const FAILED_LINE_PREFIX = "OCTOPUS_DAEMON_FAILED ";
 
 // Starts the daemon with the given agents: the real ones in main.ts, replayed ones in devDaemon.ts.
 // The config comes from stdin and the environment, except in devDaemon.ts, which makes its own token.
@@ -33,7 +36,16 @@ export const runDaemon = (
 	const main = Effect.gen(function* () {
 		const shutdown = yield* Shutdown;
 		yield* shutdown.requested;
-	}).pipe(Effect.provide(DaemonLayer));
+	}).pipe(
+		Effect.provide(DaemonLayer),
+		// Tagged errors carry a message for the user. The desktop shell shows it when the daemon stops.
+		Effect.tapCause((cause) =>
+			Option.match(Cause.findErrorOption(cause), {
+				onNone: () => Effect.void,
+				onSome: (error) => Console.log(`${FAILED_LINE_PREFIX}${error.message.replaceAll("\n", " ")}`),
+			}),
+		),
+	);
 
 	BunRuntime.runMain(main, {
 		// A signal interrupts main, which is still a clean shutdown when every finalizer succeeded.
