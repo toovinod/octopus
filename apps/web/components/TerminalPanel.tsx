@@ -9,6 +9,7 @@ import { PlusIcon, XIcon } from "lucide-react";
 import { Button } from "@repo/ui/components/button";
 import { toast } from "../lib/store.ts";
 import { cn } from "@repo/ui/lib/utils";
+import { useTheme } from "next-themes";
 
 // Matches the daemon's scrollback, so a reattached terminal shows everything it kept.
 const SCROLLBACK_LINES = 5000;
@@ -111,10 +112,20 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 
 const cssColor = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
+// Read from the page's CSS variables, so the terminal matches the light or dark theme in use.
+const terminalTheme = () => ({
+	background: cssColor("--background"),
+	foreground: cssColor("--foreground"),
+	cursor: cssColor("--foreground"),
+	selectionBackground: "rgba(90, 169, 230, 0.3)",
+});
+
 // xterm touches the DOM when it loads, so it is imported in the effect, never during prerendering.
 const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; readonly visible: boolean }) => {
 	const hostRef = useRef<HTMLDivElement>(null);
 	const fitRef = useRef<(() => void) | null>(null);
+	const themeRef = useRef<(() => void) | null>(null);
+	const { resolvedTheme } = useTheme();
 
 	useEffect(() => {
 		const host = hostRef.current;
@@ -128,13 +139,11 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 				fontFamily: cssColor("--font-geist-mono") || "ui-monospace, monospace",
 				fontSize: 12,
 				cursorBlink: true,
-				theme: {
-					background: cssColor("--background"),
-					foreground: cssColor("--foreground"),
-					cursor: cssColor("--foreground"),
-					selectionBackground: "rgba(90, 169, 230, 0.3)",
-				},
+				theme: terminalTheme(),
 			});
+			themeRef.current = () => {
+				terminal.options.theme = terminalTheme();
+			};
 			const fit = new FitAddon();
 			terminal.loadAddon(fit);
 			terminal.open(host);
@@ -172,6 +181,13 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 	useEffect(() => {
 		if (visible) fitRef.current?.();
 	}, [visible]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a theme change is the signal to read the colours again.
+	useEffect(() => {
+		// A frame later, once the new theme's class is on the page and its variables apply.
+		const frame = requestAnimationFrame(() => themeRef.current?.());
+		return () => cancelAnimationFrame(frame);
+	}, [resolvedTheme]);
 
 	return <div ref={hostRef} className={cn("min-h-0 flex-1 px-2 py-1", !visible && "hidden")} />;
 };
