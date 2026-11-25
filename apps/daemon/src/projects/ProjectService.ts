@@ -22,6 +22,14 @@ import { basename, join } from "node:path";
 
 const normalizeScript = (script: string | null) => script?.trim() || null;
 
+// For the first commit of a new project on a machine where git has no identity yet.
+const FALLBACK_IDENTITY = {
+	GIT_AUTHOR_NAME: "Octopus",
+	GIT_AUTHOR_EMAIL: "octopus@localhost",
+	GIT_COMMITTER_NAME: "Octopus",
+	GIT_COMMITTER_EMAIL: "octopus@localhost",
+};
+
 export class ProjectService extends Context.Service<ProjectService>()("octopus/daemon/projects/ProjectService", {
 	make: Effect.gen(function* () {
 		const database = yield* LocalDatabase;
@@ -145,7 +153,21 @@ export class ProjectService extends Context.Service<ProjectService>()("octopus/d
 				);
 			yield* Effect.gen(function* () {
 				yield* runGit(path, ["init", "--initial-branch=main"]);
-				yield* runGit(path, ["commit", "--allow-empty", "--message", "Initial commit"]);
+				// `git var` fails when git cannot find or guess who the user is.
+				const identity = yield* runGit(path, ["var", "GIT_COMMITTER_IDENT"]).pipe(
+					Effect.as({}),
+					Effect.catchTag("GitCommandError", () =>
+						Effect.logWarning("git has no identity, so Octopus signs the empty first commit").pipe(
+							Effect.as(FALLBACK_IDENTITY),
+						),
+					),
+				);
+				// Signing could wait for a gpg passphrase nobody sees, and an empty commit needs no signature.
+				yield* runGit(
+					path,
+					["-c", "commit.gpgsign=false", "commit", "--allow-empty", "--message", "Initial commit"],
+					identity,
+				);
 			}).pipe(Effect.provide(services), Effect.catchTags({ GitCommandError: giveUp, GitSpawnError: giveUp }));
 			return yield* add(path);
 		});

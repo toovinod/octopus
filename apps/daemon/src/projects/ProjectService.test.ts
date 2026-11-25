@@ -144,6 +144,31 @@ describe("ProjectService", () => {
 		expect(result.missingParent._tag).toBe("ProjectFolderNotFoundError");
 	});
 
+	test("creates the first commit with no git identity and with gpg signing that would fail", async () => {
+		// Git as on a fresh machine: no identity it may guess, and signing turned on with a gpg that fails.
+		const isolated = {
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
+			GIT_CONFIG_COUNT: "3",
+			GIT_CONFIG_KEY_0: "user.useConfigOnly",
+			GIT_CONFIG_VALUE_0: "true",
+			GIT_CONFIG_KEY_1: "commit.gpgsign",
+			GIT_CONFIG_VALUE_1: "true",
+			GIT_CONFIG_KEY_2: "gpg.program",
+			GIT_CONFIG_VALUE_2: "false",
+		};
+		Object.assign(process.env, isolated);
+		const log = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const created = yield* Effect.flatMap(ProjectService, (projects) => projects.create(tempDir, "fresh"));
+				return yield* runGit(created.path, ["log", "--format=%s by %an"]);
+			}),
+		).finally(() => {
+			for (const key of Object.keys(isolated)) delete process.env[key];
+		});
+		expect(log).toBe("Initial commit by Octopus");
+	});
+
 	test("rejects folder names that would leave the parent folder", () => {
 		const isValid = Schema.is(ProjectFolderName);
 		expect(["app", "my app", "a.b"].map(isValid)).toEqual([true, true, true]);
