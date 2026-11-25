@@ -77,6 +77,9 @@ export interface TurnDriver {
 
 export interface AgentSession {
 	emit(event: AgentEvent): Effect.Effect<void>;
+	// Agent output Octopus does not show, like a subagent's messages or a command's streamed output, still
+	// proves the turn is alive, so it keeps the watchdog from stopping it.
+	readonly touch: Effect.Effect<void>;
 	requestApproval(request: ApprovalRequest, respond: RespondToAgent): Effect.Effect<void>;
 	proposePlan(request: PlanRequest, respond: RespondToPlan): Effect.Effect<void>;
 	// For an agent that withdraws its own plan. Does nothing once the plan is answered.
@@ -129,9 +132,11 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	// An approval, plan or question waiting on the user, so a quiet turn is not a stalled one.
 	const waitingOnUser = () => approvals.size > 0 || plans.size > 0 || questions.size > 0;
 
+	const touch = Effect.flatMap(Clock.currentTimeMillis, (now) => Ref.set(lastEventAt, now));
+
 	const emit = (agentEvent: AgentEvent) =>
 		Effect.gen(function* () {
-			yield* Ref.set(lastEventAt, yield* Clock.currentTimeMillis);
+			yield* touch;
 			let event = agentEvent;
 			if (event.type === "turn.completed") {
 				const stall = yield* Ref.getAndSet(stalled, Option.none());
@@ -318,6 +323,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 
 	return {
 		emit,
+		touch,
 		requestApproval: (request, respond) =>
 			Effect.gen(function* () {
 				approvals.set(request.requestId, { choices: request.choices, respond });

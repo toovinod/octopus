@@ -343,6 +343,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
 	const handle = Effect.fnUntraced(function* (message: ClaudeMessage) {
+		yield* session.touch;
 		// Subagent frames belong to the Task tool call that started them.
 		if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return;
 		switch (message.type) {

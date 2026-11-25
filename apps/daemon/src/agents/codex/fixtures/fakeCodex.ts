@@ -175,6 +175,16 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("long command")) {
+		// Octopus shows only the finished output, but each streamed chunk proves the command is alive.
+		notify("item/started", { item: command, threadId, turnId });
+		for (let index = 0; index < 4; index++) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			notify("item/commandExecution/outputDelta", { threadId, turnId, itemId: "cmd-1", delta: "." });
+		}
+		notify("item/completed", { item: { ...command, status: "completed", aggregatedOutput: "...." }, threadId, turnId });
+		return completeTurn("completed");
+	}
 	if (text.includes("approve")) {
 		notify("item/started", { item: command, threadId, turnId });
 		const answer = await ask(100, "item/commandExecution/requestApproval", {

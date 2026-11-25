@@ -582,9 +582,13 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 
 				yield* client.incoming.pipe(
 					Stream.runForEach((message) =>
-						message._tag === "notification"
-							? handleNotification(session, currentTurn, plans, message.method, message.params)
-							: handleServerRequest(session, client, message),
+						session.touch.pipe(
+							Effect.andThen(
+								message._tag === "notification"
+									? handleNotification(session, currentTurn, plans, message.method, message.params)
+									: handleServerRequest(session, client, message),
+							),
+						),
 					),
 					Effect.andThen(session.end),
 					Effect.catch(session.fail),

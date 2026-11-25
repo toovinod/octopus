@@ -103,6 +103,23 @@ describe("makeAgentSession turn watchdog", () => {
 		);
 		expect(results).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } }]);
 	});
+
+	test("agent activity it does not show still keeps the turn alive", async () => {
+		const results = await runQuietAgent(
+			() => Effect.die("the watchdog should not interrupt"),
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					for (let index = 0; index < 4; index++) {
+						yield* Effect.sleep("100 millis");
+						yield* session.touch;
+					}
+					yield* session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
+					return yield* turnResults(handle);
+				}),
+		);
+		expect(results).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } }]);
+	});
 });
 
 describe("makeAgentSession plans", () => {

@@ -2,6 +2,7 @@ import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
 import { Duration, Effect, Fiber, Option, Stream } from "effect";
+import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
@@ -139,6 +140,23 @@ describe("CodexAdapter", () => {
 			{ type: "reasoning.completed", itemId: "rs-1", text: "Read the tests\n\nThen run them" },
 			{ type: "message.completed", itemId: "msg-1", text: "Done" },
 		]);
+	});
+
+	test("a command that keeps streaming output outlives the idle timeout", async () => {
+		const events = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("long command"));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(TurnWatchdogSettings, {
+					idleTimeout: Duration.millis(250),
+					interruptGrace: Duration.millis(100),
+				}),
+			),
+		);
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
 	});
 
 	test("round-trips a command approval", async () => {

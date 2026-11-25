@@ -5,10 +5,11 @@ import type {
 	PermissionUpdate,
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { ConfigProvider, Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
-import { ConfigProvider, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
@@ -193,6 +194,19 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						controller.abort();
 						const result = await permission;
 						if (result) permissions.push(result);
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("subagent")) {
+						// A Task subagent works on its own: only its frames arrive, each marked with the Task's tool use.
+						for (let index = 0; index < 4; index++) {
+							await new Promise((resolve) => setTimeout(resolve, 100));
+							yield {
+								type: "assistant",
+								parent_tool_use_id: "toolu_task",
+								message: { id: `msg_sub${index}`, content: [{ type: "text", text: "Searching" }] },
+							};
+						}
 						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
 						continue;
 					}
@@ -466,6 +480,24 @@ describe("ClaudeAdapter", () => {
 				result: { status: "completed" },
 			},
 		]);
+	});
+
+	test("a subagent that works longer than the idle timeout keeps its turn alive", async () => {
+		const events = await runWithClaude(
+			Effect.gen(function* () {
+				const claude = yield* ClaudeAdapter;
+				const handle = yield* claude.startSession(newSession);
+				yield* handle.sendMessage(userMessage("subagent"));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(TurnWatchdogSettings, {
+					idleTimeout: Duration.millis(250),
+					interruptGrace: Duration.millis(100),
+				}),
+			),
+		);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
 	test("streams summarized thinking and stores it under the block's own item id", async () => {
