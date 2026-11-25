@@ -13,15 +13,20 @@ export const StatusDot = ({
 	readonly attention?: Attention | undefined;
 	readonly className?: string;
 }) => {
-	const tone =
+	const shown =
 		status === "awaitingApproval" || attention === "approval"
-			? "bg-attention"
+			? { tone: "bg-attention", label: "Needs approval" }
 			: status === "failed" || attention === "failed"
-				? "bg-destructive"
+				? { tone: "bg-destructive", label: "Failed" }
 				: status === "running"
-					? "bg-running animate-pulse"
+					? { tone: "bg-running animate-pulse", label: "Working" }
 					: attention === "done"
-						? "bg-success"
+						? { tone: "bg-success", label: "Finished" }
 						: null;
-	return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone ?? "bg-transparent", className)} />;
+	// Named for screen readers, since the colour alone says nothing to them.
+	return shown === null ? (
+		<span aria-hidden className={cn("size-1.5 shrink-0 rounded-full bg-transparent", className)} />
+	) : (
+		<span role="img" aria-label={shown.label} className={cn("size-1.5 shrink-0 rounded-full", shown.tone, className)} />
+	);
 };

@@ -23,7 +23,7 @@ import {
 } from "../lib/store.ts";
 import { MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
 import { type Draft, draftOf, keepDraft } from "../lib/drafts.ts";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
 import { formatClockTime, formatTokens } from "../lib/format.ts";
@@ -36,7 +36,7 @@ import {
 	DialogTitle,
 } from "@repo/ui/components/dialog";
 import { modeLabels, nextMode, orderedModes } from "../lib/agentModes.ts";
-import { type Suggestion, SuggestionList, useSuggestions } from "./ComposerSuggestions.tsx";
+import { type Suggestion, SuggestionList, suggestionOptionId, useSuggestions } from "./ComposerSuggestions.tsx";
 import { insertSuggestion, tokenAt } from "../lib/composerSuggestions.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
@@ -71,6 +71,7 @@ export const Composer = memo(
 		const token = typed !== null && typed.start !== dismissedAt ? typed : null;
 		const suggestions = useSuggestions(session, token);
 		const shown = Math.min(highlight, suggestions.length - 1);
+		const suggestionsId = useId();
 
 		// biome-ignore lint/correctness/useExhaustiveDependencies: a new word or query starts at the top.
 		useEffect(() => {
@@ -144,7 +145,13 @@ export const Composer = memo(
 					}}
 				>
 					{suggestions.length === 0 ? null : (
-						<SuggestionList suggestions={suggestions} highlight={shown} onPick={pick} onHighlight={setHighlight} />
+						<SuggestionList
+							id={suggestionsId}
+							suggestions={suggestions}
+							highlight={shown}
+							onPick={pick}
+							onHighlight={setHighlight}
+						/>
 					)}
 					{draft.images.length === 0 ? null : (
 						<div className="flex flex-wrap gap-2 px-3 pt-3">
@@ -167,6 +174,12 @@ export const Composer = memo(
 					<Textarea
 						ref={textRef}
 						rows={1}
+						role="combobox"
+						aria-label="Message"
+						aria-autocomplete="list"
+						aria-expanded={suggestions.length > 0}
+						aria-controls={suggestions.length > 0 ? suggestionsId : undefined}
+						aria-activedescendant={suggestions.length > 0 ? suggestionOptionId(suggestionsId, shown) : undefined}
 						value={draft.text}
 						placeholder={
 							busy ? (steer ? "Steer the agent" : "Queue a message for when the turn ends") : "Ask for a change"
