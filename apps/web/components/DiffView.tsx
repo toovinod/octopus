@@ -21,6 +21,7 @@ import { newChat, sendMessage, toast, updateSettings, useAppState, workingChats 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { commitPaths } from "../lib/commitPaths.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
 import { Tabs, TabsList, TabsTrigger } from "@repo/ui/components/tabs";
@@ -44,6 +45,12 @@ const WORKING_RELOAD_MS = 5000;
 const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
 
 // Says whether a line number is picked or has a comment, and picks it on click.
+// Which files the commit takes. Every file starts ticked.
+interface FileSelection {
+	readonly included: (path: string) => boolean;
+	readonly onChange: (path: string, included: boolean) => void;
+}
+
 interface LinePicking {
 	readonly onPick: (range: LineRange, extend: boolean) => void;
 	readonly marked: (path: string, side: DiffSide, line: number | null) => boolean;
@@ -60,6 +67,20 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const reverts = useAppState((current) => current.reverts[workspace.id] ?? 0);
 	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
 	const [picked, setPicked] = useState<LineRange | null>(null);
+	const [excluded, setExcluded] = useState<ReadonlySet<string>>(new Set());
+	const selection = useMemo<FileSelection>(
+		() => ({
+			included: (path) => !excluded.has(path),
+			onChange: (path, included) =>
+				setExcluded((current) => {
+					const next = new Set(current);
+					if (included) next.delete(path);
+					else next.add(path);
+					return next;
+				}),
+		}),
+		[excluded],
+	);
 
 	useEffect(() => {
 		commentsByWorkspace.set(workspace.id, comments);
@@ -173,7 +194,15 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 					</Button>
 				</Hint>
 			</div>
-			<CommitBar workspace={workspace} hasChanges={(diff?.files.length ?? 0) > 0} onCommitted={() => void load()} />
+			<CommitBar
+				workspace={workspace}
+				files={diff?.files ?? []}
+				excluded={excluded}
+				onCommitted={() => {
+					setExcluded(new Set());
+					void load();
+				}}
+			/>
 			{error !== null ? (
 				<p className="p-4 text-xs text-destructive">{error}</p>
 			) : diff !== null && diff.files.length === 0 ? (
@@ -183,6 +212,7 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 					rows={rows}
 					mode={mode}
 					picking={picking}
+					selection={selection}
 					onToggle={(file) => setToggled((current) => new Map(current).set(file.path, !isOpen(file)))}
 					onLoadFull={(path) => void loadFullFile(path)}
 				/>
@@ -202,18 +232,24 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 
 const CommitBar = ({
 	workspace,
-	hasChanges,
+	files,
+	excluded,
 	onCommitted,
 }: {
 	readonly workspace: Workspace;
-	readonly hasChanges: boolean;
+	readonly files: ReadonlyArray<DiffFile>;
+	readonly excluded: ReadonlySet<string>;
 	readonly onCommitted: () => void;
 }) => {
 	const [message, setMessage] = useState("");
+	const hasChanges = files.length > 0;
+	const ticked = files.filter((file) => !excluded.has(file.path)).length;
 	const [busy, setBusy] = useState<"commit" | "push" | null>(null);
 	const commit = async () => {
 		setBusy("commit");
-		await callDaemon((daemon) => daemon.commit({ workspaceId: workspace.id, message, paths: null })).then(
+		await callDaemon((daemon) =>
+			daemon.commit({ workspaceId: workspace.id, message, paths: commitPaths(files, excluded) }),
+		).then(
 			(result) => {
 				setMessage("");
 				toast(`Committed ${result.sha.slice(0, 7)}`, "info");
@@ -236,7 +272,7 @@ const CommitBar = ({
 			className="flex shrink-0 items-center gap-1.5 border-b border-border px-3 py-2"
 			onSubmit={(event) => {
 				event.preventDefault();
-				if (message.trim() !== "") void commit();
+				if (message.trim() !== "" && ticked > 0) void commit();
 			}}
 		>
 			<Input
@@ -251,10 +287,10 @@ const CommitBar = ({
 				variant="secondary"
 				type="submit"
 				size="sm"
-				disabled={!hasChanges || message.trim() === "" || busy !== null}
+				disabled={!hasChanges || ticked === 0 || message.trim() === "" || busy !== null}
 			>
 				<GitCommitIcon />
-				Commit
+				{ticked === files.length ? "Commit" : `Commit ${ticked} of ${files.length}`}
 			</Button>
 			<Hint label={`Push ${workspace.branch} to origin`}>
 				<Button variant="ghost" size="icon-sm" aria-label="Push" disabled={busy !== null} onClick={() => void push()}>
@@ -373,12 +409,14 @@ const DiffRows = ({
 	rows,
 	mode,
 	picking,
+	selection,
 	onToggle,
 	onLoadFull,
 }: {
 	readonly rows: ReadonlyArray<DiffRow>;
 	readonly mode: "unified" | "split";
 	readonly picking?: LinePicking;
+	readonly selection?: FileSelection;
 	readonly onToggle?: (file: DiffFile) => void;
 	readonly onLoadFull?: (path: string) => void;
 }) => {
@@ -406,7 +444,14 @@ const DiffRows = ({
 							className="absolute inset-x-0"
 							style={{ transform: `translateY(${virtualRow.start}px)` }}
 						>
-							<RowView row={row} mode={mode} picking={picking} onToggle={onToggle} onLoadFull={onLoadFull} />
+							<RowView
+								row={row}
+								mode={mode}
+								picking={picking}
+								selection={selection}
+								onToggle={onToggle}
+								onLoadFull={onLoadFull}
+							/>
 						</div>
 					);
 				})}
@@ -419,12 +464,14 @@ const RowView = ({
 	row,
 	mode,
 	picking,
+	selection,
 	onToggle,
 	onLoadFull,
 }: {
 	readonly row: DiffRow;
 	readonly mode: "unified" | "split";
 	readonly picking: LinePicking | undefined;
+	readonly selection: FileSelection | undefined;
 	readonly onToggle: ((file: DiffFile) => void) | undefined;
 	readonly onLoadFull: ((path: string) => void) | undefined;
 }) => {
@@ -432,25 +479,39 @@ const RowView = ({
 		case "file": {
 			const status = STATUS_LETTERS[row.file.status];
 			return (
-				<button
-					type="button"
-					disabled={onToggle === undefined}
-					onClick={() => onToggle?.(row.file)}
-					aria-expanded={row.open}
-					className="flex h-8 w-full items-center gap-2 border-y border-border bg-card px-3 text-left font-sans"
-				>
-					<ChevronRightIcon
-						className={cn("size-3 shrink-0 text-muted-foreground/60 transition-transform", row.open && "rotate-90")}
-					/>
-					<span className={cn("w-3 font-mono font-semibold", status.tone)}>{status.letter}</span>
-					<span className="min-w-0 flex-1 truncate">
-						{row.file.oldPath === null ? row.file.path : `${row.file.oldPath} to ${row.file.path}`}
-					</span>
-					<span className="font-mono">
-						<span className="text-success">+{row.file.additions}</span>{" "}
-						<span className="text-destructive">-{row.file.deletions}</span>
-					</span>
-				</button>
+				<div className="flex h-8 w-full items-center border-y border-border bg-card font-sans">
+					{selection === undefined ? null : (
+						<input
+							type="checkbox"
+							checked={selection.included(row.file.path)}
+							onChange={(event) => selection.onChange(row.file.path, event.target.checked)}
+							aria-label={`Include ${row.file.path} in the commit`}
+							className="ml-3 size-3.5 shrink-0 accent-primary"
+						/>
+					)}
+					<button
+						type="button"
+						disabled={onToggle === undefined}
+						onClick={() => onToggle?.(row.file)}
+						aria-expanded={row.open}
+						className={cn(
+							"flex h-full min-w-0 flex-1 items-center gap-2 pr-3 text-left",
+							selection === undefined ? "pl-3" : "pl-2",
+						)}
+					>
+						<ChevronRightIcon
+							className={cn("size-3 shrink-0 text-muted-foreground/60 transition-transform", row.open && "rotate-90")}
+						/>
+						<span className={cn("w-3 font-mono font-semibold", status.tone)}>{status.letter}</span>
+						<span className="min-w-0 flex-1 truncate">
+							{row.file.oldPath === null ? row.file.path : `${row.file.oldPath} to ${row.file.path}`}
+						</span>
+						<span className="font-mono">
+							<span className="text-success">+{row.file.additions}</span>{" "}
+							<span className="text-destructive">-{row.file.deletions}</span>
+						</span>
+					</button>
+				</div>
 			);
 		}
 		case "hunk":
