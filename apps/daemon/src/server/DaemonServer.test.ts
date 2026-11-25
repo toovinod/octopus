@@ -1,10 +1,10 @@
+import { Effect, Exit, Fiber, FileSystem, Layer, Redacted, Stream } from "effect";
 import { TEST_TOKEN, testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { testAgentServices } from "../testing/testAgentServices.ts";
 import packageJson from "../../package.json" with { type: "json" };
-import { Effect, Fiber, FileSystem, Layer, Stream } from "effect";
 import { DaemonClient } from "@repo/contracts/DaemonClient";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
@@ -87,6 +87,21 @@ describe("DaemonServer", () => {
 		);
 		expect(error._tag).toBe("NotAGitRepositoryError");
 		expect(error.message).toContain("is not a git repository");
+	});
+
+	test("refuses an empty API key over RPC", async () => {
+		const [empty, saved] = await runWithDaemon((baseUrl) =>
+			Effect.gen(function* () {
+				const client = yield* DaemonClient;
+				const empty = yield* Effect.exit(client.setAgentApiKey({ agent: "claude", apiKey: Redacted.make("") }));
+				const saved = yield* Effect.exit(
+					client.setAgentApiKey({ agent: "claude", apiKey: Redacted.make("sk-ant-test") }),
+				);
+				return [empty, saved] as const;
+			}).pipe(withClient(baseUrl)),
+		);
+		expect(Exit.isFailure(empty)).toBe(true);
+		expect(Exit.isSuccess(saved)).toBe(true);
 	});
 
 	test("runs a session turn with an approval over RPC", async () => {

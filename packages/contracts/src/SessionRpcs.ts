@@ -37,7 +37,7 @@ export class SessionRpcs extends RpcGroup.make(
 	}),
 	// The key travels only over the local socket and is stored in the OS keychain.
 	Rpc.make("setAgentApiKey", {
-		payload: { agent: AgentKind, apiKey: Schema.Redacted(Schema.String) },
+		payload: { agent: AgentKind, apiKey: Schema.Redacted(Schema.NonEmptyString) },
 		error: DaemonInternalError,
 	}),
 	Rpc.make("removeAgentApiKey", {
