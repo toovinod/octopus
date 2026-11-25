@@ -30,6 +30,18 @@ const readStdin = Effect.gen(function* () {
 // The pages the desktop shell serves the web app from: tauri://localhost on macOS and Linux, http://tauri.localhost on Windows.
 export const TAURI_ORIGINS = ["tauri://localhost", "http://tauri.localhost"];
 
+// A dev server answers on localhost and on 127.0.0.1 alike, so a dev origin on either is allowed on both.
+const withLoopbackAlias = (origin: string) => {
+	const url = new URL(origin);
+	if (url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+		return [origin];
+	}
+	return ["localhost", "127.0.0.1"].map((hostname) => {
+		url.hostname = hostname;
+		return url.origin;
+	});
+};
+
 // The dev daemon makes its own token, prints it and listens on a known port next to the web dev server.
 const randomToken = Effect.sync(() => ({
 	token: Redacted.make(randomBytes(32).toString("hex")),
@@ -49,7 +61,10 @@ const readConfig = Effect.fn("readConfig")(function* <E, R>(
 	const dataDir = yield* Config.String("OCTOPUS_DATA_DIR").pipe(Config.withDefault(join(homedir(), ".octopus")));
 	// Set by a debug build of the desktop shell, whose window loads the web dev server instead of tauri://localhost.
 	const devOrigin = yield* Config.option(Config.String("OCTOPUS_DAEMON_DEV_ORIGIN"));
-	const allowedOrigins = [...TAURI_ORIGINS, ...Option.toArray(Option.orElse(devOrigin, () => defaults.devOrigin))];
+	const allowedOrigins = [
+		...TAURI_ORIGINS,
+		...Option.toArray(Option.orElse(devOrigin, () => defaults.devOrigin)).flatMap(withLoopbackAlias),
+	];
 	return { port, token, dataDir, allowedOrigins, parentExited };
 });
 

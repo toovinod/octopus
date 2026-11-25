@@ -1,5 +1,5 @@
 import { TEST_ORIGIN, TEST_TOKEN, testDaemonConfig } from "../testing/testDaemonConfig.ts";
-import { Effect, Exit, Fiber, FileSystem, Layer, Redacted, Stream } from "effect";
+import { Effect, Exit, Fiber, FileSystem, Layer, Logger, Redacted, Stream } from "effect";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 const runWithDaemon = <A, E>(
 	program: (baseUrl: string, tempDir: string) => Effect.Effect<A, E, BunServices.BunServices>,
+	loggers: ReadonlyArray<Logger.Logger<unknown, void>> = [],
 ) =>
 	Effect.gen(function* () {
 		const fs = yield* FileSystem.FileSystem;
@@ -27,6 +28,7 @@ const runWithDaemon = <A, E>(
 					Layer.provide([testDaemonConfig(join(tempDir, "data")), testAgentServices(), testProcessRegistry]),
 				),
 			),
+			Effect.provide(Logger.layer(loggers, { mergeWithExisting: true })),
 		);
 	}).pipe(Effect.scoped, Effect.provide(BunServices.layer), Effect.runPromise);
 
@@ -55,6 +57,26 @@ describe("DaemonServer", () => {
 		});
 		expect(statuses.slice(0, 2)).toEqual([403, 403]);
 		expect(statuses[2]).not.toBe(403);
+	});
+
+	test("logs the Origin or Host it refused", async () => {
+		const logs: Array<string> = [];
+		const capture = Logger.make((options) => {
+			logs.push(String(Logger.formatLogFmt.log(options)));
+		});
+		await runWithDaemon(
+			(baseUrl) => {
+				const url = `${baseUrl}/rpc?token=${TEST_TOKEN}`;
+				return Effect.all([
+					statusOf(url, { Origin: "https://evil.example" }),
+					statusOf(url, { Host: `evil.example:${new URL(baseUrl).port}` }),
+				]);
+			},
+			[capture],
+		);
+		const warnings = logs.filter((line) => line.includes("level=WARN")).join("\n");
+		expect(warnings).toContain("https://evil.example");
+		expect(warnings).toContain("evil.example:");
 	});
 
 	test("answers health over a WebSocket with the right token", async () => {
