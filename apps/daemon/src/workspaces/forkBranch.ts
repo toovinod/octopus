@@ -10,8 +10,9 @@ export const markForkBranch = Effect.fn("markForkBranch")(function* (repositoryP
 	yield* runGit(repositoryPath, ["config", "--type=bool", forkKey(branch), "true"]);
 });
 
-// Whether a folder's checked-out branch holds a fork's code: Octopus marked it, or it pulls from a URL rather
-// than a configured remote, as `gh pr checkout` sets up for a fork's pull request. A branch tracking a named
+// Whether a folder's checked-out branch holds a fork's code: Octopus marked it, or it is set up the way
+// `gh pr checkout` sets up a fork's pull request, pulling from a URL rather than a configured remote, or pulling
+// the pull request's head (refs/pull/<n>/head) when the fork keeps maintainers out. A branch tracking a named
 // remote such as upstream is the user's own. A detached HEAD shows neither.
 export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: string) {
 	const branch = yield* runGit(path, ["branch", "--show-current"]);
@@ -19,6 +20,8 @@ export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: strin
 	if (yield* isForkBranch(path, branch)) return true;
 	const remote = yield* runGit(path, ["config", "--default", "", "--get", `branch.${branch}.remote`]);
 	if (remote === "" || remote === ".") return false;
+	const merge = yield* runGit(path, ["config", "--default", "", "--get", `branch.${branch}.merge`]);
+	if (merge.startsWith("refs/pull/")) return true;
 	const remotes = yield* runGit(path, ["remote"]);
 	return !remotes.split("\n").includes(remote);
 });
