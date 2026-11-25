@@ -89,16 +89,23 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		setPicked(null);
 	};
 
+	// Loads can overlap, and an older one can answer last. Only the latest request may show its result.
+	const latestLoad = useRef(0);
 	const load = useCallback(async () => {
+		const request = ++latestLoad.current;
+		const isLatest = () => request === latestLoad.current;
 		setLoading(true);
 		await callDaemon((daemon) => daemon.getWorkspaceDiff({ workspaceId: workspace.id })).then(
 			(loaded) => {
+				if (!isLatest()) return;
 				setDiff(loaded);
 				setError(null);
 			},
-			(failure: unknown) => setError(errorMessage(failure)),
+			(failure: unknown) => {
+				if (isLatest()) setError(errorMessage(failure));
+			},
 		);
-		setLoading(false);
+		if (isLatest()) setLoading(false);
 	}, [workspace.id]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: finished and reverts are the reload signals.
