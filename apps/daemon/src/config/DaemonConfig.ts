@@ -36,23 +36,22 @@ const randomToken = Effect.sync(() => ({
 	parentExited: Effect.never,
 }));
 
-const readConfig = <E, R>(
+const readConfig = Effect.fn("readConfig")(function* <E, R>(
 	credentials: Effect.Effect<
 		{ readonly token: Redacted.Redacted<string>; readonly parentExited: Effect.Effect<void> },
 		E,
 		R
 	>,
 	defaults: { readonly port: number; readonly devOrigin: Option.Option<string> },
-) =>
-	Effect.gen(function* () {
-		const port = yield* Config.Port("OCTOPUS_DAEMON_PORT").pipe(Config.withDefault(defaults.port));
-		const { token, parentExited } = yield* credentials;
-		const dataDir = yield* Config.String("OCTOPUS_DATA_DIR").pipe(Config.withDefault(join(homedir(), ".octopus")));
-		// Set by a debug build of the desktop shell, whose window loads the web dev server instead of tauri://localhost.
-		const devOrigin = yield* Config.option(Config.String("OCTOPUS_DAEMON_DEV_ORIGIN"));
-		const allowedOrigins = [...TAURI_ORIGINS, ...Option.toArray(Option.orElse(devOrigin, () => defaults.devOrigin))];
-		return { port, token, dataDir, allowedOrigins, parentExited };
-	});
+) {
+	const port = yield* Config.Port("OCTOPUS_DAEMON_PORT").pipe(Config.withDefault(defaults.port));
+	const { token, parentExited } = yield* credentials;
+	const dataDir = yield* Config.String("OCTOPUS_DATA_DIR").pipe(Config.withDefault(join(homedir(), ".octopus")));
+	// Set by a debug build of the desktop shell, whose window loads the web dev server instead of tauri://localhost.
+	const devOrigin = yield* Config.option(Config.String("OCTOPUS_DAEMON_DEV_ORIGIN"));
+	const allowedOrigins = [...TAURI_ORIGINS, ...Option.toArray(Option.orElse(devOrigin, () => defaults.devOrigin))];
+	return { port, token, dataDir, allowedOrigins, parentExited };
+});
 
 export class DaemonConfig extends Context.Service<
 	DaemonConfig,
