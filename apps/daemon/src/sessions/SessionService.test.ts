@@ -590,6 +590,25 @@ describe("SessionService", () => {
 		expect(statuses).toEqual(["interrupted", "interrupted", "idle"]);
 	});
 
+	test("a project that loses its trust stops its running agents", async () => {
+		const status = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const { projectId } = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
+					workspaces.get(session.workspaceId),
+				);
+				const projects = yield* ProjectService;
+				yield* projects.setTrust(projectId, true);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				yield* projects.setTrust(projectId, false);
+				return yield* waitForStatus(session.id, "interrupted");
+			}),
+		);
+		expect(status).toBe("interrupted");
+	});
+
 	test("a restart cancels the requests it left open and ends the turn it cut off", async () => {
 		const stored = await runInTempDir((tempDir) =>
 			Effect.gen(function* () {

@@ -77,6 +77,7 @@ import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
 import { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import { CredentialStore } from "../agents/CredentialStore.ts";
+import { ProjectService } from "../projects/ProjectService.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { SessionEvent } from "@repo/contracts/SessionEvent";
@@ -197,6 +198,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const database = yield* LocalDatabase;
 		const credentials = yield* CredentialStore;
 		const workspaceLock = yield* WorkspaceLock;
+		const projects = yield* ProjectService;
 		const claude = yield* ClaudeAdapter;
 		const codex = yield* CodexAdapter;
 		const adapters: Record<AgentKind, AgentAdapter> = { claude, codex };
@@ -867,23 +869,24 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}
 		});
 
-		const updateSettings = Effect.fn("SessionService.updateSettings")(function* (
-			sessionId: string,
-			settings: SessionSettings,
-		) {
-			const row = yield* getRow(sessionId);
-			yield* checkModeAllowed(row, settings.mode);
-			// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
-			const runtime = runtimes.get(sessionId);
-			if (runtime !== undefined) {
-				yield* runtime.handle.updateSettings(settings);
-			}
-			const session = yield* updateSession(sessionId, settings);
-			if (session === undefined) {
-				return yield* new SessionNotFoundError({ sessionId });
-			}
-			return session;
-		});
+		// Under the process lock, so a process starting meanwhile cannot miss the change.
+		const updateSettings = Effect.fn("SessionService.updateSettings")(
+			function* (sessionId: string, settings: SessionSettings) {
+				const row = yield* getRow(sessionId);
+				yield* checkModeAllowed(row, settings.mode);
+				// Applied before it is stored, so a change the agent refuses never shows as the session's settings.
+				const runtime = runtimes.get(sessionId);
+				if (runtime !== undefined) {
+					yield* runtime.handle.updateSettings(settings);
+				}
+				const session = yield* updateSession(sessionId, settings);
+				if (session === undefined) {
+					return yield* new SessionNotFoundError({ sessionId });
+				}
+				return session;
+			},
+			(effect, sessionId) => withProcessLock(sessionId, effect),
+		);
 
 		const toSessionEvents = (rows: ReadonlyArray<typeof sessionEvent.$inferSelect>) =>
 			Effect.forEach(rows, (row) =>
@@ -1158,6 +1161,20 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		// Stop the idle sweep first, then release every remaining runtime while consumers can still save events.
 		yield* Effect.addFinalizer(() => stopRuntimes(() => true));
 		yield* stopExpiredRuntimes.pipe(Effect.repeat(Schedule.spaced(IDLE_SWEEP_INTERVAL)), Effect.forkScoped);
+
+		// A running agent keeps the project settings and full access it started with, so losing trust stops it.
+		// The next message starts it again as untrusted.
+		const stopProject = Effect.fnUntraced(
+			function* (projectId: string) {
+				const rows = yield* database.query((db) =>
+					db.select({ id: workspace.id }).from(workspace).where(eq(workspace.projectId, projectId)),
+				);
+				const workspaceIds = new Set(rows.map(({ id }) => id));
+				yield* stopRuntimes((runtime) => workspaceIds.has(runtime.workspaceId));
+			},
+			Effect.catch((error) => Effect.logError("Could not stop the agents of a project that lost its trust", error)),
+		);
+		yield* projects.trustRevoked.pipe(Stream.runForEach(stopProject), Effect.forkScoped);
 
 		return {
 			listAgents,

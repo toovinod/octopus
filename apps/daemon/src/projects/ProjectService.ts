@@ -9,9 +9,9 @@ import {
 	ProjectNotFoundError,
 } from "@repo/contracts/Project";
 import { type GitCommandError, type GitSpawnError, runGit } from "../git/runGit.ts";
+import { Context, Effect, FileSystem, Layer, PubSub, Stream } from "effect";
 import { detectDefaultBranch } from "./detectDefaultBranch.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
-import { Context, Effect, FileSystem, Layer } from "effect";
 import { project, workspace } from "../database/schema.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import type { SecureRandom } from "effect/crypto";
@@ -27,6 +27,8 @@ export class ProjectService extends Context.Service<ProjectService>()("octopus/d
 		const database = yield* LocalDatabase;
 		const fs = yield* FileSystem.FileSystem;
 		const services = yield* Effect.context<ChildProcessSpawner.ChildProcessSpawner | SecureRandom.SecureRandom>();
+		// Running agents keep the trust they started with, so the sessions hear when a project loses it.
+		const trustRevocations = yield* PubSub.unbounded<string>();
 
 		const get = Effect.fn("ProjectService.get")(function* (projectId: string) {
 			const [row] = yield* database.query((db) => db.select().from(project).where(eq(project.id, projectId)));
@@ -125,6 +127,7 @@ export class ProjectService extends Context.Service<ProjectService>()("octopus/d
 			if (row === undefined) {
 				return yield* new ProjectNotFoundError({ projectId });
 			}
+			if (!trusted) yield* PubSub.publish(trustRevocations, projectId);
 			return new Project(row);
 		});
 
@@ -150,7 +153,16 @@ export class ProjectService extends Context.Service<ProjectService>()("octopus/d
 			return yield* add(path);
 		});
 
-		return { get, add, create, list, remove, updateScripts, setTrust };
+		return {
+			get,
+			add,
+			create,
+			list,
+			remove,
+			updateScripts,
+			setTrust,
+			trustRevoked: Stream.fromPubSub(trustRevocations),
+		};
 	}),
 }) {
 	static readonly layer = Layer.effect(ProjectService, ProjectService.make);
