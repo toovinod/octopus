@@ -102,10 +102,16 @@ export const restoreCheckpoint = Effect.fn("restoreCheckpoint")(function* (
 	checkpoint: string,
 	before: string,
 ) {
+	const giveUp = (cause: unknown) => Effect.logError("Could not undo a revert that failed partway", cause);
 	yield* writeTree(worktree, checkpoint).pipe(
 		Effect.onError(() =>
 			writeTree(worktree, before).pipe(
-				Effect.catch((cause) => Effect.logError("Could not undo a revert that failed partway", cause)),
+				Effect.catchTags({
+					GitCommandError: giveUp,
+					GitSpawnError: giveUp,
+					GitTimeoutError: giveUp,
+					PlatformError: giveUp,
+				}),
 			),
 		),
 	);
