@@ -1,6 +1,6 @@
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
+import { MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
-import { MAX_FINISHED_OUTPUTS, WorkspaceService } from "./WorkspaceService.ts";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { Duration, Effect, Fiber, FileSystem, Stream } from "effect";
@@ -454,6 +454,27 @@ describe("WorkspaceService", () => {
 		expect(result.retried).toMatchObject({ id: result.failed?.id, status: "completed", attempts: 0, lastError: null });
 		expect(result.runs).toHaveLength(1);
 		expect(result.refused._tag).toBe("WorkspaceArchivedError");
+	});
+
+	test("runs only a few setup scripts at once", async () => {
+		const log = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const logPath = join(tempDir, "setup.log");
+				const project = yield* addProject(tempDir, `echo start >> ${logPath}; sleep 0.3; echo end >> ${logPath}`);
+				const names = Array.from({ length: SETUP_SCRIPTS_AT_ONCE + 1 }, (_, index) => `feature-${index}`);
+				const created = yield* Effect.forEach(names, (name) =>
+					workspaces.create({ kind: "worktree", projectId: project.id, name }),
+				);
+				yield* Effect.forEach(created, (each) => waitForScriptRun(each.id));
+				return yield* Effect.flatMap(FileSystem.FileSystem, (fs) => fs.readFileString(logPath));
+			}),
+		);
+		const lines = log.trim().split("\n");
+		expect(lines.slice(0, SETUP_SCRIPTS_AT_ONCE + 1)).toEqual([
+			...Array.from({ length: SETUP_SCRIPTS_AT_ONCE }, () => "start"),
+			"end",
+		]);
 	});
 
 	test("a timed-out setup script is retried, then dead-lettered", async () => {

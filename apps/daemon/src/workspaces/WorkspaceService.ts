@@ -13,7 +13,7 @@ import {
 	restoreArchiveStash,
 } from "./removeWorktree.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "@repo/contracts/ScriptRun";
-import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
+import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
@@ -72,6 +72,9 @@ const LIVE_LINES = 1000;
 // Finished output stays so the UI can show why a run failed, but only for the latest runs: a
 // daemon that runs scripts for weeks would otherwise hold the output of every one.
 export const MAX_FINISHED_OUTPUTS = 20;
+
+// Setup scripts are usually installs, so only this many run at once, as after a restart that finds many pending.
+export const SETUP_SCRIPTS_AT_ONCE = 2;
 
 export class WorkspaceService extends Context.Service<WorkspaceService>()(
 	"octopus/daemon/workspaces/WorkspaceService",
@@ -135,8 +138,16 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 			});
 
-			const startSetupScript = (scriptRunId: string, script: string, cwd: string) =>
-				startScript(scriptRunId, (onLine) => runSetupScript({ scriptRunId, script, cwd, onLine }));
+			const setupPermits = yield* Semaphore.make(SETUP_SCRIPTS_AT_ONCE);
+			// The run stays pending while it waits out `delay` or a free permit.
+			const startSetupScript = (scriptRunId: string, script: string, cwd: string, delay = Duration.zero) =>
+				startScript(scriptRunId, (onLine) =>
+					Effect.sleep(delay).pipe(
+						Effect.andThen(
+							runSetupScript({ scriptRunId, script, cwd, onLine }).pipe(Semaphore.withPermit(setupPermits)),
+						),
+					),
+				);
 
 			const insertWorkspace = (row: WorkspaceRow, setupRun: ScriptRunRow | null) =>
 				database.query((db) =>
@@ -713,7 +724,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			// Startup recovery: runs left in processing were cut off by a restart, which is a
 			// retryable failure. Then every pending run of an active workspace starts again.
 			const recoverScriptRuns = Effect.gen(function* () {
-				const { maxAttempts } = yield* SetupScriptSettings;
+				const { maxAttempts, retryBaseDelay } = yield* SetupScriptSettings;
 				const cutOff = yield* database.query((db) =>
 					db
 						.select({ id: scriptRun.id, kind: scriptRun.kind })
@@ -738,6 +749,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						.select({
 							id: scriptRun.id,
 							kind: scriptRun.kind,
+							attempts: scriptRun.attempts,
 							path: workspace.path,
 							workspaceStatus: workspace.status,
 							script: project.setupScript,
@@ -749,7 +761,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 				for (const run of pending) {
 					if (run.kind === "setup" && run.workspaceStatus === "active" && run.script !== null) {
-						yield* startSetupScript(run.id, run.script, run.path);
+						// A run that already failed waits out the retry delay it would have had, rather than starting at once.
+						const delay = run.attempts === 0 ? Duration.zero : Duration.times(retryBaseDelay, 2 ** (run.attempts - 1));
+						yield* startSetupScript(run.id, run.script, run.path, delay);
 					} else {
 						yield* applyScriptRunEvent(run.id, {
 							_tag: "Cancelled",
