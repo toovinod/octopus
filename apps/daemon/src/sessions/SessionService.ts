@@ -500,45 +500,45 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				);
 			}
 			const scope = yield* Scope.make();
-			const handle = yield* adapters[row.agent]
-				.startSession({
-					cwd: target.path,
-					model: row.model,
-					effort: row.effort,
-					mode,
-					trustProjectSettings: target.trusted,
-					auth,
-					...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
-				})
-				.pipe(
-					Scope.provide(scope),
-					Effect.onError(() => Scope.close(scope, Exit.void)),
-					Effect.mapError(toUnavailable(row.agent)),
+			// Nothing else owns the process until the runtime is registered, so a failure before that stops it.
+			const runtime = yield* Effect.gen(function* () {
+				const handle = yield* adapters[row.agent]
+					.startSession({
+						cwd: target.path,
+						model: row.model,
+						effort: row.effort,
+						mode,
+						trustProjectSettings: target.trusted,
+						auth,
+						...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
+					})
+					.pipe(Scope.provide(scope), Effect.mapError(toUnavailable(row.agent)));
+				const [stored] = yield* database.query((db) =>
+					db
+						.select({ last: max(sessionEvent.sequence) })
+						.from(sessionEvent)
+						.where(eq(sessionEvent.sessionId, row.id)),
 				);
-			const [stored] = yield* database.query((db) =>
-				db
-					.select({ last: max(sessionEvent.sequence) })
-					.from(sessionEvent)
-					.where(eq(sessionEvent.sessionId, row.id)),
-			);
-			const runtime: Runtime = {
-				sessionId: row.id,
-				workspaceId: row.workspaceId,
-				agent: row.agent,
-				handle,
-				scope,
-				done: yield* Deferred.make<void>(),
-				ending: false,
-				idleSince: clock.currentTimeNanosUnsafe(),
-				nextSequence: (stored?.last ?? -1) + 1,
-				outstanding: 0,
-				approvals: new Map(),
-				resting: isBusy(row.status) ? "idle" : row.status,
-				status: row.status,
-			};
-			if (row.authMode !== auth.mode) {
-				yield* updateSession(row.id, { authMode: auth.mode });
-			}
+				const created: Runtime = {
+					sessionId: row.id,
+					workspaceId: row.workspaceId,
+					agent: row.agent,
+					handle,
+					scope,
+					done: yield* Deferred.make<void>(),
+					ending: false,
+					idleSince: clock.currentTimeNanosUnsafe(),
+					nextSequence: (stored?.last ?? -1) + 1,
+					outstanding: 0,
+					approvals: new Map(),
+					resting: isBusy(row.status) ? "idle" : row.status,
+					status: row.status,
+				};
+				if (row.authMode !== auth.mode) {
+					yield* updateSession(row.id, { authMode: auth.mode });
+				}
+				return created;
+			}).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
 			runtimes.set(row.id, runtime);
 			yield* consume(runtime).pipe(Effect.forkIn(consumers));
 			yield* Effect.logInfo("Started agent process").pipe(
