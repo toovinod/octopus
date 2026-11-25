@@ -1247,7 +1247,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				const workspaceIds = new Set(rows.map(({ id }) => id));
 				yield* stopRuntimes((runtime) => workspaceIds.has(runtime.workspaceId));
 			},
-			Effect.catch((error) => Effect.logError("Could not stop the agents of a project that lost its trust", error)),
+			Effect.catchTag("LocalDatabaseError", (error) =>
+				Effect.logError("Could not stop the agents of a project that lost its trust", error),
+			),
 		);
 		yield* projects.trustRevoked.pipe(Stream.runForEach(stopProject), Effect.forkScoped);
 
