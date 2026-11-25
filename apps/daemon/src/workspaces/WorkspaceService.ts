@@ -16,11 +16,11 @@ import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingEr
 import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
+import { applyScriptRunEvent, runSetupScript, setupRetryDelay } from "./runSetupScript.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
 import { holdsForkCode, isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
-import { applyScriptRunEvent, runSetupScript } from "./runSetupScript.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import { project, scriptRun, workspace } from "../database/schema.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
@@ -770,7 +770,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				for (const run of pending) {
 					if (run.kind === "setup" && run.workspaceStatus === "active" && run.script !== null) {
 						// A run that already failed waits out the retry delay it would have had, rather than starting at once.
-						const delay = run.attempts === 0 ? Duration.zero : Duration.times(retryBaseDelay, 2 ** (run.attempts - 1));
+						const delay = run.attempts === 0 ? Duration.zero : yield* setupRetryDelay(retryBaseDelay, run.attempts);
 						yield* startSetupScript(run.id, run.script, run.path, delay);
 					} else {
 						yield* applyScriptRunEvent(run.id, {
