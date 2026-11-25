@@ -80,7 +80,14 @@ export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace 
 				) : loaded.state === "failed" ? (
 					<p className="p-4 text-xs text-destructive">{loaded.message}</p>
 				) : loaded.value.status === "none" ? (
-					<CreatePullRequest workspace={workspace} onCreated={reload} />
+					workspace.fromFork ? (
+						<p className="p-4 text-xs text-muted-foreground">
+							This workspace holds a fork's pull request, so Octopus does not open a new one. Push to update the fork's
+							branch.
+						</p>
+					) : (
+						<CreatePullRequest workspace={workspace} onCreated={reload} />
+					)
 				) : (
 					<PullRequestDetails workspace={workspace} pullRequest={loaded.value.pullRequest} onChanged={reload} />
 				)}

@@ -3,6 +3,8 @@ import {
 	CommitFailedError,
 	CommitResult,
 	DiffFile,
+	ForkPullRequestError,
+	ForkPushTargetMissingError,
 	GhNotAuthenticatedError,
 	GhNotInstalledError,
 	GitStatus,
@@ -23,31 +25,49 @@ import {
 	PushRejectedError,
 	WorkspaceDiff,
 } from "./Git.ts";
-import { Workspace, WorkspaceNotFoundError } from "./Workspace.ts";
+import { Workspace, WorkspaceArchivedError, WorkspaceNotFoundError } from "./Workspace.ts";
 import { DaemonInternalError } from "./DaemonInternalError.ts";
 import { FileReadError } from "./WorkspaceFile.ts";
 import { Rpc, RpcGroup } from "effect/rpc";
 import { Schema } from "effect";
 
-const PushError = [BranchChangedError, NoRemoteError, PushRejectedError, PushFailedError] as const;
+const PushError = [
+	BranchChangedError,
+	NoRemoteError,
+	ForkPushTargetMissingError,
+	PushRejectedError,
+	PushFailedError,
+] as const;
 const GhError = [GhNotInstalledError, GhNotAuthenticatedError] as const;
 
 export class GitRpcs extends RpcGroup.make(
 	Rpc.make("getWorkspaceDiff", {
 		payload: { workspaceId: Schema.String },
 		success: WorkspaceDiff,
-		error: Schema.Union([WorkspaceNotFoundError, GitTimeoutError, FileReadError, DaemonInternalError]),
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
+			GitTimeoutError,
+			FileReadError,
+			DaemonInternalError,
+		]),
 	}),
 	// One file in full, for a file the workspace diff left out as too large.
 	Rpc.make("getFileDiff", {
 		payload: { workspaceId: Schema.String, path: Schema.String },
 		success: Schema.NullOr(DiffFile),
-		error: Schema.Union([WorkspaceNotFoundError, GitTimeoutError, FileReadError, DaemonInternalError]),
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
+			GitTimeoutError,
+			FileReadError,
+			DaemonInternalError,
+		]),
 	}),
 	Rpc.make("getGitStatus", {
 		payload: { workspaceId: Schema.String },
 		success: GitStatus,
-		error: Schema.Union([WorkspaceNotFoundError, GitTimeoutError, DaemonInternalError]),
+		error: Schema.Union([WorkspaceNotFoundError, WorkspaceArchivedError, GitTimeoutError, DaemonInternalError]),
 	}),
 	// paths null commits every change, untracked files included.
 	Rpc.make("commit", {
@@ -59,6 +79,7 @@ export class GitRpcs extends RpcGroup.make(
 		success: CommitResult,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			NothingToCommitError,
 			CommitFailedError,
@@ -67,7 +88,13 @@ export class GitRpcs extends RpcGroup.make(
 	}),
 	Rpc.make("push", {
 		payload: { workspaceId: Schema.String },
-		error: Schema.Union([WorkspaceNotFoundError, GitTimeoutError, ...PushError, DaemonInternalError]),
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
+			GitTimeoutError,
+			...PushError,
+			DaemonInternalError,
+		]),
 	}),
 	// Pushes the branch first, then stores the pull request URL on the workspace.
 	Rpc.make("createPullRequest", {
@@ -80,10 +107,12 @@ export class GitRpcs extends RpcGroup.make(
 		success: Workspace,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			...PushError,
 			...GhError,
 			PullRequestCreateError,
+			ForkPullRequestError,
 			DaemonInternalError,
 		]),
 	}),
@@ -92,6 +121,7 @@ export class GitRpcs extends RpcGroup.make(
 		success: PullRequestStatus,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			BranchChangedError,
 			...GhError,
@@ -105,6 +135,7 @@ export class GitRpcs extends RpcGroup.make(
 		success: PullRequestStatus,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			BranchChangedError,
 			...GhError,
@@ -119,6 +150,7 @@ export class GitRpcs extends RpcGroup.make(
 		success: PullRequestConversation,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			BranchChangedError,
 			...GhError,
@@ -131,6 +163,7 @@ export class GitRpcs extends RpcGroup.make(
 		payload: { workspaceId: Schema.String, review: PullRequestReviewInput },
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			BranchChangedError,
 			...GhError,
@@ -146,6 +179,7 @@ export class GitRpcs extends RpcGroup.make(
 		success: PullRequestStatus,
 		error: Schema.Union([
 			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
 			GitTimeoutError,
 			BranchChangedError,
 			...GhError,

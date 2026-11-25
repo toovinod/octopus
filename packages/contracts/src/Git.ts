@@ -97,6 +97,23 @@ export class NoRemoteError extends Schema.TaggedError<NoRemoteError>()("NoRemote
 	}
 }
 
+export class ForkPushTargetMissingError extends Schema.TaggedError<ForkPushTargetMissingError>()(
+	"ForkPushTargetMissingError",
+	{ branch: Schema.String },
+) {
+	override get message() {
+		return `${this.branch} holds a fork's pull request but has no remote branch to push to. Check it out again with \`gh pr checkout\`.`;
+	}
+}
+
+export class ForkPullRequestError extends Schema.TaggedError<ForkPullRequestError>()("ForkPullRequestError", {
+	branch: Schema.String,
+}) {
+	override get message() {
+		return `${this.branch} holds a fork's pull request, which already exists. Push to update it instead.`;
+	}
+}
+
 export class PushRejectedError extends Schema.TaggedError<PushRejectedError>()("PushRejectedError", {
 	branch: Schema.String,
 }) {
