@@ -334,7 +334,11 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 				interrupt: async () => resolveInterrupt(),
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
-				setPermissionMode: async (permissionMode) => void settingsChanges.push({ permissionMode }),
+				setPermissionMode: async (permissionMode) => {
+					// Like a claude that refuses to bypass permissions.
+					if (permissionMode === "bypassPermissions") throw new Error("refused");
+					settingsChanges.push({ permissionMode });
+				},
 				supportedCommands: async () => [
 					{ name: "review", description: "Review the branch", argumentHint: "" },
 					{ name: "fix-issue", description: "Fix a GitHub issue", argumentHint: "<number>" },
@@ -898,6 +902,19 @@ describe("sessionAllowRules", () => {
 			{ model: "claude-haiku-5-5" },
 			{ effort: "low" },
 			{ permissionMode: "plan" },
+		]);
+	});
+
+	test("a settings change claude refuses part of leaves it on the settings it had", async () => {
+		const error = await runSession((handle) =>
+			Effect.flip(handle.updateSettings({ model: "claude-haiku-5-5", effort: "low", mode: "fullAccess" })),
+		);
+		expect(error._tag).toBe("AgentProcessError");
+		expect(settingsChanges.slice(-4)).toEqual([
+			{ model: "claude-haiku-5-5" },
+			{ effort: "low" },
+			{ model: newSession.model },
+			{ effort: null },
 		]);
 	});
 

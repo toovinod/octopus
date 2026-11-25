@@ -755,6 +755,19 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					Effect.forkScoped,
 				);
 
+				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
+				const modelAndEffort = yield* Ref.make({ model: input.model, effort: input.effort });
+				const settingsError = (cause: unknown) =>
+					new AgentProcessError({ message: "Could not change the chat's settings.", cause });
+				const setModelAndEffort = ({ model, effort }: { readonly model: string; readonly effort: string | null }) =>
+					Effect.tryPromise({
+						try: async () => {
+							await run.setModel(model);
+							await run.setEffort(Option.getOrNull(decodeEffort(effort)));
+						},
+						catch: settingsError,
+					});
+
 				const sendMessage = ({ text, images }: UserMessage) =>
 					Effect.asVoid(
 						Queue.offer(prompts, {
@@ -780,14 +793,24 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// An interrupt that arrived after the last turn's result must not mark this one.
 					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
 					steerTurn: (message) => Effect.as(sendMessage(message), true),
-					updateSettings: ({ model, effort, mode }) =>
-						Effect.tryPromise({
-							try: async () => {
-								await run.setModel(model);
-								await run.setEffort(Option.getOrNull(decodeEffort(effort)));
-								await run.setPermissionMode(permissionModes[mode]);
-							},
-							catch: (cause) => new AgentProcessError({ message: "Could not change the chat's settings.", cause }),
+					updateSettings: (next) =>
+						Effect.gen(function* () {
+							const previous = yield* Ref.get(modelAndEffort);
+							yield* setModelAndEffort(next).pipe(
+								Effect.andThen(
+									Effect.tryPromise({
+										try: () => run.setPermissionMode(permissionModes[next.mode]),
+										catch: settingsError,
+									}),
+								),
+								// The caller keeps the stored settings when this fails, so claude goes back to them too.
+								Effect.tapError(() =>
+									setModelAndEffort(previous).pipe(
+										Effect.catch((error) => Effect.logWarning("Could not restore the chat's settings", error)),
+									),
+								),
+							);
+							yield* Ref.set(modelAndEffort, { model: next.model, effort: next.effort });
 						}),
 					listCommands: Effect.tryPromise({
 						try: () => run.supportedCommands(),
