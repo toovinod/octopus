@@ -314,6 +314,28 @@ describe("WorkspaceService", () => {
 		expect(result.folderExists).toBe(false);
 	});
 
+	test("archives a worktree whose only ignored files are build output that a build makes again", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), "dist/\n.next/\n__pycache__/\n");
+				yield* fs.makeDirectory(join(project.path, "packages", "app"), { recursive: true });
+				yield* fs.writeFileString(join(project.path, "packages", "app", "index.js"), "app\n");
+				yield* runGit(project.path, ["add", "."]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				for (const folder of ["dist", ".next", join("packages", "app", "dist"), join("packages", "__pycache__")]) {
+					yield* fs.makeDirectory(join(created.path, folder), { recursive: true });
+					yield* fs.writeFileString(join(created.path, folder, "out.js"), "built\n");
+				}
+				return yield* workspaces.archive(created.id, { force: false });
+			}),
+		);
+		expect(result.status).toBe("archived");
+	});
+
 	test("archives a worktree with an initialized submodule", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
