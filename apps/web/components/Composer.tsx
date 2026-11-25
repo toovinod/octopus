@@ -259,7 +259,16 @@ export const Composer = memo(
 									variant="secondary"
 									size="icon-sm"
 									aria-label="Stop"
-									onClick={() => void interruptSession(session.id)}
+									onClick={() =>
+										void interruptSession(session.id).then((dropped) => {
+											if (dropped === null || dropped.length === 0) return;
+											// Queued messages never ran, so their text comes back to be edited or sent again.
+											setDraft((current) => ({
+												...current,
+												text: [...dropped, current.text].filter((text) => text !== "").join("\n\n"),
+											}));
+										})
+									}
 								>
 									<SquareIcon className="size-3 fill-current" />
 								</Button>

@@ -177,6 +177,29 @@ test("runs a queued message's beforeTurn only once the turn ahead of it has ende
 	expect(steps).toEqual(["before one", "start one", "end one", "before two", "start two"]);
 });
 
+test("a stop drops the queued messages and hands them back", async () => {
+	const [dropped, started] = await Effect.gen(function* () {
+		const started: Array<string> = [];
+		const session = yield* makeAgentSession(capabilities);
+		const handle: AgentSessionHandle = yield* session.start({
+			startTurn: (message) => Effect.sync(() => void started.push(message.text)),
+			steerTurn: () => Effect.succeed(true),
+			interruptTurn: session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }),
+			updateSettings: () => Effect.void,
+			listCommands: Effect.succeed([]),
+		});
+		yield* handle.sendMessage(userMessage("one"));
+		yield* handle.sendMessage(userMessage("two"));
+		yield* handle.sendMessage(userMessage("three"));
+		yield* Effect.sleep("20 millis");
+		const dropped = yield* handle.interrupt;
+		yield* Effect.sleep("50 millis");
+		return [dropped.map(({ text }) => text), started] as const;
+	}).pipe(Effect.scoped, Effect.runPromise);
+	expect(dropped).toEqual(["two", "three"]);
+	expect(started).toEqual(["one"]);
+});
+
 describe("makeAgentSession plans", () => {
 	const plan = { requestId: "plan-1", itemId: "plan-1", text: "1. Add tests", choices: ["auto", "ask"] } as const;
 

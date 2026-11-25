@@ -738,13 +738,17 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.answerQuestion(requestId, answers);
 		});
 
+		// Returns the text of the queued messages it dropped, so the user can send them again.
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
 			const runtime = runtimes.get(sessionId);
 			if (runtime === undefined) {
 				yield* getRow(sessionId);
-				return;
+				return [];
 			}
-			yield* runtime.handle.interrupt;
+			const dropped = yield* runtime.handle.interrupt;
+			runtime.outstanding = Math.max(0, runtime.outstanding - dropped.length);
+			yield* refreshStatus(runtime);
+			return dropped.map(({ text }) => text);
 		});
 
 		const stop = Effect.fn("SessionService.stop")(

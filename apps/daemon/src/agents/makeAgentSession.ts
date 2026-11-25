@@ -347,11 +347,15 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 						yield* pending.respond({ type: "answered", answers });
 					}),
 				interrupt: Effect.gen(function* () {
+					// Messages waiting for their turn would start the moment the stopped turn ends, so a stop drops them
+					// first and hands them back.
+					const dropped = yield* Queue.clear(inbox);
 					yield* cancelApprovals;
 					yield* cancelPlansAndQuestions;
 					if (Option.isSome(yield* Ref.get(currentTurn))) {
 						yield* driver.interruptTurn;
 					}
+					return dropped.map(({ message }) => message);
 				}),
 				updateSettings: driver.updateSettings,
 				listCommands: driver.listCommands,
