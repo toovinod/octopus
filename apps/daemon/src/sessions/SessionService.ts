@@ -114,7 +114,8 @@ interface Runtime {
 	nextSequence: number;
 	// Turns sent and not yet completed, including queued ones.
 	outstanding: number;
-	readonly approvals: Set<string>;
+	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
+	readonly approvals: Map<string, Cancellation>;
 	// The status when no turn or approval is pending.
 	resting: RestingStatus;
 	status: AgentSessionStatus;
@@ -124,6 +125,31 @@ interface Published {
 	readonly event: SessionEvent;
 	readonly bytes: number;
 }
+
+type Cancellation = Extract<AgentEvent, { type: "approval.resolved" | "plan.resolved" | "question.resolved" }>;
+
+// How a request is closed when the process that asked it ends, so the chat stops offering to answer it.
+const cancellationOf = (event: AgentEvent): Cancellation | undefined => {
+	switch (event.type) {
+		case "approval.requested":
+			return { type: "approval.resolved", requestId: event.requestId, outcome: "cancelled" };
+		case "plan.proposed":
+			return { type: "plan.resolved", requestId: event.requestId, outcome: { type: "cancelled" } };
+		case "question.asked":
+			return { type: "question.resolved", requestId: event.requestId, outcome: { type: "cancelled" } };
+		default:
+			return undefined;
+	}
+};
+
+const requestEventTypes = [
+	"approval.requested",
+	"approval.resolved",
+	"plan.proposed",
+	"plan.resolved",
+	"question.asked",
+	"question.resolved",
+] as const;
 
 const isBusy = (status: AgentSessionStatus) => status === "running" || status === "awaitingApproval";
 
@@ -163,6 +189,7 @@ const toUnavailable = (agent: AgentKind) => (error: AgentError) =>
 	new AgentUnavailableError({ agent, availability: toAvailability(error) });
 
 const decodeEvent = Schema.decodeUnknownEffect(AgentEvent);
+const decodeEventOption = Schema.decodeUnknownOption(AgentEvent);
 const decodeMediaType = Schema.decodeUnknownOption(ImageMediaType);
 
 export class SessionService extends Context.Service<SessionService>()("octopus/daemon/sessions/SessionService", {
@@ -278,17 +305,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				case "mode.changed":
 					yield* updateSession(sessionId, { mode: event.mode });
 					break;
-				case "approval.requested":
-					runtime.approvals.add(event.requestId);
-					break;
-				case "approval.resolved":
-					runtime.approvals.delete(event.requestId);
-					break;
 				// A plan or a question waits on the user like an approval does, so the chat shows it needs them.
+				case "approval.requested":
 				case "plan.proposed":
-				case "question.asked":
-					runtime.approvals.add(event.requestId);
+				case "question.asked": {
+					const cancellation = cancellationOf(event);
+					if (cancellation !== undefined) runtime.approvals.set(event.requestId, cancellation);
 					break;
+				}
+				case "approval.resolved":
 				case "plan.resolved":
 				case "question.resolved":
 					runtime.approvals.delete(event.requestId);
@@ -311,6 +336,12 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				);
 				runtime.ending = true;
 				yield* Scope.close(runtime.scope, Exit.void);
+				// Nothing can answer what the process left open, so history closes it instead of offering it forever.
+				for (const cancellation of [...runtime.approvals.values()]) yield* record(runtime, cancellation);
+				if (runtime.outstanding > 0) {
+					const turnId = yield* newId.pipe(Effect.provide(services));
+					yield* record(runtime, { type: "turn.completed", turnId, result: { status: "interrupted" } });
+				}
 				runtime.approvals.clear();
 				runtime.outstanding = 0;
 				if (Result.isSuccess(outcome)) {
@@ -499,7 +530,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				idleSince: clock.currentTimeNanosUnsafe(),
 				nextSequence: (stored?.last ?? -1) + 1,
 				outstanding: 0,
-				approvals: new Set(),
+				approvals: new Map(),
 				resting: isBusy(row.status) ? "idle" : row.status,
 				status: row.status,
 			};
@@ -1063,6 +1094,48 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const removeApiKey = (agent: AgentKind) =>
 			credentials.remove(agent).pipe(Effect.tap(() => Effect.sync(() => forgetModels(agent))));
 
+		// The requests a restart left open are cancelled and the turn it cut off ends, as when a process ends.
+		const closeCutOffHistory = Effect.fnUntraced(function* (sessionId: string) {
+			const rows = yield* database.query((db) =>
+				db
+					.select({ payload: sessionEvent.payload })
+					.from(sessionEvent)
+					.where(and(eq(sessionEvent.sessionId, sessionId), inArray(sessionEvent.type, [...requestEventTypes])))
+					.orderBy(asc(sessionEvent.sequence)),
+			);
+			const open = new Map<string, Cancellation>();
+			for (const row of rows) {
+				const event = decodeEventOption(row.payload);
+				if (Option.isNone(event) || !("requestId" in event.value)) continue;
+				const cancellation = cancellationOf(event.value);
+				if (cancellation === undefined) open.delete(event.value.requestId);
+				else open.set(event.value.requestId, cancellation);
+			}
+			const closing: Array<AgentEvent> = [
+				...open.values(),
+				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
+			];
+			const [stored] = yield* database.query((db) =>
+				db
+					.select({ last: max(sessionEvent.sequence) })
+					.from(sessionEvent)
+					.where(eq(sessionEvent.sessionId, sessionId)),
+			);
+			const first = (stored?.last ?? -1) + 1;
+			const createdAt = yield* nowIso;
+			const values = yield* Effect.forEach(closing, (event, index) =>
+				Effect.map(newId, (id) => ({
+					id,
+					sessionId,
+					sequence: first + index,
+					type: event.type,
+					payload: event,
+					createdAt,
+				})),
+			);
+			yield* database.query((db) => db.insert(sessionEvent).values(values));
+		}, Effect.provide(services));
+
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
 		const recoverSessions = Effect.gen(function* () {
 			const updatedAt = yield* nowIso;
@@ -1078,6 +1151,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					Effect.annotateLogs({ count: cutOff.length }),
 				);
 			}
+			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 		});
 		yield* recoverSessions;
 

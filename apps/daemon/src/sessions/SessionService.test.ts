@@ -590,6 +590,116 @@ describe("SessionService", () => {
 		expect(statuses).toEqual(["interrupted", "interrupted", "idle"]);
 	});
 
+	test("a restart cancels the requests it left open and ends the turn it cut off", async () => {
+		const stored = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const dataDir = join(tempDir, "data");
+				const sessionId = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const database = yield* LocalDatabase;
+						const session = yield* addSession(tempDir);
+						const requests: Array<AgentEvent> = [
+							{
+								type: "approval.requested",
+								requestId: "answered",
+								itemId: "cmd-1",
+								kind: "command",
+								summary: "ls",
+								reason: null,
+								choices: ["allowOnce", "deny"],
+							},
+							{ type: "approval.resolved", requestId: "answered", outcome: "allowOnce" },
+							{
+								type: "approval.requested",
+								requestId: "open",
+								itemId: "cmd-2",
+								kind: "command",
+								summary: "rm",
+								reason: null,
+								choices: ["allowOnce", "deny"],
+							},
+						];
+						yield* database.query((db) =>
+							db.insert(sessionEvent).values(
+								requests.map((event, sequence) => ({
+									id: `event-${sequence}`,
+									sessionId: session.id,
+									sequence,
+									type: event.type,
+									payload: event,
+									createdAt: "2026-01-01T00:00:00.000Z",
+								})),
+							),
+						);
+						yield* database.query((db) =>
+							db.update(agentSession).set({ status: "awaitingApproval" }).where(eq(agentSession.id, session.id)),
+						);
+						return session.id;
+					}),
+				);
+				return yield* withServices(dataDir)(storedEvents(sessionId));
+			}),
+		);
+		expect(stored.slice(3).map((row) => [row.sequence, row.payload])).toEqual([
+			[3, { type: "approval.resolved", requestId: "open", outcome: "cancelled" }],
+			[4, { type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } }],
+		]);
+	});
+
+	test("an agent process that dies mid-turn leaves its approval cancelled and its turn ended", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-crash");
+					return yield* session.start({
+						startTurn: () =>
+							session
+								.requestApproval(
+									{
+										requestId: "approval-1",
+										itemId: "cmd-1",
+										kind: "command",
+										summary: "bun test",
+										reason: null,
+										choices: ["allowOnce", "deny"],
+									},
+									() => Effect.void,
+								)
+								.pipe(
+									Effect.andThen(Effect.sleep("50 millis")),
+									Effect.andThen(session.fail(new AgentProtocolError({ message: "Codex exited.", cause: null }))),
+								),
+						steerTurn: () => Effect.succeed(true),
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
+					});
+				}),
+		};
+		const result = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "first", [], false);
+					yield* waitForStatus(session.id, "failed");
+					return (yield* storedEvents(session.id)).map((row) => row.payload).slice(-3);
+				}),
+			),
+		);
+		expect(result).toEqual([
+			{ type: "approval.resolved", requestId: "approval-1", outcome: "cancelled" },
+			{ type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } },
+			{ type: "error", message: "Codex exited.", willRetry: false },
+		]);
+	});
+
 	test("reverting to a message puts the files back as they were before it, but not while an agent works", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
