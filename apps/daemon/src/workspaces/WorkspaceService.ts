@@ -827,7 +827,13 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					);
 				}
 			});
-			yield* pruneOrphanWorktrees.pipe(Effect.provide(services));
+			// Cleanup only frees folder names, so a database that cannot answer here does not keep the daemon from starting.
+			yield* pruneOrphanWorktrees.pipe(
+				Effect.catchTag("LocalDatabaseError", (cause) =>
+					Effect.logWarning("Could not look for worktrees that no workspace owns", cause),
+				),
+				Effect.provide(services),
+			);
 
 			return {
 				create,
