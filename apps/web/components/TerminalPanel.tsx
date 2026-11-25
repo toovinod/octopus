@@ -44,11 +44,19 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 		setSelected(opened.id);
 	};
 
-	const close = (terminalId: string) => {
-		void callDaemon((daemon) => daemon.closeTerminal({ terminalId }));
+	// The tab stays when the daemon could not close the shell, so it can still be reached and closed again.
+	const close = async (terminalId: string) => {
+		const closed = await callDaemon((daemon) => daemon.closeTerminal({ terminalId })).then(
+			() => true,
+			(error: unknown) => {
+				toast(errorMessage(error));
+				return false;
+			},
+		);
+		if (!closed) return;
 		const rest = terminals.filter((terminal) => terminal.id !== terminalId);
-		setTerminals(rest);
-		if (selected === terminalId) setSelected(rest.at(-1)?.id ?? null);
+		setTerminals((current) => current.filter((terminal) => terminal.id !== terminalId));
+		setSelected((current) => (current === terminalId ? (rest.at(-1)?.id ?? null) : current));
 	};
 
 	return (
@@ -74,7 +82,7 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 							variant="ghost"
 							size="icon-xs"
 							aria-label="Close terminal"
-							onClick={() => close(terminal.id)}
+							onClick={() => void close(terminal.id)}
 							className="size-4 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
 						>
 							<XIcon />
