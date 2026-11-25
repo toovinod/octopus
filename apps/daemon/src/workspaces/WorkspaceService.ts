@@ -367,7 +367,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					.query((db) =>
 						db.select().from(workspace).where(eq(workspace.projectId, projectId)).orderBy(asc(workspace.createdAt)),
 					)
-					.pipe(Effect.flatMap((rows) => Effect.forEach(rows, withForkState, { concurrency: "unbounded" })));
+					// Each active workspace runs a few git commands, so a long list does not start them all at once.
+					.pipe(Effect.flatMap((rows) => Effect.forEach(rows, withForkState, { concurrency: 8 })));
 
 			const cancelScripts = Effect.fn("WorkspaceService.cancelScripts")(function* (
 				workspaceId: string,
@@ -484,7 +485,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				function* (workspaceId: string) {
 					const current = yield* get(workspaceId);
 					if (current.status === "active") {
-						return current;
+						return yield* withForkState(current);
 					}
 					if (yield* isPathActive(current.path)) {
 						return yield* new WorkspacePathInUseError({ path: current.path });

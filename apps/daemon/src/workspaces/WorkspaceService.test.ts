@@ -948,6 +948,23 @@ describe("WorkspaceService", () => {
 });
 
 describe("WorkspaceService.unarchive", () => {
+	test("returns an active workspace as it is now, as on a fork's branch checked out since", async () => {
+		const restored = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				// What `gh pr checkout` leaves for a fork's pull request that keeps maintainers out.
+				yield* runGit(project.path, ["remote", "add", "origin", "https://example.com/owner/app.git"]);
+				yield* runGit(project.path, ["checkout", "-b", "pr-7-feature"]);
+				yield* runGit(project.path, ["config", "branch.pr-7-feature.remote", "origin"]);
+				yield* runGit(project.path, ["config", "branch.pr-7-feature.merge", "refs/pull/7/head"]);
+				return yield* workspaces.unarchive(created.id);
+			}),
+		);
+		expect(restored).toMatchObject({ status: "active", fromFork: true });
+	});
+
 	test("brings back a force-archived worktree with its stashed changes", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
