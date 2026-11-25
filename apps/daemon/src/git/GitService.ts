@@ -3,6 +3,7 @@ import {
 	CommitFailedError,
 	CommitResult,
 	DiffFile,
+	type DiffHunk,
 	GitStatus,
 	NoRemoteError,
 	NothingToCommitError,
@@ -32,6 +33,7 @@ import {
 	parseNameStatus,
 	parseNumstat,
 	parsePatch,
+	parseTypeChanges,
 	parseStatus,
 	untrackedHunks,
 } from "./parseGitOutput.ts";
@@ -242,14 +244,23 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 							),
 						]);
 			const sections = parsePatch(patch);
-			if (sections.length !== fitting.length) {
+			const typeChanges = parseTypeChanges(nameStatus);
+			const expected = fitting.length + fitting.filter(({ changed }) => typeChanges.has(changed.path)).length;
+			if (sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
 				);
 			}
-			const hunksByPath = new Map(
-				sections.length === fitting.length ? fitting.map((file, index) => [file.changed.path, sections[index]]) : [],
-			);
+			// Sections come in the files' order, and a type change takes two of them.
+			const hunksByPath = new Map<string, { readonly hunks: ReadonlyArray<DiffHunk> }>();
+			if (sections.length === expected) {
+				let next = 0;
+				for (const { changed } of fitting) {
+					const parts = sections.slice(next, next + (typeChanges.has(changed.path) ? 2 : 1));
+					next += parts.length;
+					hunksByPath.set(changed.path, { hunks: parts.flatMap((part) => part.hunks) });
+				}
+			}
 
 			const toDiffFile = ({ changed, count }: { changed: ChangedPath; count: LineCounts }) => {
 				const section = hunksByPath.get(changed.path);

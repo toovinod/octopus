@@ -40,6 +40,19 @@ export const parseNameStatus = (output: string): ReadonlyArray<ChangedPath> => {
 	return changed;
 };
 
+// The paths of `git diff --name-status -z` whose type changed, as from a file to a symlink. The patch shows
+// each of them as two sections: the old file deleted, then the new one added.
+export const parseTypeChanges = (output: string): ReadonlySet<string> => {
+	const tokens = output.split("\0").filter((token) => token !== "");
+	const changed = new Set<string>();
+	for (let index = 0; index < tokens.length; ) {
+		const letter = tokens[index]?.charAt(0) ?? "";
+		if (letter === "T") changed.add(tokens[index + 1] ?? "");
+		index += letter === "R" || letter === "C" ? 3 : 2;
+	}
+	return changed;
+};
+
 export interface LineCounts {
 	readonly additions: number;
 	readonly deletions: number;

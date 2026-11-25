@@ -124,6 +124,38 @@ describe("GitService diff", () => {
 		]);
 	});
 
+	test("keeps every file's hunks when one file became a symlink", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const repositoryPath = join(tempDir, "repo");
+				yield* makeTestRepository(repositoryPath);
+				for (const name of ["a.txt", "b.txt", "c.txt"]) {
+					yield* fs.writeFileString(join(repositoryPath, name), `${name}\n`);
+				}
+				yield* runGit(repositoryPath, ["add", "."]);
+				yield* runGit(repositoryPath, ["commit", "-m", "base"]);
+				const created = yield* createWorkspace(tempDir);
+				yield* fs.writeFileString(join(created.path, "a.txt"), "a edited\n");
+				yield* fs.remove(join(created.path, "b.txt"));
+				yield* fs.symlink("a.txt", join(created.path, "b.txt"));
+				yield* fs.writeFileString(join(created.path, "c.txt"), "c edited\n");
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		expect(diff.files.map((file) => [file.path, file.content.kind])).toEqual([
+			["a.txt", "text"],
+			["b.txt", "text"],
+			["c.txt", "text"],
+		]);
+		const symlink = diff.files.find((file) => file.path === "b.txt");
+		const lines = symlink?.content.kind === "text" ? symlink.content.hunks.flatMap((hunk) => hunk.lines) : [];
+		expect(lines.map((line) => [line.kind, line.text])).toEqual([
+			["delete", "b.txt"],
+			["add", "a.txt"],
+		]);
+	});
+
 	test("includes commits made in the workspace since it left the base branch", async () => {
 		const diff = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
