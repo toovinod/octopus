@@ -34,6 +34,7 @@ import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
 import type { Project } from "@repo/contracts/Project";
 import { and, asc, eq, inArray } from "drizzle-orm";
+import { basename, dirname, join } from "node:path";
 import { WorkspaceLock } from "./WorkspaceLock.ts";
 import type { SecureRandom } from "effect/crypto";
 import { CappedOutput } from "./CappedOutput.ts";
@@ -41,7 +42,6 @@ import { runRunScript } from "./runRunScript.ts";
 import { nowIso } from "../database/nowIso.ts";
 import { newId } from "../database/newId.ts";
 import { runGit } from "../git/runGit.ts";
-import { join } from "node:path";
 
 type WorkspaceRow = typeof workspace.$inferSelect;
 type ScriptRunRow = typeof scriptRun.$inferInsert;
@@ -781,6 +781,34 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				}
 			});
 			yield* recoverScriptRuns.pipe(Effect.provide(services));
+
+			// A crash between adding a worktree and saving its workspace leaves a folder that no workspace owns and
+			// that blocks its name. Nothing ran in it yet, so it goes. Its branch stays, in case it holds commits.
+			const pruneOrphanWorktrees = Effect.gen(function* () {
+				const owned = yield* database.query((db) =>
+					db
+						.select({ path: workspace.path })
+						.from(workspace)
+						.where(and(eq(workspace.kind, "worktree"), eq(workspace.status, "active"))),
+				);
+				const ownedPaths = new Set(owned.map((row) => row.path));
+				for (const owner of yield* projects.list) {
+					const folder = join(worktreesDir, owner.id);
+					if (!(yield* fs.exists(folder))) continue;
+					const realFolder = yield* fs.realPath(folder);
+					const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
+					for (const line of listed.split("\n")) {
+						if (!line.startsWith("worktree ")) continue;
+						const path = line.slice("worktree ".length);
+						if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
+						// Rows hold the path Octopus made, which git may list with symlinks resolved.
+						if (ownedPaths.has(join(folder, basename(path)))) continue;
+						yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
+						yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
+					}
+				}
+			}).pipe(Effect.catch((cause) => Effect.logError("Could not look for worktrees that no workspace owns", cause)));
+			yield* pruneOrphanWorktrees.pipe(Effect.provide(services));
 
 			return {
 				create,

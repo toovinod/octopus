@@ -562,6 +562,35 @@ describe("WorkspaceService", () => {
 		});
 	});
 
+	test("on startup, removes a worktree folder that no workspace owns and keeps its branch", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const dataDir = join(tempDir, "data");
+				// First lifetime: one workspace, and a folder a crash left before its workspace was saved.
+				const { project, created, orphan } = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const project = yield* addProject(tempDir);
+						const created = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
+							workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" }),
+						);
+						const orphan = join(dataDir, "worktrees", project.id, "orphan");
+						yield* runGit(project.path, ["worktree", "add", "-q", "-b", "orphan", orphan]);
+						return { project, created, orphan };
+					}),
+				);
+				// Second lifetime: startup finds the orphan.
+				yield* withServices(dataDir)(Effect.void);
+				return {
+					orphanExists: yield* fs.exists(orphan),
+					ownedExists: yield* fs.exists(created.path),
+					orphanBranch: yield* branchExists(project.path, "orphan"),
+				};
+			}),
+		);
+		expect(result).toEqual({ orphanExists: false, ownedExists: true, orphanBranch: true });
+	});
+
 	test("removes the new worktree and branch when the workspace cannot be saved", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
