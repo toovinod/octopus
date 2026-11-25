@@ -268,6 +268,32 @@ esac`,
 		expect(result).toEqual({ reused: true, derived: true, own: false });
 	});
 
+	test("removes the new worktree when its branch cannot be marked as a fork's", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const project = yield* addProject(tempDir);
+				yield* runGit(project.path, ["branch", "pr-9-main"]);
+				yield* runGit(project.path, ["config", "--type=bool", "branch.pr-9-main.octopusFromFork", "true"]);
+				// A held lock makes git refuse to write the config.
+				yield* fs.writeFileString(join(project.path, ".git", "config.lock"), "");
+				const workspaces = yield* WorkspaceService;
+				const error = yield* Effect.flip(
+					workspaces.create({ kind: "worktree", projectId: project.id, name: "derived", baseBranch: "pr-9-main" }),
+				);
+				yield* fs.remove(join(project.path, ".git", "config.lock"));
+				return {
+					error: error._tag,
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+					rows: yield* workspaces.list(project.id),
+				};
+			}),
+		);
+		expect(result.error).toBe("GitCommandError");
+		expect(result.worktrees).not.toContain("derived");
+		expect(result.rows).toEqual([]);
+	});
+
 	test("removes the worktree when gh cannot check out the pull request", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

@@ -266,7 +266,6 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					}
 					yield* makeWorktreesDir;
 					yield* plan.add(path);
-					if (plan.fromFork) yield* markForkBranch(owner.path, plan.branch);
 					row = {
 						...base,
 						name: plan.branch,
@@ -290,7 +289,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					};
 				}
 
-				yield* insertWorkspace(row, setupRun).pipe(
+				// Marked under the same undo as the insert, so a failed mark leaves no unmarked worktree behind.
+				yield* (row.fromFork ? markForkBranch(owner.path, row.branch) : Effect.void).pipe(
+					Effect.andThen(insertWorkspace(row, setupRun)),
 					Effect.flatMap((inserted) =>
 						inserted ? Effect.void : Effect.fail(new WorkspacePathInUseError({ path: row.path })),
 					),
