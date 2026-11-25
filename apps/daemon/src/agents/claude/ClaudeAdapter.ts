@@ -10,8 +10,16 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
+import type {
+	CanUseTool,
+	Options,
+	PermissionResult,
+	PermissionMode,
+	PermissionUpdate,
+	SDKUserMessage,
+	SpawnOptions,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
-	Config,
 	Context,
 	Deferred,
 	Effect,
@@ -28,15 +36,6 @@ import {
 	Scope,
 	Stream,
 } from "effect";
-import type {
-	CanUseTool,
-	Options,
-	PermissionResult,
-	PermissionMode,
-	PermissionUpdate,
-	SDKUserMessage,
-	SpawnOptions,
-} from "@anthropic-ai/claude-agent-sdk";
 import {
 	type AgentCapabilities,
 	type AgentMode,
@@ -135,45 +134,8 @@ const models: AgentModels = {
 	defaultModel: "claude-opus-5-5",
 };
 
-// The SDK replaces the whole child environment when `env` is set, so API key mode passes
-// these through explicitly. Subscription mode leaves `env` unset and inherits everything but API credentials.
-// Proxies and extra CA certificates keep claude working on corporate networks, and the config
-// folders keep it reading the user's own settings.
-const inheritedVariables = [
-	"PATH",
-	"HOME",
-	"USER",
-	"SHELL",
-	"TMPDIR",
-	"LANG",
-	"TERM",
-	"HTTPS_PROXY",
-	"HTTP_PROXY",
-	"NO_PROXY",
-	"https_proxy",
-	"http_proxy",
-	"no_proxy",
-	"NODE_EXTRA_CA_CERTS",
-	"CLAUDE_CONFIG_DIR",
-	"XDG_CONFIG_HOME",
-	"XDG_DATA_HOME",
-	"XDG_STATE_HOME",
-	"XDG_CACHE_HOME",
-	"XDG_RUNTIME_DIR",
-];
-
-const apiKeyEnvironment = Effect.fnUntraced(function* (apiKey: Redacted.Redacted<string>) {
-	const env: Record<string, string> = {};
-	for (const name of inheritedVariables) {
-		const value = yield* Config.option(Config.String(name));
-		if (Option.isSome(value)) env[name] = value.value;
-	}
-	env.ANTHROPIC_API_KEY = Redacted.value(apiKey);
-	return env;
-});
-
 // A key or token in the shell that started Octopus would make claude bill the API instead of the
-// subscription. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
+// subscription, or bill another key than the one stored for Octopus. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
 const apiCredentials = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
 const withoutApiCredentials = ({
 	ANTHROPIC_API_KEY: _key,
@@ -734,21 +696,17 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
-						const child = spawnInProcessGroup(
-							input.auth.mode === "subscription"
-								? { ...spawnOptions, env: withoutApiCredentials(spawnOptions.env) }
-								: spawnOptions,
-						);
+						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
+						const env = withoutApiCredentials(spawnOptions.env);
+						const child = spawnInProcessGroup({
+							...spawnOptions,
+							env:
+								input.auth.mode === "apiKey" ? { ...env, ANTHROPIC_API_KEY: Redacted.value(input.auth.apiKey) } : env,
+						});
 						claudePid = child.pid;
 						if (child.pid !== undefined) Effect.runForkWith(context)(registry.add(child.pid));
 						return child;
 					},
-					...(input.auth.mode === "apiKey"
-						? {
-								// An optional plain string cannot fail to decode, so a ConfigError here is a defect.
-								env: yield* Effect.orDie(apiKeyEnvironment(input.auth.apiKey)),
-							}
-						: {}),
 				};
 
 				const run = yield* Effect.acquireRelease(

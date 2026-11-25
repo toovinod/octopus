@@ -5,8 +5,8 @@ import type {
 	PermissionUpdate,
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { ConfigProvider, Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
+import { Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
 import { TurnWatchdogSettings } from "../makeAgentSession.ts";
@@ -368,14 +368,13 @@ const runSession = <A, E>(
 	options: {
 		input?: StartSessionInput;
 		permissions?: Array<PermissionResult>;
-		configProvider?: ConfigProvider.ConfigProvider;
 	} = {},
 ) =>
 	runWithClaude(
 		Effect.gen(function* () {
 			const claude = yield* ClaudeAdapter;
 			return yield* program(yield* claude.startSession(options.input ?? newSession));
-		}).pipe(Effect.scoped, Effect.provide(ConfigProvider.layer(options.configProvider ?? ConfigProvider.fromEnv()))),
+		}).pipe(Effect.scoped),
 		options.permissions,
 	);
 
@@ -767,23 +766,33 @@ describe("ClaudeAdapter", () => {
 		expect(permissions).toMatchObject([{ behavior: "deny" }]);
 	});
 
-	test("API key mode passes proxy, certificate and config folder variables to claude", async () => {
-		const env = {
-			PATH: "/bin",
-			HTTPS_PROXY: "http://proxy:8080",
-			HTTP_PROXY: "http://proxy:8080",
-			NO_PROXY: "localhost",
-			NODE_EXTRA_CA_CERTS: "/certs/corp.pem",
-			CLAUDE_CONFIG_DIR: "/home/dev/.claude-work",
-			XDG_CONFIG_HOME: "/home/dev/.config",
-			UNRELATED_SECRET: "keep out",
-		};
-		await runSession(() => Effect.void, {
-			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
-			configProvider: ConfigProvider.fromEnv({ env }),
-		});
-		const { UNRELATED_SECRET: _, ...passed } = env;
-		expect(startedWith.at(-1)?.env).toEqual({ ...passed, ANTHROPIC_API_KEY: "sk-test" });
+	test("API key mode hands claude the whole environment with its own key in place of any other", async () => {
+		const printed = await runSession(
+			() =>
+				Effect.promise(async () => {
+					const spawnClaude = startedWith.at(-1)?.spawnClaudeCodeProcess;
+					if (spawnClaude === undefined) return "no spawn hook";
+					const child = spawnClaude({
+						command: "sh",
+						args: ["-c", 'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$SSH_AUTH_SOCK"'],
+						cwd: "/",
+						env: {
+							PATH: "/bin:/usr/bin",
+							ANTHROPIC_API_KEY: "sk-shell",
+							ANTHROPIC_AUTH_TOKEN: "tok",
+							SSH_AUTH_SOCK: "/tmp/agent",
+						},
+						signal: new AbortController().signal,
+					});
+					let text = "";
+					for await (const chunk of child.stdout) text += String(chunk);
+					return text;
+				}),
+			{ input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } } },
+		);
+		expect(printed).toBe("sk-test||/tmp/agent");
+		// Left unset, the SDK passes claude the daemon's whole environment.
+		expect(startedWith.at(-1)?.env).toBeUndefined();
 	});
 
 	test.each(["bad key", "revoked"])("a refused credential (%s) ends the session with an auth error", async (text) => {
