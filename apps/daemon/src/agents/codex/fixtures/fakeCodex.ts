@@ -324,6 +324,10 @@ const serve = async () => {
 					id: message.id,
 					result: { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.example/login" },
 				});
+				if (Bun.argv[1]?.endsWith("abandonedLoginCodex.ts")) {
+					setTimeout(() => process.exit(0), 50);
+					break;
+				}
 				setTimeout(
 					() =>
 						notify(

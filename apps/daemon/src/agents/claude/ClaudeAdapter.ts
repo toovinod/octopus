@@ -532,9 +532,12 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					Effect.onError(() => closeScope),
 				);
 				const stoppedEarly = exited.pipe(
+					// Built once claude has stopped, so the error carries what it printed.
 					Effect.andThen(
-						Effect.fail(
-							new AgentProcessError({ message: "claude stopped before it showed a sign-in link.", cause: printed }),
+						Effect.suspend(() =>
+							Effect.fail(
+								new AgentProcessError({ message: "claude stopped before it showed a sign-in link.", cause: printed }),
+							),
 						),
 					),
 				);
@@ -550,15 +553,19 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				// claude must keep running after this call, or the browser sign-in has nothing to return to.
 				yield* Ref.set(loginTerminal, Option.some(terminal)).pipe(
 					Effect.andThen(exited),
+					// A sign-in the user never finishes also ends, so watchers are not left waiting.
+					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.flatMap((code) =>
 						Effect.gen(function* () {
-							if (code !== 0) {
-								yield* Effect.logWarning("Claude sign-in failed").pipe(Effect.annotateLogs({ code }));
+							const success = Option.isSome(code) && code.value === 0;
+							if (!success) {
+								yield* Effect.logWarning("Claude sign-in failed").pipe(
+									Effect.annotateLogs({ code: Option.getOrNull(code) }),
+								);
 							}
-							yield* PubSub.publish(loginResults, { success: code === 0 });
+							yield* PubSub.publish(loginResults, { success });
 						}),
 					),
-					Effect.timeoutOption(LOGIN_TIMEOUT),
 					Effect.ensuring(
 						Ref.update(loginTerminal, (current) =>
 							Option.isSome(current) && current.value === terminal ? Option.none() : current,

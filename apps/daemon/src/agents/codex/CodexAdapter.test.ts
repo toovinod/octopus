@@ -66,6 +66,7 @@ describe("CodexAdapter", () => {
 	test.each([
 		["fakeCodex.ts", { success: true, error: null }],
 		["failedLoginCodex.ts", { success: false, error: "The sign-in was cancelled." }],
+		["abandonedLoginCodex.ts", { success: false, error: "The sign-in did not finish." }],
 	])("reports how the ChatGPT sign-in through %s ended", async (fixture, expected) => {
 		const result = await runWithCodex(
 			Effect.gen(function* () {

@@ -453,6 +453,15 @@ describe("ClaudeAdapter", () => {
 			expect(results).toEqual([{ success }]);
 		});
 
+		test("a claude that stops before showing a link reports what it printed", async () => {
+			const error = await runWithClaude(
+				Effect.flatMap(ClaudeAdapter, (claude) => Effect.flip(claude.startLogin)),
+				[],
+				`${import.meta.dir}/fixtures/brokenLoginClaude.ts`,
+			);
+			expect(error).toMatchObject({ _tag: "AgentProcessError", cause: expect.stringContaining("Raw mode") });
+		});
+
 		test("a code with no sign-in waiting for it is refused", async () => {
 			const error = await login((claude) => Effect.flip(claude.submitLoginCode("good-code")));
 			expect(error._tag).toBe("LoginNotPendingError");

@@ -590,7 +590,17 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					Stream.filter((message) => message._tag === "notification" && message.method === "account/login/completed"),
 					Stream.take(1),
 					Stream.mapEffect((message) => decodeCodex(LoginCompleted)(message.params)),
-					Stream.runForEach((result) =>
+					Stream.runHead,
+					Effect.timeoutOption(LOGIN_TIMEOUT),
+					Effect.map(Option.flatten),
+					Effect.catch((error) =>
+						Effect.logWarning("Codex sign-in stopped", error).pipe(Effect.as(Option.none<LoginCompleted>())),
+					),
+					// A sign-in that times out or whose app-server exits also ends, so watchers are not left waiting.
+					Effect.map(
+						Option.getOrElse((): LoginCompleted => ({ success: false, error: "The sign-in did not finish." })),
+					),
+					Effect.flatMap((result) =>
 						Effect.gen(function* () {
 							if (!result.success) {
 								yield* Effect.logWarning("Codex sign-in failed").pipe(Effect.annotateLogs({ error: result.error }));
@@ -598,8 +608,6 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							yield* PubSub.publish(loginResults, result);
 						}),
 					),
-					Effect.timeoutOption(LOGIN_TIMEOUT),
-					Effect.catch((error) => Effect.logWarning("Codex sign-in stopped", error)),
 					Effect.ensuring(Scope.close(scope, Exit.void)),
 					FiberHandle.run(pendingLogin),
 				);
