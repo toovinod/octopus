@@ -399,7 +399,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						if (yield* fs.exists(current.path).pipe(Effect.orDie)) {
 							const refuseUnsaved = Effect.fnUntraced(function* () {
 								const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
-								const hasUnsaved = unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0;
+								const hasUnsaved =
+									unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0 || unsaved.ignoredFiles.length > 0;
 								if (hasUnsaved && !options.force) {
 									return yield* new WorkspaceHasUnsavedWorkError({
 										workspaceId,

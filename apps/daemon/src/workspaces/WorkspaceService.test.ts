@@ -195,6 +195,7 @@ describe("WorkspaceService", () => {
 		expect(result.refused).toMatchObject({
 			changedFiles: ["README.md", "new.txt"],
 			unpushedCommits: 0,
+			ignoredFiles: [],
 		});
 		expect(result.stillThere).toBe(true);
 		expect(result.terminalsAfterRefusal).toBe(1);
@@ -283,6 +284,54 @@ describe("WorkspaceService", () => {
 		);
 		expect(result.refused._tag).toBe("WorkspaceHasUnsavedWorkError");
 		expect(result.archived.status).toBe("archived");
+	});
+
+	test("refuses to archive ignored files such as .env, but not installed dependencies, unless forced", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), ".env\nnode_modules/\n");
+				yield* runGit(project.path, ["add", ".gitignore"]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, ".env"), "SECRET=1\n");
+				yield* fs.makeDirectory(join(created.path, "node_modules"));
+				yield* fs.writeFileString(join(created.path, "node_modules", "lib.js"), "installed\n");
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				const archived = yield* workspaces.archive(created.id, { force: true });
+				return { refused, archived, folderExists: yield* fs.exists(created.path) };
+			}),
+		);
+		expect(result.refused).toMatchObject({
+			_tag: "WorkspaceHasUnsavedWorkError",
+			changedFiles: [],
+			unpushedCommits: 0,
+			ignoredFiles: [".env"],
+		});
+		expect(result.archived.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
+	});
+
+	test("archives a worktree with an initialized submodule", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const library = yield* makeTestRepository(join(tempDir, "library"));
+				const allowFile = ["-c", "protocol.file.allow=always"];
+				yield* runGit(project.path, [...allowFile, "submodule", "add", "-q", library, "library"]);
+				yield* runGit(project.path, ["commit", "-m", "add library"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, [...allowFile, "submodule", "update", "-q", "--init"]);
+				const archived = yield* workspaces.archive(created.id, { force: false });
+				return { archived, folderExists: yield* fs.exists(created.path) };
+			}),
+		);
+		expect(result.archived.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
 	});
 
 	test("archiving an in-place workspace removes nothing", async () => {
