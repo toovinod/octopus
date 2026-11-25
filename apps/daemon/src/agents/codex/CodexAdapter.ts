@@ -111,21 +111,30 @@ const codexDecisions = {
 	cancelled: "cancel",
 } as const satisfies Record<ApprovalOutcome, CommandExecutionApprovalDecision>;
 
+// A rewritten lockfile or generated file can be megabytes. Each diff and each event keep only their start,
+// so one change cannot fill the database or a chat's live buffer.
+const MAX_DIFF_CHARS = 50_000;
+const MAX_EVENT_DIFF_CHARS = 200_000;
+
+const capDiff = (diff: string, limit: number) =>
+	diff.length > limit ? `${diff.slice(0, limit)}\n... (diff cut, ${diff.length - limit} more characters)` : diff;
+
 const toToolCall = (item: ThreadItem): ToolCall | undefined => {
 	switch (item.type) {
 		case "commandExecution":
 			return "command" in item ? { kind: "command", command: item.command, cwd: item.cwd } : undefined;
-		case "fileChange":
-			return "changes" in item
-				? {
-						kind: "fileChange",
-						changes: item.changes.map((change) => ({
-							path: change.path,
-							kind: change.kind.type,
-							diff: change.diff,
-						})),
-					}
-				: undefined;
+		case "fileChange": {
+			if (!("changes" in item)) return undefined;
+			let budget = MAX_EVENT_DIFF_CHARS;
+			return {
+				kind: "fileChange",
+				changes: item.changes.map((change) => {
+					const limit = Math.min(MAX_DIFF_CHARS, budget);
+					budget -= Math.min(change.diff.length, limit);
+					return { path: change.path, kind: change.kind.type, diff: capDiff(change.diff, limit) };
+				}),
+			};
+		}
 		case "mcpToolCall":
 			return "server" in item ? { kind: "mcpCall", server: item.server, tool: item.tool } : undefined;
 		default:

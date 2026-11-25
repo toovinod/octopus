@@ -165,6 +165,23 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-1", result: { status: "completed" } });
 	});
 
+	test("cuts huge diffs, each and per event, with a marker", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("big diff"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		const tool = events.find((event) => event.type === "tool.completed");
+		const diffs =
+			tool?.type === "tool.completed" && tool.tool.kind === "fileChange"
+				? tool.tool.changes.map((change) => change.diff)
+				: [];
+		expect(diffs.map((diff) => diff.replace(/^\++/, "").length > 0)).toEqual([true, true, true, true, true]);
+		expect(diffs.reduce((total, diff) => total + diff.length, 0)).toBeLessThan(201_000);
+		expect(diffs[0]).toEndWith("(diff cut, 100000 more characters)");
+	});
+
 	test("round-trips a command approval", async () => {
 		const [requested, rest] = await runSession((handle) =>
 			Effect.gen(function* () {

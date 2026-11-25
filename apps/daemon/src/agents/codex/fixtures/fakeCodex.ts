@@ -175,6 +175,18 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("big diff")) {
+		// A rewritten lockfile: diffs far bigger than a chat should hold.
+		const change = (path: string) => ({ path, kind: { type: "update", move_path: null }, diff: "+".repeat(150_000) });
+		const item = {
+			type: "fileChange",
+			id: "patch-1",
+			changes: ["a.lock", "b.lock", "c.lock", "d.lock", "e.lock"].map(change),
+			status: "completed",
+		};
+		notify("item/completed", { item, threadId, turnId });
+		return completeTurn("completed");
+	}
 	if (text.includes("long command")) {
 		// Octopus shows only the finished output, but each streamed chunk proves the command is alive.
 		notify("item/started", { item: command, threadId, turnId });
