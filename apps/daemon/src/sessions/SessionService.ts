@@ -291,6 +291,37 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const publish = (event: SessionEvent) =>
 			PubSub.publish(events, { event, bytes: Buffer.byteLength(JSON.stringify(event.event)) });
 
+		// The sequence the next stored event of a session takes.
+		const nextSequenceOf = Effect.fnUntraced(function* (sessionId: string) {
+			const [stored] = yield* database.query((db) =>
+				db
+					.select({ last: max(sessionEvent.sequence) })
+					.from(sessionEvent)
+					.where(eq(sessionEvent.sessionId, sessionId)),
+			);
+			return (stored?.last ?? -1) + 1;
+		});
+
+		// Stores events at consecutive sequences from first.
+		const insertEvents = Effect.fnUntraced(function* (
+			sessionId: string,
+			first: number,
+			events: ReadonlyArray<AgentEvent>,
+			createdAt: string,
+		) {
+			const values = yield* Effect.forEach(events, (event, index) =>
+				Effect.map(newId, (id) => ({
+					id,
+					sessionId,
+					sequence: first + index,
+					type: event.type,
+					payload: event,
+					createdAt,
+				})),
+			);
+			yield* database.query((db) => db.insert(sessionEvent).values(values));
+		}, Effect.provide(services));
+
 		// Stored events are written before they are published, so a subscriber never misses one.
 		const record = Effect.fnUntraced(function* (runtime: Runtime, event: AgentEvent) {
 			const { sessionId } = runtime;
@@ -299,10 +330,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				return yield* publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
 			}
 			const sequence = runtime.nextSequence;
-			const id = yield* newId;
-			yield* database.query((db) =>
-				db.insert(sessionEvent).values({ id, sessionId, sequence, type: event.type, payload: event, createdAt }),
-			);
+			yield* insertEvents(sessionId, sequence, [event], createdAt);
 			runtime.nextSequence++;
 			yield* publish(new SessionEvent({ sessionId, sequence, event, createdAt }));
 			switch (event.type) {
@@ -535,12 +563,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						...(row.nativeSessionId === null ? {} : { resumeId: row.nativeSessionId }),
 					})
 					.pipe(Scope.provide(scope), Effect.mapError(toUnavailable(row.agent)));
-				const [stored] = yield* database.query((db) =>
-					db
-						.select({ last: max(sessionEvent.sequence) })
-						.from(sessionEvent)
-						.where(eq(sessionEvent.sessionId, row.id)),
-				);
+				const nextSequence = yield* nextSequenceOf(row.id);
 				const created: Runtime = {
 					sessionId: row.id,
 					workspaceId: row.workspaceId,
@@ -550,7 +573,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					done: yield* Deferred.make<void>(),
 					ending: false,
 					idleSince: clock.currentTimeNanosUnsafe(),
-					nextSequence: (stored?.last ?? -1) + 1,
+					nextSequence,
 					outstanding: 0,
 					unsent: [],
 					approvals: new Map(),
@@ -1193,25 +1216,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				...open.values(),
 				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
 			];
-			const [stored] = yield* database.query((db) =>
-				db
-					.select({ last: max(sessionEvent.sequence) })
-					.from(sessionEvent)
-					.where(eq(sessionEvent.sessionId, sessionId)),
-			);
-			const first = (stored?.last ?? -1) + 1;
-			const createdAt = yield* nowIso;
-			const values = yield* Effect.forEach(closing, (event, index) =>
-				Effect.map(newId, (id) => ({
-					id,
-					sessionId,
-					sequence: first + index,
-					type: event.type,
-					payload: event,
-					createdAt,
-				})),
-			);
-			yield* database.query((db) => db.insert(sessionEvent).values(values));
+			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso);
 		}, Effect.provide(services));
 
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
