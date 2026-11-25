@@ -1,10 +1,25 @@
 import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import type { AgentSession } from "@repo/contracts/AgentSession";
+import { errorMessage, errorTag } from "./errorMessage.ts";
+import { draftOf, keepDraft } from "./drafts.ts";
 import type { Follow } from "./daemonRuntime.ts";
+import { toast as sonnerToast } from "sonner";
 import { Predicate } from "effect";
 
 const project = { id: "p", name: "app", path: "/app", defaultBranch: "main", trusted: false };
 const workspace = { id: "w", projectId: "p", status: "active", kind: "worktree", name: "fix", path: "/app-fix" };
-const session = { id: "s", workspaceId: "w", agent: "claude", status: "idle", createdAt: "1", updatedAt: "1" };
+const session = {
+	id: "s",
+	workspaceId: "w",
+	agent: "claude",
+	status: "idle",
+	model: "replay",
+	effort: null,
+	mode: "default",
+	title: null,
+	createdAt: "1",
+	updatedAt: "1",
+};
 
 const drop = { _tag: "RpcClientError", message: "SocketCloseError: closed" };
 const internal = { _tag: "DaemonInternalError", message: "Octopus could not list chats." };
@@ -19,19 +34,46 @@ let agentLists = 0;
 // Every stream the store follows, newest last.
 const follows: Array<{ readonly name: string; readonly handlers: Follow<unknown> }> = [];
 
+// Each settings or rename call waits for the test to settle it.
+let settleUpdate: (outcome: unknown) => void = () => {};
+const pendingUpdate = () =>
+	new Promise((resolve, reject) => {
+		settleUpdate = (outcome) => (Predicate.hasProperty(outcome, "_tag") ? reject(outcome) : resolve(outcome));
+	});
+
+interface HistoryRequest {
+	readonly sessionId: string;
+	readonly beforeSequence: number | null;
+}
+// Answers loadSessionHistory. Tests that change it put it back.
+let history: (request: HistoryRequest) => unknown = () => [];
+const historyCalls: Array<string> = [];
+// Each listSessions call takes the next of these, and lists the one session once they run out.
+const sessionLists: Array<Array<unknown>> = [];
+const userMessage = (sequence: number) => ({
+	sequence,
+	event: { type: "user.message", itemId: `u${sequence}`, text: "hi", attachments: [] },
+});
+
 const daemon = {
+	updateSessionSettings: pendingUpdate,
+	renameSession: pendingUpdate,
 	listProjects: () => {
 		listCalls++;
 		const failure = listFailures.shift();
 		return failure === undefined ? [project] : Promise.reject(failure);
 	},
 	listWorkspaces: () => [workspace],
-	listSessions: () => [session],
+	listSessions: () => sessionLists.shift() ?? [session],
 	listAgents: () => {
 		agentLists++;
-		return [];
+		return [{ kind: "claude", availability: { status: "ready" }, defaultModel: "replay", models: [{ id: "replay" }] }];
 	},
-	loadSessionHistory: () => [],
+	createSession: pendingUpdate,
+	loadSessionHistory: (request: HistoryRequest) => {
+		historyCalls.push(`${request.sessionId}:${request.beforeSequence}`);
+		return history(request);
+	},
 	removeProject: () => undefined,
 	revertToMessage: () => [{ path: "README.md", change: "modified" }],
 	sendMessage: ({ text }: { readonly text: string }) => {
@@ -55,10 +97,9 @@ mock.module("./daemonRuntime.ts", () => ({
 		});
 		return () => {};
 	},
-	errorMessage: (error: { readonly message: string }) => error.message,
-	// mock.module replaces the module for every test file in the run, so this must behave like the real one.
-	errorTag: (error: unknown) =>
-		Predicate.hasProperty(error, "_tag") && Predicate.isString(error._tag) ? error._tag : null,
+	// mock.module replaces the module for every test file in the run, so these must be the real ones.
+	errorMessage,
+	errorTag,
 }));
 
 const {
@@ -67,11 +108,17 @@ const {
 	failedSendsOf,
 	getState,
 	isConnectionDrop,
+	loadOlderEvents,
+	newChat,
 	reconnectDelay,
 	removeProject,
 	retryFailedSend,
+	renameSession,
 	revertToMessage,
+	selectSession,
 	sendMessage,
+	updateSessionSettings,
+	workingChats,
 } = await import("./store.ts");
 
 // After the import, since sonner skips injecting its styles only when there is no document. boot sets the root font
@@ -168,7 +215,9 @@ describe("removing a project", () => {
 		expect(getState().selectedSessionId).toBe("s");
 		expect(getState().chat?.sessionId).toBe("s");
 
+		keepDraft("s", { text: "half a thought", images: [] });
 		expect(await removeProject("p")).toBe(true);
+		expect(draftOf("s").text).toBe("");
 		const state = getState();
 		expect(state.projects).toEqual({});
 		expect(state.workspaces).toEqual({});
@@ -189,5 +238,146 @@ describe("signing in", () => {
 		await sleep(0);
 		expect(watch).toBeDefined();
 		expect(agentLists).toBe(before + 1);
+	});
+});
+
+describe("session changes", () => {
+	const running = { ...session, status: "running", updatedAt: "3" };
+
+	test("a refused change undoes only its own fields, keeping a newer status", async () => {
+		await boot();
+		const change = updateSessionSettings("s", { mode: "plan" });
+		expect(getState().sessions.s?.mode).toBe("plan");
+		lastWatch()?.onItem(running);
+		settleUpdate({ _tag: "DaemonInternalError", message: "Octopus could not save the settings." });
+		await change;
+		expect(getState().sessions.s).toMatchObject({ status: "running", mode: "default" });
+	});
+
+	test("a reply older than a watch update does not step the session back", async () => {
+		await boot();
+		const rename = renameSession("s", "Fix the build");
+		lastWatch()?.onItem({ ...running, title: "Fix the build" });
+		settleUpdate({ ...session, status: "idle", title: "Fix the build", updatedAt: "2" });
+		await rename;
+		expect(getState().sessions.s).toMatchObject({ status: "running", title: "Fix the build" });
+	});
+});
+
+describe("workingChats", () => {
+	test("changes only when a chat in the workspace starts or stops working", () => {
+		const of = (
+			...sessions: ReadonlyArray<{ readonly status: AgentSession["status"]; readonly workspaceId?: string }>
+		) =>
+			workingChats(
+				sessions.map((changes, index) => ({ id: String(index), workspaceId: "w", ...changes })),
+				"w",
+			);
+		expect(of({ status: "idle" }, { status: "failed" })).toBe("");
+		expect(of({ status: "running" }, { status: "awaitingApproval" })).toBe("0 1");
+		expect(of({ status: "running", workspaceId: "other" })).toBe("");
+	});
+});
+
+describe("new chats", () => {
+	test("a chat that arrives after the user moved on does not take the selection", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, id: "t", createdAt: "2" });
+		const created = newChat("w");
+		selectSession("t");
+		settleUpdate({ ...session, id: "n", createdAt: "3" });
+		expect(await created).toBe("n");
+		expect(getState().selectedSessionId).toBe("t");
+		expect(getState().sessions.n).toBeDefined();
+	});
+
+	test("a chat that arrives while the selection stayed opens", async () => {
+		await boot();
+		await sleep(0);
+		const created = newChat("w");
+		settleUpdate({ ...session, id: "m", createdAt: "4" });
+		await created;
+		expect(getState().selectedSessionId).toBe("m");
+	});
+});
+
+const subscriptions = () => follows.filter((follow) => follow.name === "subscribeSession");
+
+describe("following the open chat", () => {
+	test("a dropped chat stream retries with a growing delay", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		await boot();
+		await sleep(0);
+		const before = subscriptions().length;
+		subscriptions().at(-1)?.handlers.onEnd?.(drop);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 1);
+		subscriptions().at(-1)?.handlers.onEnd?.(drop);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 1);
+		await sleep(300);
+		expect(subscriptions().length).toBe(before + 2);
+	});
+});
+
+describe("older history", () => {
+	test("an empty older page stops the chat asking again", async () => {
+		history = ({ beforeSequence }) => (beforeSequence === null ? [userMessage(5)] : []);
+		await boot();
+		lastWatch()?.onItem({ ...session, id: "h", createdAt: "2" });
+		selectSession("h");
+		await sleep(0);
+		historyCalls.length = 0;
+		await loadOlderEvents();
+		await loadOlderEvents();
+		expect(historyCalls).toEqual(["h:5"]);
+		expect(getState().chat?.firstSequence).toBe(0);
+		history = () => [];
+	});
+
+	test("a page still loading for the last chat does not hold up the next", async () => {
+		history = ({ sessionId, beforeSequence }) =>
+			beforeSequence === null ? [userMessage(sessionId === "a" ? 5 : 7)] : new Promise(() => {});
+		await boot();
+		lastWatch()?.onItem({ ...session, id: "a", createdAt: "2" });
+		lastWatch()?.onItem({ ...session, id: "t", createdAt: "3" });
+		selectSession("a");
+		await sleep(0);
+		void loadOlderEvents();
+		expect(historyCalls.at(-1)).toBe("a:5");
+		selectSession("t");
+		await sleep(0);
+		historyCalls.length = 0;
+		void loadOlderEvents();
+		expect(historyCalls).toEqual(["t:7"]);
+		history = () => [];
+	});
+});
+
+describe("reconnecting after deletions", () => {
+	test("drops chats the daemon no longer lists, and their selection", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		await boot();
+		expect(getState().selectedSessionId).toBe("s");
+		sessionLists.push([]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		expect(getState().sessions).toEqual({});
+		expect(getState().selectedSessionId).toBeNull();
+		expect(getState().chat).toBeNull();
+	});
+});
+
+describe("watching sign-ins", () => {
+	test("says so when the watch fails for another reason than a dropped socket", async () => {
+		const shown = spyOn(sonnerToast, "error");
+		await boot();
+		const watch = follows.filter((follow) => follow.name === "watchAgentLogins").at(-1)?.handlers;
+		watch?.onEnd?.(drop);
+		expect(shown).not.toHaveBeenCalled();
+		watch?.onEnd?.(internal);
+		expect(shown).toHaveBeenCalledWith("Sign-in results stopped arriving. Restart Octopus to see them again.");
+		shown.mockRestore();
 	});
 });

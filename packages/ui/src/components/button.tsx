@@ -42,12 +42,14 @@ function Button({
   variant = "default",
   size = "default",
   asChild = false,
+  type,
   ...props
 }: React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & {
     asChild?: boolean
   }) {
   const Comp = asChild ? Slot.Root : "button"
+  // A plain button inside a form must not submit it; only an explicit type="submit" should.
 
   return (
     <Comp
@@ -55,6 +57,7 @@ function Button({
       data-variant={variant}
       data-size={size}
       className={cn(buttonVariants({ variant, size, className }))}
+      type={asChild ? type : (type ?? "button")}
       {...props}
     />
   )

@@ -1,4 +1,4 @@
-import { Cause, Effect, Exit, Fiber, Layer, ManagedRuntime, Predicate, Schema, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema, Stream } from "effect";
 import { DaemonClient } from "@repo/contracts/DaemonClient";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -83,11 +83,4 @@ export const followDaemon = <A, E>(open: (daemon: Daemon) => Stream.Stream<A, E>
 	};
 };
 
-// Daemon errors carry a message written for the user. Anything else gets a generic one.
-export const errorMessage = (error: unknown): string =>
-	Predicate.hasProperty(error, "message") && Predicate.isString(error.message) && error.message !== ""
-		? error.message
-		: "Something went wrong. Try again.";
-
-export const errorTag = (error: unknown): string | null =>
-	Predicate.hasProperty(error, "_tag") && Predicate.isString(error._tag) ? error._tag : null;
+export { errorMessage, errorTag } from "./errorMessage.ts";

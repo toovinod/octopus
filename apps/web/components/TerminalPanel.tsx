@@ -9,9 +9,11 @@ import { PlusIcon, XIcon } from "lucide-react";
 import { Button } from "@repo/ui/components/button";
 import { toast } from "../lib/store.ts";
 import { cn } from "@repo/ui/lib/utils";
+import { useTheme } from "next-themes";
 
 // Matches the daemon's scrollback, so a reattached terminal shows everything it kept.
 const SCROLLBACK_LINES = 5000;
+const RESIZE_SETTLE_MS = 100;
 
 export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Workspace; readonly visible: boolean }) => {
 	const [terminals, setTerminals] = useState<ReadonlyArray<TerminalInfo>>([]);
@@ -44,11 +46,19 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 		setSelected(opened.id);
 	};
 
-	const close = (terminalId: string) => {
-		void callDaemon((daemon) => daemon.closeTerminal({ terminalId }));
+	// The tab stays when the daemon could not close the shell, so it can still be reached and closed again.
+	const close = async (terminalId: string) => {
+		const closed = await callDaemon((daemon) => daemon.closeTerminal({ terminalId })).then(
+			() => true,
+			(error: unknown) => {
+				toast(errorMessage(error));
+				return false;
+			},
+		);
+		if (!closed) return;
 		const rest = terminals.filter((terminal) => terminal.id !== terminalId);
-		setTerminals(rest);
-		if (selected === terminalId) setSelected(rest.at(-1)?.id ?? null);
+		setTerminals((current) => current.filter((terminal) => terminal.id !== terminalId));
+		setSelected((current) => (current === terminalId ? (rest.at(-1)?.id ?? null) : current));
 	};
 
 	return (
@@ -74,7 +84,7 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 							variant="ghost"
 							size="icon-xs"
 							aria-label="Close terminal"
-							onClick={() => close(terminal.id)}
+							onClick={() => void close(terminal.id)}
 							className="size-4 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
 						>
 							<XIcon />
@@ -103,10 +113,20 @@ export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Work
 
 const cssColor = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
+// Read from the page's CSS variables, so the terminal matches the light or dark theme in use.
+const terminalTheme = () => ({
+	background: cssColor("--background"),
+	foreground: cssColor("--foreground"),
+	cursor: cssColor("--foreground"),
+	selectionBackground: "rgba(90, 169, 230, 0.3)",
+});
+
 // xterm touches the DOM when it loads, so it is imported in the effect, never during prerendering.
 const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; readonly visible: boolean }) => {
 	const hostRef = useRef<HTMLDivElement>(null);
 	const fitRef = useRef<(() => void) | null>(null);
+	const themeRef = useRef<(() => void) | null>(null);
+	const { resolvedTheme } = useTheme();
 
 	useEffect(() => {
 		const host = hostRef.current;
@@ -120,23 +140,26 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 				fontFamily: cssColor("--font-geist-mono") || "ui-monospace, monospace",
 				fontSize: 12,
 				cursorBlink: true,
-				theme: {
-					background: cssColor("--background"),
-					foreground: cssColor("--foreground"),
-					cursor: cssColor("--foreground"),
-					selectionBackground: "rgba(90, 169, 230, 0.3)",
-				},
+				theme: terminalTheme(),
 			});
+			themeRef.current = () => {
+				terminal.options.theme = terminalTheme();
+			};
 			const fit = new FitAddon();
 			terminal.loadAddon(fit);
 			terminal.open(host);
 			// Writes and resizes after the shell exited fail harmlessly. The attach stream reports the exit.
+			// Dragging the panel resizes on every frame, so only the size it settles on goes to the daemon.
+			let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 			const resize = () => {
 				if (host.clientWidth === 0) return;
 				fit.fit();
-				void callDaemon((daemon) =>
-					daemon.resizeTerminal({ terminalId, cols: Math.max(2, terminal.cols), rows: Math.max(2, terminal.rows) }),
-				).catch(() => undefined);
+				clearTimeout(resizeTimer);
+				resizeTimer = setTimeout(() => {
+					void callDaemon((daemon) =>
+						daemon.resizeTerminal({ terminalId, cols: Math.max(2, terminal.cols), rows: Math.max(2, terminal.rows) }),
+					).catch(() => undefined);
+				}, RESIZE_SETTLE_MS);
 			};
 			fitRef.current = resize;
 			const observer = new ResizeObserver(resize);
@@ -149,6 +172,7 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 				write: (data) => terminal.write(data),
 			});
 			cleanup = () => {
+				clearTimeout(resizeTimer);
 				stop();
 				input.dispose();
 				observer.disconnect();
@@ -164,6 +188,13 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 	useEffect(() => {
 		if (visible) fitRef.current?.();
 	}, [visible]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a theme change is the signal to read the colours again.
+	useEffect(() => {
+		// A frame later, once the new theme's class is on the page and its variables apply.
+		const frame = requestAnimationFrame(() => themeRef.current?.());
+		return () => cancelAnimationFrame(frame);
+	}, [resolvedTheme]);
 
 	return <div ref={hostRef} className={cn("min-h-0 flex-1 px-2 py-1", !visible && "hidden")} />;
 };

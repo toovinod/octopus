@@ -64,18 +64,24 @@ export const useSuggestions = (session: AgentSession, token: SuggestionToken | n
 	}));
 };
 
+// The text field points at the list and its highlighted option by these ids, so screen readers follow along.
+export const suggestionOptionId = (listId: string, index: number) => `${listId}-${index}`;
+
 export const SuggestionList = ({
+	id,
 	suggestions,
 	highlight,
 	onPick,
 	onHighlight,
 }: {
+	readonly id: string;
 	readonly suggestions: ReadonlyArray<Suggestion>;
 	readonly highlight: number;
 	readonly onPick: (suggestion: Suggestion) => void;
 	readonly onHighlight: (index: number) => void;
 }) => (
 	<div
+		id={id}
 		role="listbox"
 		aria-label="Suggestions"
 		className="absolute inset-x-0 bottom-full z-20 mb-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-sm shadow-md"
@@ -83,6 +89,7 @@ export const SuggestionList = ({
 		{suggestions.map((suggestion, index) => (
 			<div
 				key={suggestion.key}
+				id={suggestionOptionId(id, index)}
 				role="option"
 				tabIndex={-1}
 				aria-selected={index === highlight}

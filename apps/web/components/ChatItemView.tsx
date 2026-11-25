@@ -7,6 +7,7 @@ import {
 	FileDiffIcon,
 	LoaderIcon,
 	PlugIcon,
+	RotateCwIcon,
 	TerminalIcon,
 	TriangleAlertIcon,
 	Undo2Icon,
@@ -22,7 +23,15 @@ import type {
 	QuestionAnswers,
 	ToolCall,
 } from "@repo/contracts/AgentEvent";
-import { answerQuestion, openDialog, respondToApproval, respondToPlan } from "../lib/store.ts";
+import {
+	answerQuestion,
+	openDialog,
+	openWorkspaceFile,
+	respondToApproval,
+	respondToPlan,
+	useAppState,
+} from "../lib/store.ts";
+import { workspaceLinkPath } from "../lib/workspaceLinkPath.ts";
 import type { AgentMode } from "@repo/contracts/AgentSession";
 import { Textarea } from "@repo/ui/components/textarea";
 import { Input } from "@repo/ui/components/input";
@@ -80,9 +89,9 @@ export const ChatItemView = memo(({ item, sessionId }: { readonly item: ChatItem
 		case "assistant":
 			return <AssistantMessage text={item.text} streaming={item.streaming} />;
 		case "reasoning":
-			return <ThinkingBlock text={item.text} streaming={item.streaming} />;
+			return <ThinkingBlock rowKey={`${sessionId}:${item.key}`} text={item.text} streaming={item.streaming} />;
 		case "tool":
-			return <ToolCard item={item} />;
+			return <ToolCard rowKey={`${sessionId}:${item.key}`} item={item} />;
 		case "approval":
 			return <ApprovalCard item={item} sessionId={sessionId} />;
 		case "plan":
@@ -117,7 +126,7 @@ const fencedCode = (node: ExtraProps["node"]) => {
 };
 
 const markdownComponents: Components = {
-	a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+	a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
 	pre: ({ node, children }) => {
 		const code = fencedCode(node);
 		return code === null ? <pre>{children}</pre> : <CodeBlock code={code.text} language={code.language} />;
@@ -127,6 +136,33 @@ const markdownComponents: Components = {
 };
 
 const remarkPlugins = [remarkGfm];
+
+// A link to a file in the workspace opens it in the Files tab. Anything else goes to the system browser.
+const MarkdownLink = ({
+	href,
+	children,
+}: {
+	readonly href: string | undefined;
+	readonly children: React.ReactNode;
+}) => {
+	const workspace = useAppState((current) =>
+		current.selectedWorkspaceId === null ? undefined : current.workspaces[current.selectedWorkspaceId],
+	);
+	const path = href === undefined || workspace === undefined ? null : workspaceLinkPath(href, workspace.path);
+	if (path === null || workspace === undefined) return <ExternalLink href={href}>{children}</ExternalLink>;
+	return (
+		<a
+			href={href}
+			title={`Open ${path}`}
+			onClick={(event) => {
+				event.preventDefault();
+				openWorkspaceFile(workspace.id, path);
+			}}
+		>
+			{children}
+		</a>
+	);
+};
 
 // Shows the plain code at once, then the highlighted version when Shiki has loaded and finished.
 const CodeBlock = ({ code, language }: { readonly code: string; readonly language: string }) => {
@@ -195,15 +231,37 @@ const AssistantMessage = ({ text, streaming }: { readonly text: string; readonly
 	);
 };
 
+// Rows unmount when they scroll out of view, so a row the user opened or closed keeps that choice here. Until then it
+// follows its default, which can change, as when a running tool fails. Only toggled rows are kept, so it stays small.
+const toggledRows = new Map<string, boolean>();
+
+const useRowOpen = (rowKey: string, byDefault: boolean) => {
+	const [toggled, setToggled] = useState(() => toggledRows.get(rowKey));
+	const open = toggled ?? byDefault;
+	const toggle = () => {
+		toggledRows.set(rowKey, !open);
+		setToggled(!open);
+	};
+	return [open, toggle] as const;
+};
+
 // Collapsed by default: the thinking is there for whoever wants it, and the reply stays the focus.
-const ThinkingBlock = ({ text, streaming }: { readonly text: string; readonly streaming: boolean }) => {
-	const [open, setOpen] = useState(false);
+const ThinkingBlock = ({
+	rowKey,
+	text,
+	streaming,
+}: {
+	readonly rowKey: string;
+	readonly text: string;
+	readonly streaming: boolean;
+}) => {
+	const [open, toggle] = useRowOpen(rowKey, false);
 	const throttled = useThrottledText(text);
 	return (
 		<div className="flex flex-col gap-1.5 text-xs text-muted-foreground">
 			<button
 				type="button"
-				onClick={() => setOpen(!open)}
+				onClick={toggle}
 				className="flex items-center gap-1.5 self-start hover:text-foreground"
 				aria-expanded={open}
 			>
@@ -243,24 +301,42 @@ const cacheAttachment = (attachmentId: string, src: string) => {
 
 const Attachment = ({ sessionId, attachmentId }: { readonly sessionId: string; readonly attachmentId: string }) => {
 	const [src, setSrc] = useState(() => cachedAttachment(attachmentId));
+	const [failed, setFailed] = useState(false);
+	// Bumped by Retry, to load again.
+	const [attempt, setAttempt] = useState(0);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: attempt is the retry signal.
 	useEffect(() => {
 		if (attachmentCache.has(attachmentId)) return;
 		let live = true;
+		setFailed(false);
 		callDaemon((daemon) => daemon.getAttachment({ sessionId, attachmentId })).then(
 			(image) => {
 				const url = `data:${image.mediaType};base64,${image.base64}`;
 				cacheAttachment(attachmentId, url);
 				if (live) setSrc(url);
 			},
-			() => undefined,
+			() => {
+				if (live) setFailed(true);
+			},
 		);
 		return () => {
 			live = false;
 		};
-	}, [sessionId, attachmentId]);
-	return src === null ? (
+	}, [sessionId, attachmentId, attempt]);
+	return failed ? (
+		<button
+			type="button"
+			onClick={() => setAttempt((current) => current + 1)}
+			title="The image could not be loaded. Click to try again."
+			className="flex size-16 flex-col items-center justify-center gap-1 rounded-lg bg-muted text-xs text-muted-foreground hover:text-foreground"
+		>
+			<RotateCwIcon className="size-3.5" />
+			Retry
+		</button>
+	) : src === null ? (
 		<div className="size-16 rounded-lg bg-muted" />
 	) : (
+		// biome-ignore lint/performance/noImgElement: a data URL in a static export, which next/image cannot optimize.
 		<img src={src} alt="" className="size-16 rounded-lg object-cover" />
 	);
 };
@@ -285,8 +361,14 @@ const TOOL_ICONS = {
 	other: WrenchIcon,
 } as const;
 
-const ToolCard = ({ item }: { readonly item: Extract<ChatItem, { kind: "tool" }> }) => {
-	const [open, setOpen] = useState(item.status === "failed");
+const ToolCard = ({
+	rowKey,
+	item,
+}: {
+	readonly rowKey: string;
+	readonly item: Extract<ChatItem, { kind: "tool" }>;
+}) => {
+	const [open, toggle] = useRowOpen(rowKey, item.status === "failed");
 	const Icon = TOOL_ICONS[item.tool.kind];
 	const detail =
 		item.tool.kind === "fileChange" ? item.tool.changes.map((change) => change.diff).join("\n") : item.output;
@@ -294,7 +376,7 @@ const ToolCard = ({ item }: { readonly item: Extract<ChatItem, { kind: "tool" }>
 		<div className="rounded-lg border border-border bg-card">
 			<button
 				type="button"
-				onClick={() => setOpen(!open)}
+				onClick={toggle}
 				disabled={detail === null || detail === ""}
 				className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs"
 				aria-expanded={open}

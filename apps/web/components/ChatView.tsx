@@ -28,7 +28,7 @@ import { Hint } from "./Hint.tsx";
 import { StatusDot } from "./StatusDot.tsx";
 import { Button } from "@repo/ui/components/button";
 import { Composer } from "./Composer.tsx";
-import { memo, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { cn } from "@repo/ui/lib/utils";
 
 export const ChatView = () => {
@@ -53,6 +53,16 @@ export const ChatView = () => {
 	const chatSessionId = useAppState((current) => current.chat?.sessionId ?? null);
 	const panelOpen = useAppState((current) => current.panel.open);
 	const tabs = useMemo(() => (tabIds === "" ? [] : tabIds.split(" ")), [tabIds]);
+	// Arrow keys move between tabs, as in any tab list.
+	const moveTab = useCallback(
+		(from: string, step: number) => {
+			const next = tabs[(tabs.indexOf(from) + step + tabs.length) % tabs.length];
+			if (next === undefined) return;
+			selectSession(next);
+			document.getElementById(chatTabId(next))?.focus();
+		},
+		[tabs],
+	);
 
 	if (workspace === undefined || project === undefined) {
 		return <Welcome />;
@@ -63,7 +73,7 @@ export const ChatView = () => {
 			<header className="flex h-10 shrink-0 items-center gap-1 border-b border-border px-2">
 				<div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto" role="tablist" aria-label="Chats">
 					{tabs.map((tabId) => (
-						<ChatTab key={tabId} sessionId={tabId} selected={tabId === selectedSessionId} />
+						<ChatTab key={tabId} sessionId={tabId} selected={tabId === selectedSessionId} onMove={moveTab} />
 					))}
 					<NewChatMenu />
 				</div>
@@ -85,8 +95,15 @@ export const ChatView = () => {
 			{session === undefined || chatSessionId !== session.id ? (
 				<EmptyWorkspace name={workspace.kind === "inPlace" ? project.name : workspace.name} />
 			) : (
-				// Keyed so each chat gets its own timeline (scroll position, measurements, stick-to-end) and composer.
-				<OpenChat key={session.id} session={session} workspacePath={workspace.path} />
+				<div
+					id={CHAT_PANEL_ID}
+					role="tabpanel"
+					aria-labelledby={chatTabId(session.id)}
+					className="flex min-h-0 flex-1 flex-col"
+				>
+					{/* Keyed so each chat gets its own timeline (scroll position, measurements, stick-to-end) and composer. */}
+					<OpenChat key={session.id} session={session} workspacePath={workspace.path} />
+				</div>
 			)}
 		</section>
 	);
@@ -116,60 +133,81 @@ const OpenChat = ({ session, workspacePath }: { readonly session: AgentSession; 
 	);
 };
 
-const ChatTab = memo(({ sessionId, selected }: { readonly sessionId: string; readonly selected: boolean }) => {
-	const session = useAppState((current) => current.sessions[sessionId]);
-	const attention = useAppState((current) => current.attention[sessionId]);
-	const [editing, setEditing] = useState(false);
-	if (session === undefined) return null;
-	return (
-		<div
-			className={cn(
-				"group flex h-7 max-w-48 shrink-0 items-center gap-1.5 rounded-md pr-1 pl-2.5 text-xs",
-				selected ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground",
-			)}
-		>
-			<StatusDot status={session.status} attention={attention} />
-			{editing ? (
-				<Input
-					autoFocus
-					defaultValue={session.title ?? ""}
-					placeholder={sessionTitle(session)}
-					aria-label="Chat name"
-					className="h-5 w-28 rounded-sm border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
-					onBlur={(event) => {
-						setEditing(false);
-						if (event.target.value !== (session.title ?? "")) void renameSession(session.id, event.target.value);
-					}}
-					onKeyDown={(event) => {
-						if (event.key === "Enter") event.currentTarget.blur();
-						if (event.key === "Escape") setEditing(false);
-					}}
-				/>
-			) : (
-				<button
-					type="button"
-					role="tab"
-					aria-selected={selected}
-					className="min-w-0 truncate"
-					title="Double-click to rename"
-					onClick={() => selectSession(session.id)}
-					onDoubleClick={() => setEditing(true)}
-				>
-					{sessionTitle(session)}
-				</button>
-			)}
-			<Button
-				variant="ghost"
-				size="icon-xs"
-				aria-label={`Close ${sessionTitle(session)}`}
-				onClick={() => closeTab(session.id)}
-				className="size-4 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+const CHAT_PANEL_ID = "chat-panel";
+const chatTabId = (sessionId: string) => `chat-tab-${sessionId}`;
+
+const ChatTab = memo(
+	({
+		sessionId,
+		selected,
+		onMove,
+	}: {
+		readonly sessionId: string;
+		readonly selected: boolean;
+		readonly onMove: (from: string, step: number) => void;
+	}) => {
+		const session = useAppState((current) => current.sessions[sessionId]);
+		const attention = useAppState((current) => current.attention[sessionId]);
+		const [editing, setEditing] = useState(false);
+		if (session === undefined) return null;
+		return (
+			<div
+				className={cn(
+					"group flex h-7 max-w-48 shrink-0 items-center gap-1.5 rounded-md pr-1 pl-2.5 text-xs",
+					selected ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground",
+				)}
 			>
-				<XIcon />
-			</Button>
-		</div>
-	);
-});
+				<StatusDot status={session.status} attention={attention} />
+				{editing ? (
+					<Input
+						autoFocus
+						defaultValue={session.title ?? ""}
+						placeholder={sessionTitle(session)}
+						aria-label="Chat name"
+						className="h-5 w-28 rounded-sm border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
+						onBlur={(event) => {
+							setEditing(false);
+							if (event.target.value !== (session.title ?? "")) void renameSession(session.id, event.target.value);
+						}}
+						onKeyDown={(event) => {
+							if (event.key === "Enter") event.currentTarget.blur();
+							if (event.key === "Escape") setEditing(false);
+						}}
+					/>
+				) : (
+					<button
+						type="button"
+						role="tab"
+						id={chatTabId(session.id)}
+						aria-selected={selected}
+						aria-controls={selected ? CHAT_PANEL_ID : undefined}
+						tabIndex={selected ? 0 : -1}
+						className="min-w-0 truncate"
+						title="Double-click or press F2 to rename"
+						onClick={() => selectSession(session.id)}
+						onDoubleClick={() => setEditing(true)}
+						onKeyDown={(event) => {
+							if (event.key === "F2") setEditing(true);
+							if (event.key === "ArrowRight") onMove(session.id, 1);
+							if (event.key === "ArrowLeft") onMove(session.id, -1);
+						}}
+					>
+						{sessionTitle(session)}
+					</button>
+				)}
+				<Button
+					variant="ghost"
+					size="icon-xs"
+					aria-label={`Close ${sessionTitle(session)}`}
+					onClick={() => closeTab(session.id)}
+					className="size-4 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+				>
+					<XIcon />
+				</Button>
+			</div>
+		);
+	},
+);
 
 const NewChatMenu = () => {
 	const agents = useAppState((current) => current.agents);

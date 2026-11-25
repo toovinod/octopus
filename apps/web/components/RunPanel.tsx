@@ -14,6 +14,8 @@ import { Tabs, TabsList, TabsTrigger } from "@repo/ui/components/tabs";
 
 // The daemon keeps a capped tail. The view keeps no more than this many lines either.
 const MAX_LINES = 5000;
+// How close to the end counts as at the end, in pixels.
+const STICK_DISTANCE = 24;
 
 const SCRIPT_KINDS = ["run", "setup"] as const;
 
@@ -60,11 +62,16 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 		workspace.kind === "worktree" &&
 		(run === undefined || run.status === "failed" || run.status === "deadLetter");
 
+	// Run and Stop stay disabled until the daemon answers, so a double click sends one request.
+	const [busy, setBusy] = useState(false);
+
 	const start = async () => {
 		setConfirmingRun(false);
+		setBusy(true);
 		await callDaemon((daemon) => daemon.startRunScript({ workspaceId: workspace.id })).then(reload, (error: unknown) =>
 			toast(errorMessage(error)),
 		);
+		setBusy(false);
 	};
 	const startSetup = async () => {
 		await callDaemon((daemon) => daemon.startSetupScript({ workspaceId: workspace.id })).then(
@@ -73,9 +80,11 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 		);
 	};
 	const stop = async () => {
+		setBusy(true);
 		await callDaemon((daemon) => daemon.stopRunScript({ workspaceId: workspace.id })).then(reload, (error: unknown) =>
 			toast(errorMessage(error)),
 		);
+		setBusy(false);
 	};
 
 	return (
@@ -101,7 +110,7 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 				</span>
 				{kind === "run" ? (
 					running ? (
-						<Button variant="secondary" size="xs" onClick={() => void stop()}>
+						<Button variant="secondary" size="xs" disabled={busy} onClick={() => void stop()}>
 							<SquareIcon className="size-3 fill-current" />
 							Stop
 						</Button>
@@ -119,6 +128,7 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 						<Button
 							size="xs"
 							variant="default"
+							disabled={busy}
 							onClick={() => (workspace.fromFork ? setConfirmingRun(true) : void start())}
 						>
 							<PlayIcon />
@@ -192,6 +202,8 @@ const RunScriptPorts = ({ workspaceId }: { readonly workspaceId: string }) => {
 const ScriptOutput = ({ scriptRunId, onEnd }: { readonly scriptRunId: string; readonly onEnd: () => void }) => {
 	const [lines, setLines] = useState<ReadonlyArray<string>>([]);
 	const scrollRef = useRef<HTMLPreElement>(null);
+	// Follows new output only while the user is at the end, so scrolling up to read is not undone by the next line.
+	const atEnd = useRef(true);
 
 	useEffect(() => {
 		let batch: Array<string> = [];
@@ -231,12 +243,16 @@ const ScriptOutput = ({ scriptRunId, onEnd }: { readonly scriptRunId: string; re
 
 	useLayoutEffect(() => {
 		const element = scrollRef.current;
-		if (element !== null && lines.length > 0) element.scrollTop = element.scrollHeight;
+		if (element !== null && lines.length > 0 && atEnd.current) element.scrollTop = element.scrollHeight;
 	}, [lines]);
 
 	return (
 		<pre
 			ref={scrollRef}
+			onScroll={(event) => {
+				const element = event.currentTarget;
+				atEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < STICK_DISTANCE;
+			}}
 			className="min-h-0 flex-1 overflow-auto p-3 font-mono text-xs whitespace-pre-wrap text-muted-foreground"
 		>
 			{lines.length === 0 ? "No output yet." : lines.join("\n")}

@@ -21,8 +21,9 @@ import {
 	updateSessionSettings,
 	useAppState,
 } from "../lib/store.ts";
-import { type DraftImage, MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
-import { memo, useEffect, useRef, useState } from "react";
+import { MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
+import { type Draft, draftOf, keepDraft } from "../lib/drafts.ts";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
 import { formatClockTime, formatTokens } from "../lib/format.ts";
@@ -35,19 +36,11 @@ import {
 	DialogTitle,
 } from "@repo/ui/components/dialog";
 import { modeLabels, nextMode, orderedModes } from "../lib/agentModes.ts";
-import { type Suggestion, SuggestionList, useSuggestions } from "./ComposerSuggestions.tsx";
+import { type Suggestion, SuggestionList, suggestionOptionId, useSuggestions } from "./ComposerSuggestions.tsx";
 import { insertSuggestion, tokenAt } from "../lib/composerSuggestions.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
 import { cn } from "@repo/ui/lib/utils";
-
-interface Draft {
-	readonly text: string;
-	readonly images: ReadonlyArray<DraftImage>;
-}
-
-// Drafts outlive the composer, so switching chats and back keeps what was typed.
-const drafts = new Map<string, Draft>();
 
 // Memoized with only the chat fields it shows, so streamed output does not re-render it.
 export const Composer = memo(
@@ -62,7 +55,7 @@ export const Composer = memo(
 		readonly usage: ChatState["usage"];
 		readonly rateLimit: ChatState["rateLimit"];
 	}) => {
-		const [draft, setDraft] = useState<Draft>(() => drafts.get(session.id) ?? { text: "", images: [] });
+		const [draft, setDraft] = useState<Draft>(() => draftOf(session.id));
 		const [dragging, setDragging] = useState(false);
 		const textRef = useRef<HTMLTextAreaElement>(null);
 		const fileRef = useRef<HTMLInputElement>(null);
@@ -78,6 +71,7 @@ export const Composer = memo(
 		const token = typed !== null && typed.start !== dismissedAt ? typed : null;
 		const suggestions = useSuggestions(session, token);
 		const shown = Math.min(highlight, suggestions.length - 1);
+		const suggestionsId = useId();
 
 		// biome-ignore lint/correctness/useExhaustiveDependencies: a new word or query starts at the top.
 		useEffect(() => {
@@ -85,7 +79,7 @@ export const Composer = memo(
 		}, [token?.start, token?.query]);
 
 		useEffect(() => {
-			drafts.set(session.id, draft);
+			keepDraft(session.id, draft);
 		}, [session.id, draft]);
 
 		useEffect(() => {
@@ -151,12 +145,19 @@ export const Composer = memo(
 					}}
 				>
 					{suggestions.length === 0 ? null : (
-						<SuggestionList suggestions={suggestions} highlight={shown} onPick={pick} onHighlight={setHighlight} />
+						<SuggestionList
+							id={suggestionsId}
+							suggestions={suggestions}
+							highlight={shown}
+							onPick={pick}
+							onHighlight={setHighlight}
+						/>
 					)}
 					{draft.images.length === 0 ? null : (
 						<div className="flex flex-wrap gap-2 px-3 pt-3">
 							{draft.images.map((image) => (
 								<div key={image.id} className="group relative">
+									{/* biome-ignore lint/performance/noImgElement: a blob URL in a static export, which next/image cannot optimize. */}
 									<img src={image.previewUrl} alt="" className="size-14 rounded-md border border-border object-cover" />
 									<Button
 										size="icon-xs"
@@ -173,6 +174,12 @@ export const Composer = memo(
 					<Textarea
 						ref={textRef}
 						rows={1}
+						role="combobox"
+						aria-label="Message"
+						aria-autocomplete="list"
+						aria-expanded={suggestions.length > 0}
+						aria-controls={suggestions.length > 0 ? suggestionsId : undefined}
+						aria-activedescendant={suggestions.length > 0 ? suggestionOptionId(suggestionsId, shown) : undefined}
 						value={draft.text}
 						placeholder={
 							busy ? (steer ? "Steer the agent" : "Queue a message for when the turn ends") : "Ask for a change"
