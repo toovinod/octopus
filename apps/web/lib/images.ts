@@ -40,11 +40,12 @@ export const readImages = async (files: ReadonlyArray<File>, room: number) => {
 			problems.push(`A message can carry ${MAX_IMAGES_PER_MESSAGE} images at most.`);
 			break;
 		}
-		const base64 = await readBase64(file);
-		if (base64.length > MAX_IMAGE_BASE64_LENGTH) {
+		// Base64 is 4 characters per 3 bytes. Checking the size first keeps a huge file from being read at all.
+		if (Math.ceil(file.size / 3) * 4 > MAX_IMAGE_BASE64_LENGTH) {
 			problems.push(`${file.name} is larger than 5 MB.`);
 			continue;
 		}
+		const base64 = await readBase64(file);
 		images.push({ id: `image-${++nextImage}`, mediaType, base64, previewUrl: URL.createObjectURL(file) });
 	}
 	return { images, problems };
