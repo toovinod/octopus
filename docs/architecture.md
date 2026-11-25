@@ -242,7 +242,7 @@ It changed these decisions:
 
 - `octopusd` exits when its stdin closes, which section 3.1 asked for. Until the `shutdown` RPC exists, quitting closes stdin instead of killing the daemon.
 - The Claude adapter runs the user's own `claude` from PATH. Octopus does not embed or extract the SDK's bundled CLI.
-- The shell starts `octopusd` with the PATH of the user's login shell, because an app opened from Finder cannot otherwise find `claude`, `codex` or `node`.
+- The shell starts `octopusd` with the environment of the user's login shell (PATH, proxy and tool variables), because an app opened from Finder cannot otherwise find `claude`, `codex` or `node`.
 - Terminals spawn with `detached: true` and are stopped by signalling their process group.
 - A crash of `octopusd` itself leaves children running until the next start, which stops them from the process registry (section 3.3).
 
