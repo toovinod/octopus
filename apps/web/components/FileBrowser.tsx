@@ -7,7 +7,8 @@ import { callDaemon } from "../lib/daemonRuntime.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Button } from "@repo/ui/components/button";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { takeFileRequest, useAppState } from "../lib/store.ts";
 import { Hint } from "./Hint.tsx";
 
 const parentOf = (path: string) => path.split("/").slice(0, -1).join("/");
@@ -16,6 +17,13 @@ const parentOf = (path: string) => path.split("/").slice(0, -1).join("/");
 export const FileBrowser = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [folder, setFolder] = useState("");
 	const [file, setFile] = useState<string | null>(null);
+	const request = useAppState((current) => current.fileRequest);
+	useEffect(() => {
+		if (request === null || request.workspaceId !== workspace.id) return;
+		setFolder(parentOf(request.path));
+		setFile(request.path);
+		takeFileRequest();
+	}, [request, workspace.id]);
 	if (file !== null) {
 		return <FileViewer workspace={workspace} path={file} onBack={() => setFile(null)} />;
 	}

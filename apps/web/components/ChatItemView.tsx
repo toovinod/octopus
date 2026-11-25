@@ -23,7 +23,15 @@ import type {
 	QuestionAnswers,
 	ToolCall,
 } from "@repo/contracts/AgentEvent";
-import { answerQuestion, openDialog, respondToApproval, respondToPlan } from "../lib/store.ts";
+import {
+	answerQuestion,
+	openDialog,
+	openWorkspaceFile,
+	respondToApproval,
+	respondToPlan,
+	useAppState,
+} from "../lib/store.ts";
+import { workspaceLinkPath } from "../lib/workspaceLinkPath.ts";
 import type { AgentMode } from "@repo/contracts/AgentSession";
 import { Textarea } from "@repo/ui/components/textarea";
 import { Input } from "@repo/ui/components/input";
@@ -118,7 +126,7 @@ const fencedCode = (node: ExtraProps["node"]) => {
 };
 
 const markdownComponents: Components = {
-	a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+	a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
 	pre: ({ node, children }) => {
 		const code = fencedCode(node);
 		return code === null ? <pre>{children}</pre> : <CodeBlock code={code.text} language={code.language} />;
@@ -128,6 +136,33 @@ const markdownComponents: Components = {
 };
 
 const remarkPlugins = [remarkGfm];
+
+// A link to a file in the workspace opens it in the Files tab. Anything else goes to the system browser.
+const MarkdownLink = ({
+	href,
+	children,
+}: {
+	readonly href: string | undefined;
+	readonly children: React.ReactNode;
+}) => {
+	const workspace = useAppState((current) =>
+		current.selectedWorkspaceId === null ? undefined : current.workspaces[current.selectedWorkspaceId],
+	);
+	const path = href === undefined || workspace === undefined ? null : workspaceLinkPath(href, workspace.path);
+	if (path === null || workspace === undefined) return <ExternalLink href={href}>{children}</ExternalLink>;
+	return (
+		<a
+			href={href}
+			title={`Open ${path}`}
+			onClick={(event) => {
+				event.preventDefault();
+				openWorkspaceFile(workspace.id, path);
+			}}
+		>
+			{children}
+		</a>
+	);
+};
 
 // Shows the plain code at once, then the highlighted version when Shiki has loaded and finished.
 const CodeBlock = ({ code, language }: { readonly code: string; readonly language: string }) => {

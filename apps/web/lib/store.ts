@@ -64,6 +64,8 @@ export interface AppState {
 	// Only the visible chat's events are in memory.
 	readonly chat: ChatState | null;
 	readonly panel: { readonly open: boolean; readonly tab: PanelTab };
+	// A file a link in a chat asked the Files tab to show. The tab takes it, so it opens once.
+	readonly fileRequest: { readonly workspaceId: string; readonly path: string } | null;
 	readonly dialog: DialogState | null;
 	readonly settings: Settings;
 }
@@ -82,6 +84,7 @@ let state: AppState = {
 	selectedSessionId: null,
 	chat: null,
 	panel: { open: true, tab: "diff" },
+	fileRequest: null,
 	dialog: null,
 	settings: defaultSettings,
 };
@@ -783,6 +786,11 @@ export const openDialog = (dialog: DialogState | null) => setState(() => ({ dial
 
 export const setPanel = (panel: Partial<AppState["panel"]>) =>
 	setState((current) => ({ panel: { ...current.panel, ...panel } }));
+
+export const openWorkspaceFile = (workspaceId: string, path: string) =>
+	setState(() => ({ fileRequest: { workspaceId, path }, panel: { open: true, tab: "files" } }));
+
+export const takeFileRequest = () => setState(() => ({ fileRequest: null }));
 
 export const updateSettings = (changes: Partial<Settings>) => {
 	setState((current) => ({ settings: { ...current.settings, ...changes } }));
