@@ -20,6 +20,8 @@ export class Workspace extends Schema.Class<Workspace>("Workspace")({
 	baseBranch: Schema.String,
 	status: WorkspaceStatus,
 	pullRequestUrl: Schema.NullOr(Schema.String),
+	// A fork's pull request: anyone on GitHub can write its code, so its setup script waits for the user.
+	fromFork: Schema.Boolean,
 	createdAt: Schema.String,
 	archivedAt: Schema.NullOr(Schema.String),
 }) {}
@@ -71,10 +73,16 @@ export class WorkspaceHasUnsavedWorkError extends Schema.TaggedError<WorkspaceHa
 		workspaceId: Schema.String,
 		changedFiles: Schema.Array(Schema.String),
 		unpushedCommits: Schema.Int,
+		// Files git ignores, such as .env. Archiving deletes them, even with force.
+		ignoredFiles: Schema.Array(Schema.String),
 	},
 ) {
 	override get message() {
-		return `This workspace has ${this.changedFiles.length} changed file(s) and ${this.unpushedCommits} unpushed commit(s). Commit and push them, or archive with force to stash the changes and keep the branch.`;
+		const ignored =
+			this.ignoredFiles.length === 0
+				? ""
+				: ` Archiving also deletes ${this.ignoredFiles.length} ignored file(s): ${this.ignoredFiles.slice(0, 5).join(", ")}.`;
+		return `This workspace has ${this.changedFiles.length} changed file(s) and ${this.unpushedCommits} unpushed commit(s). Commit and push them, or archive with force to stash the changes and keep the branch.${ignored}`;
 	}
 }
 

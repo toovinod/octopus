@@ -12,9 +12,9 @@ import {
 	removeWorktree,
 	restoreArchiveStash,
 } from "./removeWorktree.ts";
-import { Context, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
+import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "@repo/contracts/ScriptRun";
+import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
-import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "@repo/contracts/ScriptRun";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
@@ -34,6 +34,7 @@ import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
 import type { Project } from "@repo/contracts/Project";
 import { and, asc, eq, inArray } from "drizzle-orm";
+import { basename, dirname, join } from "node:path";
 import { WorkspaceLock } from "./WorkspaceLock.ts";
 import type { SecureRandom } from "effect/crypto";
 import { CappedOutput } from "./CappedOutput.ts";
@@ -41,7 +42,6 @@ import { runRunScript } from "./runRunScript.ts";
 import { nowIso } from "../database/nowIso.ts";
 import { newId } from "../database/newId.ts";
 import { runGit } from "../git/runGit.ts";
-import { join } from "node:path";
 
 type WorkspaceRow = typeof workspace.$inferSelect;
 type ScriptRunRow = typeof scriptRun.$inferInsert;
@@ -73,6 +73,9 @@ const LIVE_LINES = 1000;
 // daemon that runs scripts for weeks would otherwise hold the output of every one.
 export const MAX_FINISHED_OUTPUTS = 20;
 
+// Setup scripts are usually installs, so only this many run at once, as after a restart that finds many pending.
+export const SETUP_SCRIPTS_AT_ONCE = 2;
+
 export class WorkspaceService extends Context.Service<WorkspaceService>()(
 	"octopus/daemon/workspaces/WorkspaceService",
 	{
@@ -91,7 +94,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			const runningScripts = yield* FiberMap.make<string>();
 			// Archiving runs git on the worktree folder, so two archives at once could both try to remove it.
 			const archiveLock = yield* Semaphore.make(1);
-			// Two quick clicks on Run must not start the run script twice.
+			// Two quick clicks on Run or Run setup must not start a script twice.
 			const runScriptLock = yield* Semaphore.make(1);
 			const outputs = new Map<string, ScriptOutput>();
 			// The process group of each running run script, by script run id, to find the ports it listens on.
@@ -135,8 +138,16 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 			});
 
-			const startSetupScript = (scriptRunId: string, script: string, cwd: string) =>
-				startScript(scriptRunId, (onLine) => runSetupScript({ scriptRunId, script, cwd, onLine }));
+			const setupPermits = yield* Semaphore.make(SETUP_SCRIPTS_AT_ONCE);
+			// The run stays pending while it waits out `delay` or a free permit.
+			const startSetupScript = (scriptRunId: string, script: string, cwd: string, delay = Duration.zero) =>
+				startScript(scriptRunId, (onLine) =>
+					Effect.sleep(delay).pipe(
+						Effect.andThen(
+							runSetupScript({ scriptRunId, script, cwd, onLine }).pipe(Semaphore.withPermit(setupPermits)),
+						),
+					),
+				);
 
 			const insertWorkspace = (row: WorkspaceRow, setupRun: ScriptRunRow | null) =>
 				database.query((db) =>
@@ -266,7 +277,6 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					}
 					yield* makeWorktreesDir;
 					yield* plan.add(path);
-					if (plan.fromFork) yield* markForkBranch(owner.path, plan.branch);
 					row = {
 						...base,
 						name: plan.branch,
@@ -290,7 +300,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					};
 				}
 
-				yield* insertWorkspace(row, setupRun).pipe(
+				// Marked under the same undo as the insert, so a failed mark leaves no unmarked worktree behind.
+				yield* (row.fromFork ? markForkBranch(owner.path, row.branch) : Effect.void).pipe(
+					Effect.andThen(insertWorkspace(row, setupRun)),
 					Effect.flatMap((inserted) =>
 						inserted ? Effect.void : Effect.fail(new WorkspacePathInUseError({ path: row.path })),
 					),
@@ -399,7 +411,8 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						if (yield* fs.exists(current.path).pipe(Effect.orDie)) {
 							const refuseUnsaved = Effect.fnUntraced(function* () {
 								const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
-								const hasUnsaved = unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0;
+								const hasUnsaved =
+									unsaved.changedFiles.length > 0 || unsaved.unpushedCommits > 0 || unsaved.ignoredFiles.length > 0;
 								if (hasUnsaved && !options.force) {
 									return yield* new WorkspaceHasUnsavedWorkError({
 										workspaceId,
@@ -641,6 +654,45 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				Effect.provide(services),
 			);
 
+			// The user's explicit start, the only way a fork's setup script runs. A failed run starts over.
+			const startSetupScriptRun = Effect.fn("WorkspaceService.startSetupScriptRun")(
+				function* (workspaceId: string) {
+					const current = yield* get(workspaceId);
+					if (current.status === "archived") {
+						return yield* new WorkspaceArchivedError({ workspaceId });
+					}
+					const owner = yield* projects.get(current.projectId);
+					const script = owner.setupScript;
+					if (script === null) {
+						return yield* new SetupScriptMissingError({ projectId: owner.id });
+					}
+					const last = (yield* listScriptRuns(workspaceId)).filter((run) => run.kind === "setup").at(-1);
+					if (last !== undefined && (last.status === "pending" || last.status === "processing")) {
+						return last;
+					}
+					let scriptRunId: string;
+					if (last !== undefined && (last.status === "failed" || last.status === "deadLetter")) {
+						scriptRunId = last.id;
+						yield* applyScriptRunEvent(scriptRunId, { _tag: "Retried" });
+					} else {
+						const setupRun = yield* newSetupRun(owner, workspaceId);
+						if (setupRun === null) {
+							return yield* new SetupScriptMissingError({ projectId: owner.id });
+						}
+						scriptRunId = setupRun.id;
+						yield* database.query((db) => db.insert(scriptRun).values(setupRun));
+					}
+					yield* startSetupScript(scriptRunId, script, current.path);
+					yield* Effect.logInfo("Started setup script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
+					const [row] = yield* database.query((db) => db.select().from(scriptRun).where(eq(scriptRun.id, scriptRunId)));
+					// The row was written just above and runs go only with their workspace.
+					return row === undefined ? yield* Effect.die("The setup run is missing") : new ScriptRun(row);
+				},
+				Semaphore.withPermit(runScriptLock),
+				(effect, workspaceId) => workspaceLock.starting(workspaceId, effect),
+				Effect.provide(services),
+			);
+
 			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
 				const running = yield* findRunningRunScript(workspaceId);
 				const group = running === null ? undefined : runScriptGroups.get(running.id);
@@ -672,7 +724,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			// Startup recovery: runs left in processing were cut off by a restart, which is a
 			// retryable failure. Then every pending run of an active workspace starts again.
 			const recoverScriptRuns = Effect.gen(function* () {
-				const { maxAttempts } = yield* SetupScriptSettings;
+				const { maxAttempts, retryBaseDelay } = yield* SetupScriptSettings;
 				const cutOff = yield* database.query((db) =>
 					db
 						.select({ id: scriptRun.id, kind: scriptRun.kind })
@@ -697,6 +749,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						.select({
 							id: scriptRun.id,
 							kind: scriptRun.kind,
+							attempts: scriptRun.attempts,
 							path: workspace.path,
 							workspaceStatus: workspace.status,
 							script: project.setupScript,
@@ -708,7 +761,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 				for (const run of pending) {
 					if (run.kind === "setup" && run.workspaceStatus === "active" && run.script !== null) {
-						yield* startSetupScript(run.id, run.script, run.path);
+						// A run that already failed waits out the retry delay it would have had, rather than starting at once.
+						const delay = run.attempts === 0 ? Duration.zero : Duration.times(retryBaseDelay, 2 ** (run.attempts - 1));
+						yield* startSetupScript(run.id, run.script, run.path, delay);
 					} else {
 						yield* applyScriptRunEvent(run.id, {
 							_tag: "Cancelled",
@@ -727,6 +782,34 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			});
 			yield* recoverScriptRuns.pipe(Effect.provide(services));
 
+			// A crash between adding a worktree and saving its workspace leaves a folder that no workspace owns and
+			// that blocks its name. Nothing ran in it yet, so it goes. Its branch stays, in case it holds commits.
+			const pruneOrphanWorktrees = Effect.gen(function* () {
+				const owned = yield* database.query((db) =>
+					db
+						.select({ path: workspace.path })
+						.from(workspace)
+						.where(and(eq(workspace.kind, "worktree"), eq(workspace.status, "active"))),
+				);
+				const ownedPaths = new Set(owned.map((row) => row.path));
+				for (const owner of yield* projects.list) {
+					const folder = join(worktreesDir, owner.id);
+					if (!(yield* fs.exists(folder))) continue;
+					const realFolder = yield* fs.realPath(folder);
+					const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
+					for (const line of listed.split("\n")) {
+						if (!line.startsWith("worktree ")) continue;
+						const path = line.slice("worktree ".length);
+						if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
+						// Rows hold the path Octopus made, which git may list with symlinks resolved.
+						if (ownedPaths.has(join(folder, basename(path)))) continue;
+						yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
+						yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
+					}
+				}
+			}).pipe(Effect.catch((cause) => Effect.logError("Could not look for worktrees that no workspace owns", cause)));
+			yield* pruneOrphanWorktrees.pipe(Effect.provide(services));
+
 			return {
 				create,
 				get,
@@ -740,6 +823,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				getScriptRunOutput,
 				followScriptRunOutput,
 				startRunScript,
+				startSetupScriptRun,
 				stopRunScript,
 				watchScriptRuns,
 				watchRunScriptPorts,

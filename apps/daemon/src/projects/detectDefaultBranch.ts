@@ -1,4 +1,5 @@
 import { DefaultBranchNotFoundError } from "@repo/contracts/Project";
+import { resolveBranchRef } from "../workspaces/createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
 import { Effect } from "effect";
 
@@ -14,17 +15,25 @@ export const detectDefaultBranch = Effect.fn("detectDefaultBranch")(
 			"--short",
 			"refs/remotes/origin/HEAD",
 		]);
-		if (originHead !== "") {
-			return originHead.replace(/^origin\//, "");
+		// A guess is used only when this repository has the branch, here or on origin.
+		const exists = (branch: string) =>
+			branch === ""
+				? Effect.succeed(false)
+				: Effect.map(resolveBranchRef(repositoryPath, branch), (ref) => ref !== null);
+		const fromOrigin = originHead.replace(/^origin\//, "");
+		if (yield* exists(fromOrigin)) {
+			return fromOrigin;
 		}
 
 		yield* Effect.logWarning("origin/HEAD is not set, using init.defaultBranch as the default branch");
 		const configured = yield* readGit(repositoryPath, ["config", "--get", "init.defaultBranch"]);
-		if (configured !== "") {
+		if (yield* exists(configured)) {
 			return configured;
 		}
 
-		yield* Effect.logWarning("init.defaultBranch is not set, using the checked-out branch as the default branch");
+		yield* Effect.logWarning(
+			"init.defaultBranch is not set or not a branch here, using the checked-out branch as the default branch",
+		);
 		const current = yield* readGit(repositoryPath, ["branch", "--show-current"]);
 		if (current !== "") {
 			return current;

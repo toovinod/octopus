@@ -1,4 +1,5 @@
 import { WorktreeRemoveError } from "@repo/contracts/Workspace";
+import { resolveBranchRef } from "./createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
 import { Effect } from "effect";
 
@@ -7,8 +8,25 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 	// Each line is "XY path"; renames read "XY old -> new".
 	const changedFiles = status === "" ? [] : status.split("\n").map((line) => line.slice(3));
 	// Commits made in this workspace that no remote has. Base branch history is not this workspace's work.
-	const unpushed = yield* runGit(worktreePath, ["rev-list", "--count", "HEAD", `^${baseBranch}`, "--not", "--remotes"]);
-	return { changedFiles, unpushedCommits: Number(unpushed) };
+	const base = yield* resolveBranchRef(worktreePath, baseBranch);
+	if (base === null) {
+		yield* Effect.logWarning("The base branch is gone, so every commit no remote has counts as unpushed").pipe(
+			Effect.annotateLogs({ worktreePath, baseBranch }),
+		);
+	}
+	const exclude = base === null ? [] : [`^${base}`];
+	const unpushed = yield* runGit(worktreePath, ["rev-list", "--count", "HEAD", ...exclude, "--not", "--remotes"]);
+	// Ignored files such as .env are not stashed, so they go with the folder. Installed dependencies are meant to.
+	const ignored = yield* runGit(worktreePath, [
+		"ls-files",
+		"--others",
+		"--ignored",
+		"--exclude-standard",
+		"--directory",
+		"-z",
+	]);
+	const ignoredFiles = ignored.split("\0").filter((entry) => entry !== "" && !/(^|\/)node_modules\/$/.test(entry));
+	return { changedFiles, unpushedCommits: Number(unpushed), ignoredFiles };
 });
 
 // The stash a forced archive leaves, found again by this message when the workspace is restored.
@@ -36,7 +54,9 @@ export const removeWorktree = Effect.fn("removeWorktree")(function* (options: {
 			Effect.annotateLogs({ worktreePath, stashMessage }),
 		);
 	}
-	yield* runGit(repositoryPath, ["worktree", "remove", worktreePath]).pipe(
+	// Forced, since git refuses any worktree with submodules otherwise. The caller has already checked for
+	// unsaved work, or stashed it. A locked worktree still refuses.
+	yield* runGit(repositoryPath, ["worktree", "remove", "--force", worktreePath]).pipe(
 		Effect.catchTag("GitCommandError", (cause) =>
 			Effect.logError("git worktree remove failed", cause).pipe(
 				// The workspace stays active, so its changes go back into its folder.

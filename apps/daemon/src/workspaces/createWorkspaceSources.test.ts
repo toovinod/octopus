@@ -1,6 +1,6 @@
+import { runServiceTest, waitForScriptRun } from "../testing/runServiceTest.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
-import { runServiceTest } from "../testing/runServiceTest.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { WorkspaceService } from "./WorkspaceService.ts";
 import { describe, expect, test } from "bun:test";
@@ -40,6 +40,46 @@ describe("WorkspaceService.create from a source", () => {
 		);
 		expect(result.created).toMatchObject({ branch: "feature", baseBranch: "develop" });
 		expect(result.hasFile).toBe(true);
+	});
+
+	test("branches a new worktree off a base branch that only exists on origin", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const project = yield* addProject(tempDir);
+				const origin = join(tempDir, "origin.git");
+				yield* runGit(tempDir, ["clone", "-q", "--bare", project.path, origin]);
+				yield* runGit(project.path, ["remote", "add", "origin", origin]);
+				const other = join(tempDir, "other");
+				yield* runGit(tempDir, ["clone", "-q", origin, other]);
+				yield* runGit(other, ["config", "user.email", "test@octopus.local"]);
+				yield* runGit(other, ["config", "user.name", "Octopus Test"]);
+				yield* runGit(other, ["checkout", "-q", "-b", "remote-only"]);
+				yield* commitFile(other, "remote.txt");
+				yield* runGit(other, ["push", "-q", "origin", "remote-only"]);
+				yield* runGit(project.path, ["fetch", "-q", "origin"]);
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "remote-only",
+				});
+				const missing = yield* Effect.flip(
+					workspaces.create({ kind: "worktree", projectId: project.id, name: "other", baseBranch: "nowhere" }),
+				);
+				const fs = yield* FileSystem.FileSystem;
+				return {
+					checkedOut: yield* runGit(created.path, ["branch", "--show-current"]),
+					hasFile: yield* fs.exists(join(created.path, "remote.txt")),
+					localBranches: yield* runGit(project.path, ["branch", "--format=%(refname:short)"]),
+					missing: missing._tag,
+				};
+			}),
+		);
+		expect(result.checkedOut).toBe("feature");
+		expect(result.hasFile).toBe(true);
+		expect(result.localBranches.split("\n")).toEqual(["feature", "main"]);
+		expect(result.missing).toBe("BranchNotFoundError");
 	});
 
 	test("checks out an existing local branch in a folder named after it", async () => {
@@ -162,6 +202,38 @@ esac`,
 		expect(result.fromFork).toBe(true);
 	});
 
+	test("runs a fork's setup script only when the user starts it", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const project = yield* Effect.flatMap(ProjectService, (projects) =>
+					Effect.flatMap(addProject(tempDir), (added) =>
+						projects.updateScripts(added.id, { setupScript: "echo set up", runScript: null }),
+					),
+				);
+				const executable = yield* fakeGh(
+					tempDir,
+					`case "$1 $2" in
+"pr view") echo '{"headRefName":"main","baseRefName":"main","isCrossRepository":true}' ;;
+"pr checkout") git checkout -q -b "$5" ;;
+esac`,
+				);
+				const workspaces = yield* WorkspaceService;
+				const created = yield* workspaces
+					.create({ kind: "pullRequest", projectId: project.id, number: 9 })
+					.pipe(Effect.provideService(GhSettings, { executable }));
+				const before = yield* workspaces.listScriptRuns(created.id);
+				const started = yield* workspaces.startSetupScriptRun(created.id);
+				const finished = yield* waitForScriptRun(created.id);
+				return { created, before, started, finished, output: workspaces.getScriptRunOutput(started.id).output };
+			}),
+		);
+		expect(result.created.fromFork).toBe(true);
+		expect(result.before).toEqual([]);
+		expect(result.started).toMatchObject({ kind: "setup" });
+		expect(result.finished).toMatchObject({ id: result.started.id, status: "completed" });
+		expect(result.output).toContain("set up");
+	});
+
 	test("a fork's branch stays a fork after its workspace is archived, and so does a branch made from it", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -194,6 +266,32 @@ esac`,
 			}),
 		);
 		expect(result).toEqual({ reused: true, derived: true, own: false });
+	});
+
+	test("removes the new worktree when its branch cannot be marked as a fork's", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const project = yield* addProject(tempDir);
+				yield* runGit(project.path, ["branch", "pr-9-main"]);
+				yield* runGit(project.path, ["config", "--type=bool", "branch.pr-9-main.octopusFromFork", "true"]);
+				// A held lock makes git refuse to write the config.
+				yield* fs.writeFileString(join(project.path, ".git", "config.lock"), "");
+				const workspaces = yield* WorkspaceService;
+				const error = yield* Effect.flip(
+					workspaces.create({ kind: "worktree", projectId: project.id, name: "derived", baseBranch: "pr-9-main" }),
+				);
+				yield* fs.remove(join(project.path, ".git", "config.lock"));
+				return {
+					error: error._tag,
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+					rows: yield* workspaces.list(project.id),
+				};
+			}),
+		);
+		expect(result.error).toBe("GitCommandError");
+		expect(result.worktrees).not.toContain("derived");
+		expect(result.rows).toEqual([]);
 	});
 
 	test("removes the worktree when gh cannot check out the pull request", async () => {

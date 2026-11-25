@@ -8,7 +8,7 @@ import {
 	updateProjectScripts,
 	useAppState,
 } from "../lib/store.ts";
-import type { Workspace } from "@repo/contracts/Workspace";
+import { WorkspaceHasUnsavedWorkError, type Workspace } from "@repo/contracts/Workspace";
 import type { Project } from "@repo/contracts/Project";
 import { errorMessage } from "../lib/daemonRuntime.ts";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@repo/ui/components/dialog";
@@ -115,6 +115,7 @@ const Trust = ({ project }: { readonly project: Project }) => (
 const Archive = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [state, setState] = useState<"idle" | "busy" | "unsaved">("idle");
 	const [error, setError] = useState<string | null>(null);
+	const [ignoredFiles, setIgnoredFiles] = useState<ReadonlyArray<string>>([]);
 	const archive = async (force: boolean) => {
 		setState("busy");
 		setError(null);
@@ -122,6 +123,7 @@ const Archive = ({ workspace }: { readonly workspace: Workspace }) => {
 			() => openDialog(null),
 			(failure: unknown) => {
 				if (isUnsavedWorkError(failure)) {
+					setIgnoredFiles(failure instanceof WorkspaceHasUnsavedWorkError ? failure.ignoredFiles : []);
 					setState("unsaved");
 					return;
 				}
@@ -144,6 +146,11 @@ const Archive = ({ workspace }: { readonly workspace: Workspace }) => {
 						This worktree has changes that are not committed or not pushed. Archiving anyway stashes the uncommitted
 						changes and keeps the branch with its commits. Run <code>git stash list</code> in the project to find them.
 					</p>
+					{ignoredFiles.length === 0 ? null : (
+						<p className="text-xs text-destructive">
+							Files git ignores are not stashed, so archiving deletes them: {ignoredFiles.join(", ")}
+						</p>
+					)}
 					<div className="flex justify-end gap-1.5">
 						<Button size="sm" variant="ghost" onClick={() => setState("idle")}>
 							Keep the workspace

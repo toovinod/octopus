@@ -1231,6 +1231,37 @@ describe("SessionService", () => {
 		expect(refused).toMatchObject({ _tag: "ModeNotAllowedError", mode: "fullAccess", reason: "fork" });
 	});
 
+	test("does not trust a project folder that was switched to a fork's branch after the workspace was made", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const inputs: Array<StartSessionInput> = [];
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: (input) => Effect.tap(replay.startSession(input), () => Effect.sync(() => void inputs.push(input))),
+		};
+		await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const workspace = yield* addWorkspace(tempDir);
+					yield* Effect.flatMap(ProjectService, (projects) => projects.setTrust(workspace.projectId, true));
+					// What `gh pr checkout` of a fork's pull request leaves behind.
+					yield* runGit(workspace.path, ["config", "branch.main.remote", "https://github.com/someone/fork.git"]);
+					const session = yield* sessions.create({
+						workspaceId: workspace.id,
+						agent: "codex",
+						model: "replay",
+						effort: null,
+					});
+					yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				}),
+			),
+		);
+		expect(inputs.map((input) => input.trustProjectSettings)).toEqual([false]);
+	});
+
 	test("keeps the mode the agent switches to by itself", async () => {
 		const codex = makeReplayAdapter({
 			kind: "codex",

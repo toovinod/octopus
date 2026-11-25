@@ -79,6 +79,7 @@ import { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import { CredentialStore } from "../agents/CredentialStore.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
+import { isForkCheckout } from "../workspaces/forkBranch.ts";
 import { SessionEvent } from "@repo/contracts/SessionEvent";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
@@ -448,7 +449,18 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			);
 			// The foreign key keeps the workspace while a session in it exists.
 			if (target === undefined) return yield* Effect.die("The session's workspace is missing");
-			return { ...target, trusted: target.projectTrusted && !target.fromFork };
+			// Checked again now: the folder may have switched to a fork's branch since, as with `gh pr checkout`.
+			const fromFork =
+				target.fromFork ||
+				(target.status === "active" &&
+					(yield* isForkCheckout(target.path).pipe(
+						Effect.catch((cause) =>
+							Effect.logWarning("Could not tell whether the branch is a fork's, so it is not trusted", cause).pipe(
+								Effect.as(true),
+							),
+						),
+					)));
+			return { ...target, fromFork, trusted: target.projectTrusted && !fromFork };
 		});
 
 		const startRuntime = Effect.fnUntraced(function* (row: SessionRow) {
@@ -643,7 +655,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			const { now, files } = yield* changesSince(path, checkpoint);
 			// Kept so the revert itself can be undone with git.
 			yield* runGit(path, ["update-ref", beforeRevertRef(row.workspaceId, sessionId), now]);
-			yield* restoreCheckpoint(path, checkpoint);
+			yield* restoreCheckpoint(path, checkpoint, now);
 			yield* Effect.logInfo("Reverted a workspace to a checkpoint").pipe(
 				Effect.annotateLogs({ sessionId, messageId, files: files.length }),
 			);

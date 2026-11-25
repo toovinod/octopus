@@ -1,5 +1,5 @@
 import { TerminalInfo, TerminalNotFoundError, type TerminalSpawnError } from "@repo/contracts/Terminal";
-import { Config, Context, Deferred, Effect, FiberMap, Layer, PubSub, Stream } from "effect";
+import { Config, Context, Deferred, Effect, Exit, FiberMap, Layer, PubSub, Stream } from "effect";
 import type { ProcessRegistry } from "../processes/ProcessRegistry.ts";
 import type { TerminalOutput } from "@repo/contracts/Terminal";
 import { spawnTerminal } from "./spawnTerminal.ts";
@@ -25,8 +25,24 @@ interface RunningTerminal {
 	readonly appended: { count: number };
 }
 
-// A slow client loses old output rather than growing the daemon's memory.
-const LIVE_BUFFER = 4096;
+// A slow client loses old output rather than growing the daemon's memory. One PTY read can be large, so
+// live output goes out in pieces of at most LIVE_CHUNK characters: the buffer then holds at most
+// LIVE_BUFFER * LIVE_CHUNK characters, whatever the reads were.
+const LIVE_BUFFER = 1024;
+export const LIVE_CHUNK = 4096;
+
+export const splitLiveOutput = (data: string): ReadonlyArray<string> => {
+	const pieces: Array<string> = [];
+	for (let start = 0; start < data.length; ) {
+		let end = Math.min(start + LIVE_CHUNK, data.length);
+		// Never between the two halves of a surrogate pair.
+		const last = data.charCodeAt(end - 1);
+		if (end < data.length && last >= 0xd800 && last <= 0xdbff) end--;
+		pieces.push(data.slice(start, end));
+		start = end;
+	}
+	return pieces;
+};
 
 export class TerminalService extends Context.Service<TerminalService>()("octopus/daemon/terminals/TerminalService", {
 	make: Effect.gen(function* () {
@@ -45,7 +61,9 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		const startPty = (info: TerminalInfo, cwd: string, size: Size) =>
 			Effect.gen(function* () {
 				const output = yield* PubSub.sliding<IndexedOutput>(LIVE_BUFFER);
-				yield* Effect.addFinalizer(() => PubSub.shutdown(output));
+				// After a natural exit, clients still have the exit event to read and end on it themselves. Shutting
+				// down then could drop it, so only a closed terminal shuts its clients' streams.
+				yield* Effect.addFinalizer((exit) => (Exit.isSuccess(exit) ? Effect.void : PubSub.shutdown(output)));
 				const decoder = new TextDecoder();
 				const scrollback = new Scrollback();
 				const appended = { count: 0 };
@@ -57,7 +75,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 					onData: (bytes) => {
 						const data = decoder.decode(bytes, { stream: true });
 						scrollback.append(data);
-						publish({ output, appended }, { type: "data", data });
+						for (const piece of splitLiveOutput(data)) publish({ output, appended }, { type: "data", data: piece });
 					},
 				});
 				const terminal: RunningTerminal = { info, pty, scrollback, output, appended };

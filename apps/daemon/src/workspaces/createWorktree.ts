@@ -14,6 +14,14 @@ export const refExists = (repositoryPath: string, ref: string) =>
 		Effect.catchTag("GitCommandError", () => Effect.succeed(false)),
 	);
 
+// The full ref of a branch here, or else on origin, or null when neither has it.
+export const resolveBranchRef = Effect.fn("resolveBranchRef")(function* (repositoryPath: string, branch: string) {
+	for (const ref of [`refs/heads/${branch}`, `refs/remotes/origin/${branch}`]) {
+		if (yield* refExists(repositoryPath, ref)) return ref;
+	}
+	return null;
+});
+
 export const createWorktree = Effect.fn("createWorktree")(function* (options: {
 	readonly repositoryPath: string;
 	readonly worktreePath: string;
@@ -24,7 +32,13 @@ export const createWorktree = Effect.fn("createWorktree")(function* (options: {
 	if (yield* refExists(repositoryPath, `refs/heads/${branch}`)) {
 		return yield* new BranchAlreadyExistsError({ branch });
 	}
-	yield* runGit(repositoryPath, ["worktree", "add", "-b", branch, worktreePath, baseBranch]).pipe(
+	// A bare name that only origin has makes git check out a new local branch of that name instead of `branch`.
+	const baseRef = yield* resolveBranchRef(repositoryPath, baseBranch);
+	if (baseRef === null) {
+		return yield* new BranchNotFoundError({ branch: baseBranch });
+	}
+	// No tracking: the workspace branch is new, and pushing sets its own upstream.
+	yield* runGit(repositoryPath, ["worktree", "add", "--no-track", "-b", branch, worktreePath, baseRef]).pipe(
 		Effect.catchTag("GitCommandError", (cause) =>
 			Effect.logError("git worktree add failed", cause).pipe(
 				Effect.andThen(Effect.fail(new WorktreeCreateError({ branch }))),

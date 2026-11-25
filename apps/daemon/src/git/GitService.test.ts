@@ -124,6 +124,38 @@ describe("GitService diff", () => {
 		]);
 	});
 
+	test("keeps every file's hunks when one file became a symlink", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const repositoryPath = join(tempDir, "repo");
+				yield* makeTestRepository(repositoryPath);
+				for (const name of ["a.txt", "b.txt", "c.txt"]) {
+					yield* fs.writeFileString(join(repositoryPath, name), `${name}\n`);
+				}
+				yield* runGit(repositoryPath, ["add", "."]);
+				yield* runGit(repositoryPath, ["commit", "-m", "base"]);
+				const created = yield* createWorkspace(tempDir);
+				yield* fs.writeFileString(join(created.path, "a.txt"), "a edited\n");
+				yield* fs.remove(join(created.path, "b.txt"));
+				yield* fs.symlink("a.txt", join(created.path, "b.txt"));
+				yield* fs.writeFileString(join(created.path, "c.txt"), "c edited\n");
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		expect(diff.files.map((file) => [file.path, file.content.kind])).toEqual([
+			["a.txt", "text"],
+			["b.txt", "text"],
+			["c.txt", "text"],
+		]);
+		const symlink = diff.files.find((file) => file.path === "b.txt");
+		const lines = symlink?.content.kind === "text" ? symlink.content.hunks.flatMap((hunk) => hunk.lines) : [];
+		expect(lines.map((line) => [line.kind, line.text])).toEqual([
+			["delete", "b.txt"],
+			["add", "a.txt"],
+		]);
+	});
+
 	test("includes commits made in the workspace since it left the base branch", async () => {
 		const diff = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -561,6 +593,88 @@ describe("GitService pull requests", () => {
 			}),
 		);
 		expect(error._tag).toBe("PullRequestMergeError");
+	});
+});
+
+describe("GitService in a fork's workspace", () => {
+	// A worktree whose branch came from a fork's pull request, as `gh pr checkout` leaves it, plus hooks that
+	// would fail any commit or push they ran for.
+	const forkWorkspace = Effect.fn("forkWorkspace")(function* (tempDir: string) {
+		const fs = yield* FileSystem.FileSystem;
+		const created = yield* createWorkspace(tempDir);
+		const repositoryPath = join(tempDir, "repo");
+		const fork = join(tempDir, "fork.git");
+		yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", fork]);
+		yield* runGit(repositoryPath, ["config", "branch.feature.octopusFromFork", "true"]);
+		yield* runGit(repositoryPath, ["config", "branch.feature.remote", fork]);
+		yield* runGit(repositoryPath, ["config", "branch.feature.merge", "refs/heads/their-branch"]);
+		for (const hook of ["pre-commit", "pre-push"]) {
+			const path = join(repositoryPath, ".git", "hooks", hook);
+			yield* fs.writeFileString(path, `#!/bin/sh\ntouch "${tempDir}/${hook}-ran"\nexit 1\n`);
+			yield* fs.chmod(path, 0o755);
+		}
+		return { created, fork, origin: yield* addOrigin(tempDir, repositoryPath) };
+	});
+
+	test("commits and pushes to the fork's branch without running hooks, and opens no pull request", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const git = yield* GitService;
+				const { created, fork, origin } = yield* forkWorkspace(tempDir);
+				yield* fs.writeFileString(join(created.path, "fix.txt"), "fix\n");
+				yield* git.commit(created.id, "review fix", null);
+				yield* git.push(created.id);
+				return {
+					forkBranch: yield* runGit(fork, ["log", "-1", "--format=%s", "their-branch"]),
+					originBranches: yield* runGit(origin, ["branch", "--list"]),
+					hooksRan:
+						(yield* fs.exists(join(tempDir, "pre-commit-ran"))) || (yield* fs.exists(join(tempDir, "pre-push-ran"))),
+					createError: yield* Effect.flip(git.createPullRequest(created.id, { title: "x", body: "", draft: false })),
+				};
+			}),
+		);
+		expect(result.forkBranch).toBe("review fix");
+		expect(result.originBranches).toBe("");
+		expect(result.hooksRan).toBe(false);
+		expect(result.createError._tag).toBe("ForkPullRequestError");
+	});
+
+	test("merges a fork's pull request and keeps its branch without an error", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const git = yield* GitService;
+				const { created } = yield* forkWorkspace(tempDir);
+				const executable = yield* fakeGh(
+					tempDir,
+					[
+						`[ "$1 $2 $3 $4 $5" = "pr view 7 --json headRefName" ] && echo '{"headRefName":"their-branch"}' && exit 0`,
+						`[ "$1 $2" = "pr view" ] && echo '${foundJson}'`,
+						"exit 0",
+					].join("\n"),
+				);
+				const status = yield* git
+					.mergePullRequest(created.id, "squash", true)
+					.pipe(Effect.provideService(GhSettings, { executable }));
+				return { status, ghLog: yield* fs.readFileString(join(tempDir, "gh.log")) };
+			}),
+		);
+		expect(result.ghLog).toContain("pr merge 7 --squash");
+		expect(result.status.status).toBe("found");
+	});
+});
+
+describe("GitService on an archived workspace", () => {
+	test("refuses with WorkspaceArchivedError", async () => {
+		const error = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const created = yield* createWorkspace(tempDir);
+				yield* Effect.flatMap(WorkspaceService, (workspaces) => workspaces.archive(created.id, { force: true }));
+				return yield* Effect.flip(Effect.flatMap(GitService, (git) => git.getStatus(created.id)));
+			}),
+		);
+		expect(error._tag).toBe("WorkspaceArchivedError");
 	});
 });
 

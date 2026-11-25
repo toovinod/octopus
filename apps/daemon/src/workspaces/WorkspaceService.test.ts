@@ -1,6 +1,6 @@
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
+import { MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
-import { MAX_FINISHED_OUTPUTS, WorkspaceService } from "./WorkspaceService.ts";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { Duration, Effect, Fiber, FileSystem, Stream } from "effect";
@@ -195,6 +195,7 @@ describe("WorkspaceService", () => {
 		expect(result.refused).toMatchObject({
 			changedFiles: ["README.md", "new.txt"],
 			unpushedCommits: 0,
+			ignoredFiles: [],
 		});
 		expect(result.stillThere).toBe(true);
 		expect(result.terminalsAfterRefusal).toBe(1);
@@ -261,6 +262,76 @@ describe("WorkspaceService", () => {
 		});
 		expect(result.archived.status).toBe("archived");
 		expect(result.branchHead).toBe("work");
+	});
+
+	test("archives a workspace whose base branch was deleted, refusing unpushed commits without force", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* runGit(project.path, ["branch", "develop"]);
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "develop",
+				});
+				yield* runGit(project.path, ["branch", "-D", "develop"]);
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				const archived = yield* workspaces.archive(created.id, { force: true });
+				return { refused, archived };
+			}),
+		);
+		expect(result.refused._tag).toBe("WorkspaceHasUnsavedWorkError");
+		expect(result.archived.status).toBe("archived");
+	});
+
+	test("refuses to archive ignored files such as .env, but not installed dependencies, unless forced", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), ".env\nnode_modules/\n");
+				yield* runGit(project.path, ["add", ".gitignore"]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, ".env"), "SECRET=1\n");
+				yield* fs.makeDirectory(join(created.path, "node_modules"));
+				yield* fs.writeFileString(join(created.path, "node_modules", "lib.js"), "installed\n");
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				const archived = yield* workspaces.archive(created.id, { force: true });
+				return { refused, archived, folderExists: yield* fs.exists(created.path) };
+			}),
+		);
+		expect(result.refused).toMatchObject({
+			_tag: "WorkspaceHasUnsavedWorkError",
+			changedFiles: [],
+			unpushedCommits: 0,
+			ignoredFiles: [".env"],
+		});
+		expect(result.archived.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
+	});
+
+	test("archives a worktree with an initialized submodule", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const library = yield* makeTestRepository(join(tempDir, "library"));
+				const allowFile = ["-c", "protocol.file.allow=always"];
+				yield* runGit(project.path, [...allowFile, "submodule", "add", "-q", library, "library"]);
+				yield* runGit(project.path, ["commit", "-m", "add library"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, [...allowFile, "submodule", "update", "-q", "--init"]);
+				const archived = yield* workspaces.archive(created.id, { force: false });
+				return { archived, folderExists: yield* fs.exists(created.path) };
+			}),
+		);
+		expect(result.archived.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
 	});
 
 	test("archiving an in-place workspace removes nothing", async () => {
@@ -341,6 +412,20 @@ describe("WorkspaceService", () => {
 		expect(result.output.output).toContain(result.created.path);
 	});
 
+	test("a setup script that leaves a child running in the background finishes when the script exits", async () => {
+		const run = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir, "sleep 30 & echo started");
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				const finished = yield* waitForScriptRun(created.id);
+				return { finished, output: workspaces.getScriptRunOutput(finished?.id ?? "").output };
+			}),
+		);
+		expect(run.finished).toMatchObject({ status: "completed", exitCode: 0 });
+		expect(run.output).toContain("started");
+	});
+
 	test("a failing setup script fails at once, without retries", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -360,6 +445,50 @@ describe("WorkspaceService", () => {
 			attempts: 0,
 			lastError: "The setup script exited with code 3.",
 		});
+	});
+
+	test("starts a failed setup script over when the user runs it again, and refuses once archived", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir, "exit 3");
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				const failed = yield* waitForScriptRun(created.id);
+				yield* Effect.flatMap(ProjectService, (projects) =>
+					projects.updateScripts(project.id, { setupScript: "true", runScript: null }),
+				);
+				yield* workspaces.startSetupScriptRun(created.id);
+				const retried = yield* waitForScriptRun(created.id);
+				yield* workspaces.archive(created.id, { force: true });
+				const refused = yield* Effect.flip(workspaces.startSetupScriptRun(created.id));
+				return { failed, retried, runs: yield* workspaces.listScriptRuns(created.id), refused };
+			}),
+		);
+		expect(result.failed?.status).toBe("failed");
+		expect(result.retried).toMatchObject({ id: result.failed?.id, status: "completed", attempts: 0, lastError: null });
+		expect(result.runs).toHaveLength(1);
+		expect(result.refused._tag).toBe("WorkspaceArchivedError");
+	});
+
+	test("runs only a few setup scripts at once", async () => {
+		const log = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const logPath = join(tempDir, "setup.log");
+				const project = yield* addProject(tempDir, `echo start >> ${logPath}; sleep 0.3; echo end >> ${logPath}`);
+				const names = Array.from({ length: SETUP_SCRIPTS_AT_ONCE + 1 }, (_, index) => `feature-${index}`);
+				const created = yield* Effect.forEach(names, (name) =>
+					workspaces.create({ kind: "worktree", projectId: project.id, name }),
+				);
+				yield* Effect.forEach(created, (each) => waitForScriptRun(each.id));
+				return yield* Effect.flatMap(FileSystem.FileSystem, (fs) => fs.readFileString(logPath));
+			}),
+		);
+		const lines = log.trim().split("\n");
+		expect(lines.slice(0, SETUP_SCRIPTS_AT_ONCE + 1)).toEqual([
+			...Array.from({ length: SETUP_SCRIPTS_AT_ONCE }, () => "start"),
+			"end",
+		]);
 	});
 
 	test("a timed-out setup script is retried, then dead-lettered", async () => {
@@ -431,6 +560,35 @@ describe("WorkspaceService", () => {
 			attempts: 1,
 			exitCode: 0,
 		});
+	});
+
+	test("on startup, removes a worktree folder that no workspace owns and keeps its branch", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const dataDir = join(tempDir, "data");
+				// First lifetime: one workspace, and a folder a crash left before its workspace was saved.
+				const { project, created, orphan } = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const project = yield* addProject(tempDir);
+						const created = yield* Effect.flatMap(WorkspaceService, (workspaces) =>
+							workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" }),
+						);
+						const orphan = join(dataDir, "worktrees", project.id, "orphan");
+						yield* runGit(project.path, ["worktree", "add", "-q", "-b", "orphan", orphan]);
+						return { project, created, orphan };
+					}),
+				);
+				// Second lifetime: startup finds the orphan.
+				yield* withServices(dataDir)(Effect.void);
+				return {
+					orphanExists: yield* fs.exists(orphan),
+					ownedExists: yield* fs.exists(created.path),
+					orphanBranch: yield* branchExists(project.path, "orphan"),
+				};
+			}),
+		);
+		expect(result).toEqual({ orphanExists: false, ownedExists: true, orphanBranch: true });
 	});
 
 	test("removes the new worktree and branch when the workspace cannot be saved", async () => {

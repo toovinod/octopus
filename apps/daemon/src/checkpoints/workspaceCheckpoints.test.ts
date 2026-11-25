@@ -1,4 +1,5 @@
 import {
+	CHECKPOINTS_PER_SESSION,
 	changesSince,
 	checkpointRef,
 	deleteCheckpoints,
@@ -37,8 +38,8 @@ describe("workspace checkpoints", () => {
 
 				const checkpoint = yield* findCheckpoint(repo, ref);
 				if (checkpoint === null) return yield* Effect.die("no checkpoint");
-				const { files } = yield* changesSince(repo, checkpoint);
-				yield* restoreCheckpoint(repo, checkpoint);
+				const { now, files } = yield* changesSince(repo, checkpoint);
+				yield* restoreCheckpoint(repo, checkpoint, now);
 				return {
 					files,
 					readme: yield* fs.readFileString(join(repo, "README.md")),
@@ -63,6 +64,101 @@ describe("workspace checkpoints", () => {
 		expect(result.staged).toBe("");
 		expect(result.head).toBe("init");
 		expect(result.missing).toBeNull();
+	});
+
+	test("keeps files ignored at the checkpoint, though the agent deleted the .gitignore", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* fs.writeFileString(join(repo, ".gitignore"), ".env\n");
+				yield* fs.writeFileString(join(repo, ".env"), "SECRET=1\n");
+				const ref = checkpointRef("workspace-1", "session-1", "message-1");
+				yield* saveCheckpoint(repo, ref);
+				yield* fs.remove(join(repo, ".gitignore"));
+				yield* fs.writeFileString(join(repo, "made-by-agent.ts"), "new\n");
+				const checkpoint = yield* findCheckpoint(repo, ref);
+				if (checkpoint === null) return yield* Effect.die("no checkpoint");
+				const { now } = yield* changesSince(repo, checkpoint);
+				yield* restoreCheckpoint(repo, checkpoint, now);
+				return {
+					env: yield* fs.exists(join(repo, ".env")),
+					gitignore: yield* fs.exists(join(repo, ".gitignore")),
+					agentFile: yield* fs.exists(join(repo, "made-by-agent.ts")),
+				};
+			}).pipe(Effect.provide(SecureRandom.layerWebCrypto)),
+		);
+		expect(result).toEqual({ env: true, gitignore: true, agentFile: false });
+	});
+
+	test("puts the files back as they were when a revert fails partway", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				const ref = checkpointRef("workspace-1", "session-1", "message-1");
+				yield* saveCheckpoint(repo, ref);
+				yield* fs.writeFileString(join(repo, "README.md"), "after the turn\n");
+				yield* fs.writeFileString(join(repo, "a-new.txt"), "made by the agent\n");
+				// A folder whose file cannot be deleted makes the revert fail after it wrote README.md.
+				yield* fs.makeDirectory(join(repo, "locked"));
+				yield* fs.writeFileString(join(repo, "locked", "file.txt"), "x\n");
+				yield* fs.chmod(join(repo, "locked"), 0o555);
+				const checkpoint = yield* findCheckpoint(repo, ref);
+				if (checkpoint === null) return yield* Effect.die("no checkpoint");
+				const { now } = yield* changesSince(repo, checkpoint);
+				const failed = yield* Effect.exit(restoreCheckpoint(repo, checkpoint, now));
+				yield* fs.chmod(join(repo, "locked"), 0o755);
+				return {
+					failed: failed._tag,
+					readme: yield* fs.readFileString(join(repo, "README.md")),
+					newFile: yield* fs.exists(join(repo, "a-new.txt")),
+				};
+			}).pipe(Effect.provide(SecureRandom.layerWebCrypto)),
+		);
+		expect(result).toEqual({ failed: "Failure", readme: "after the turn\n", newFile: true });
+	});
+
+	test("unstages changes staged after the checkpoint", async () => {
+		const staged = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				const ref = checkpointRef("workspace-1", "session-1", "message-1");
+				yield* saveCheckpoint(repo, ref);
+				yield* fs.writeFileString(join(repo, "README.md"), "after the turn\n");
+				yield* fs.writeFileString(join(repo, "added.txt"), "new\n");
+				yield* runGit(repo, ["add", "README.md", "added.txt"]);
+				const checkpoint = yield* findCheckpoint(repo, ref);
+				if (checkpoint === null) return yield* Effect.die("no checkpoint");
+				const { now } = yield* changesSince(repo, checkpoint);
+				yield* restoreCheckpoint(repo, checkpoint, now);
+				return yield* runGit(repo, ["status", "--porcelain"]);
+			}).pipe(Effect.provide(SecureRandom.layerWebCrypto)),
+		);
+		expect(staged).toBe("");
+	});
+
+	test("keeps only a session's latest checkpoints", async () => {
+		const refs = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				const tree = yield* runGit(repo, ["write-tree"]);
+				const id = (index: number) => String(index).padStart(4, "0");
+				for (let index = 0; index < CHECKPOINTS_PER_SESSION; index++) {
+					yield* runGit(repo, ["update-ref", checkpointRef("w", "s", id(index)), tree]);
+				}
+				yield* runGit(repo, ["update-ref", "refs/octopus/checkpoints/w/s/before-revert", tree]);
+				yield* runGit(repo, ["update-ref", checkpointRef("w", "other", id(0)), tree]);
+				yield* saveCheckpoint(repo, checkpointRef("w", "s", id(CHECKPOINTS_PER_SESSION)));
+				return (yield* runGit(repo, ["for-each-ref", "--format=%(refname)", "refs/octopus/"])).split("\n");
+			}).pipe(Effect.provide(SecureRandom.layerWebCrypto)),
+		);
+		expect(refs).toHaveLength(CHECKPOINTS_PER_SESSION + 2);
+		expect(refs).not.toContain("refs/octopus/checkpoints/w/s/0000");
+		expect(refs).toContain("refs/octopus/checkpoints/w/s/0001");
+		expect(refs).toContain("refs/octopus/checkpoints/w/s/before-revert");
+		expect(refs).toContain("refs/octopus/checkpoints/w/other/0000");
 	});
 
 	test("deletes only the archived workspace's checkpoints", async () => {

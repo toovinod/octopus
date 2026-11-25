@@ -3,6 +3,9 @@ import {
 	CommitFailedError,
 	CommitResult,
 	DiffFile,
+	type DiffHunk,
+	ForkPullRequestError,
+	ForkPushTargetMissingError,
 	GitStatus,
 	NoRemoteError,
 	NothingToCommitError,
@@ -32,14 +35,16 @@ import {
 	parseNameStatus,
 	parseNumstat,
 	parsePatch,
+	parseTypeChanges,
 	parseStatus,
 	untrackedHunks,
 } from "./parseGitOutput.ts";
+import { type Workspace, WorkspaceArchivedError } from "@repo/contracts/Workspace";
 import { Context, Effect, type FileSystem, Layer, Schema } from "effect";
 import { type GhCommandError, requireGhLogin, runGh } from "./runGh.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { readWorkspaceFile } from "../files/readWorkspaceFile.ts";
-import type { Workspace } from "@repo/contracts/Workspace";
+import { isForkCheckout } from "../workspaces/forkBranch.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { leavesRoot } from "../files/leavesRoot.ts";
 import { normalize } from "node:path";
@@ -155,6 +160,23 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		const workspaces = yield* WorkspaceService;
 		const services = yield* Effect.context<ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem>();
 
+		// An archived worktree folder is gone, and an archived in-place workspace should stay untouched.
+		const activeWorkspace = Effect.fnUntraced(function* (workspaceId: string) {
+			const current = yield* workspaces.get(workspaceId);
+			if (current.status === "archived") {
+				return yield* new WorkspaceArchivedError({ workspaceId });
+			}
+			return current;
+		});
+
+		// A fork's code, stored at creation or seen now on the checked-out branch, as in an in-place workspace.
+		const holdsFork = (current: Workspace) => (current.fromFork ? Effect.succeed(true) : isForkCheckout(current.path));
+
+		// A fork's checkout can set core.hooksPath to its own tracked files, and Octopus never runs a fork's code
+		// unasked, so commits and pushes in one skip the hooks.
+		const hookArgs = (current: Workspace) =>
+			holdsFork(current).pipe(Effect.map((fork) => (fork ? ["-c", "core.hooksPath=/dev/null"] : [])));
+
 		// The point where the workspace left its base branch. Without one (unrelated histories, a missing
 		// base branch) the diff falls back to HEAD and shows only uncommitted changes.
 		const findMergeBase = (current: Workspace) =>
@@ -242,14 +264,23 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 							),
 						]);
 			const sections = parsePatch(patch);
-			if (sections.length !== fitting.length) {
+			const typeChanges = parseTypeChanges(nameStatus);
+			const expected = fitting.length + fitting.filter(({ changed }) => typeChanges.has(changed.path)).length;
+			if (sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
 				);
 			}
-			const hunksByPath = new Map(
-				sections.length === fitting.length ? fitting.map((file, index) => [file.changed.path, sections[index]]) : [],
-			);
+			// Sections come in the files' order, and a type change takes two of them.
+			const hunksByPath = new Map<string, { readonly hunks: ReadonlyArray<DiffHunk> }>();
+			if (sections.length === expected) {
+				let next = 0;
+				for (const { changed } of fitting) {
+					const parts = sections.slice(next, next + (typeChanges.has(changed.path) ? 2 : 1));
+					next += parts.length;
+					hunksByPath.set(changed.path, { hunks: parts.flatMap((part) => part.hunks) });
+				}
+			}
 
 			const toDiffFile = ({ changed, count }: { changed: ChangedPath; count: LineCounts }) => {
 				const section = hunksByPath.get(changed.path);
@@ -284,7 +315,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		});
 
 		const getWorkspaceDiff = Effect.fn("GitService.getWorkspaceDiff")(function* (workspaceId: string) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			return yield* loadDiff(current, {
 				onlyPath: null,
 				fileLimit: DIFF_FILE_LINE_LIMIT,
@@ -293,7 +324,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		}, Effect.provide(services));
 
 		const getFileDiff = Effect.fn("GitService.getFileDiff")(function* (workspaceId: string, path: string) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			// Only paths inside the workspace can be part of its diff.
 			if (leavesRoot(normalize(path))) {
 				return null;
@@ -307,7 +338,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		}, Effect.provide(services));
 
 		const getStatus = Effect.fn("GitService.getStatus")(function* (workspaceId: string) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			const output = yield* runGit(current.path, ["status", "--porcelain=v2", "--branch", "-z"]);
 			return new GitStatus(parseStatus(output));
 		}, Effect.provide(services));
@@ -317,7 +348,8 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			message: string,
 			paths: ReadonlyArray<string> | null,
 		) {
-			const { path: cwd } = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
+			const { path: cwd } = current;
 			// null means every change. An empty list means none, never "all" through a bare `--`.
 			if (paths !== null && paths.length === 0) {
 				return yield* new NothingToCommitError();
@@ -334,7 +366,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			if (nothingStaged) {
 				return yield* new NothingToCommitError();
 			}
-			yield* runGit(cwd, ["commit", "--message", message, ...selected]).pipe(
+			yield* runGit(cwd, [...(yield* hookArgs(current)), "commit", "--message", message, ...selected]).pipe(
 				Effect.catchTag("GitCommandError", (cause) =>
 					Effect.logError("git commit failed", cause).pipe(Effect.andThen(Effect.fail(new CommitFailedError()))),
 				),
@@ -359,11 +391,26 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 
 		const pushWorkspace = Effect.fn("GitService.pushWorkspace")(function* (current: Workspace) {
 			yield* requireWorkspaceBranch(current);
-			const remotes = yield* runGit(current.path, ["remote"]);
-			if (!remotes.split("\n").includes("origin")) {
-				return yield* new NoRemoteError();
+			const hooks = yield* hookArgs(current);
+			let push: ReadonlyArray<string>;
+			if (hooks.length > 0) {
+				// A fork's branch goes back where `gh pr checkout` said it came from, never to origin under its local name.
+				const config = (key: string) =>
+					runGit(current.path, ["config", "--default", "", "--get", `branch.${current.branch}.${key}`]);
+				const remote = yield* config("remote");
+				const merge = yield* config("merge");
+				if (remote === "" || merge === "") {
+					return yield* new ForkPushTargetMissingError({ branch: current.branch });
+				}
+				push = [...hooks, "push", remote, `refs/heads/${current.branch}:${merge}`];
+			} else {
+				const remotes = yield* runGit(current.path, ["remote"]);
+				if (!remotes.split("\n").includes("origin")) {
+					return yield* new NoRemoteError();
+				}
+				push = ["push", "--set-upstream", "origin", current.branch];
 			}
-			yield* runGit(current.path, ["push", "--set-upstream", "origin", current.branch]).pipe(
+			yield* runGit(current.path, push).pipe(
 				Effect.catchTag("GitCommandError", (cause) => {
 					const rejected = /\[rejected\]|non-fast-forward|fetch first/.test(cause.stderr);
 					return Effect.logError("git push failed", cause).pipe(
@@ -381,7 +428,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		});
 
 		const push = Effect.fn("GitService.push")(function* (workspaceId: string) {
-			yield* pushWorkspace(yield* workspaces.get(workspaceId));
+			yield* pushWorkspace(yield* activeWorkspace(workspaceId));
 		}, Effect.provide(services));
 
 		// With no argument, run in the workspace folder, gh finds the pull request of the checked-out branch
@@ -428,7 +475,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			);
 
 		const getPullRequest = Effect.fn("GitService.getPullRequest")(function* (workspaceId: string) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			const found = yield* findPullRequest(current);
 			if (found === null) {
 				return { status: "none" } satisfies PullRequestStatus;
@@ -443,7 +490,11 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			workspaceId: string,
 			details: { readonly title: string; readonly body: string; readonly draft: boolean },
 		) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
+			// A fork's branch already has its pull request, and a new one would be opened from the wrong repository.
+			if (yield* holdsFork(current)) {
+				return yield* new ForkPullRequestError({ branch: current.branch });
+			}
 			// Checked first, so a missing login does not leave a pushed branch and no pull request.
 			yield* requireGhLogin(current.path);
 			yield* pushWorkspace(current);
@@ -497,7 +548,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 		const getPullRequestConversation = Effect.fn("GitService.getPullRequestConversation")(function* (
 			workspaceId: string,
 		) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			const { branch } = current;
 			const number = yield* requirePullRequestNumber(current);
 			const viewed = yield* runGh(current.path, [
@@ -573,7 +624,7 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			workspaceId: string,
 			review: PullRequestReviewInput,
 		) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			const number = yield* requirePullRequestNumber(current);
 			yield* runGh(current.path, [
 				"pr",
@@ -597,20 +648,28 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			method: PullRequestMergeMethod,
 			deleteBranch: boolean,
 		) {
-			const current = yield* workspaces.get(workspaceId);
+			const current = yield* activeWorkspace(workspaceId);
 			const { branch } = current;
 			const number = yield* requirePullRequestNumber(current);
+			// A fork's branch lives in the fork, which Octopus does not push deletes to.
+			const fork = deleteBranch && (yield* holdsFork(current));
+			if (fork) {
+				yield* Effect.logInfo("Kept the fork's branch, which lives in the fork").pipe(
+					Effect.annotateLogs({ workspaceId }),
+				);
+			}
 			// Read before merging, so a gh failure here leaves the pull request open instead of half done.
-			const headRefName = deleteBranch
-				? yield* runGh(current.path, ["pr", "view", number, "--json", "headRefName"]).pipe(
-						Effect.catchTag(
-							"GhCommandError",
-							failGh(current.path, "gh pr view failed", new PullRequestReadError({ branch })),
-						),
-						Effect.flatMap((output) => decodeGh(GhHeadRef, output, branch)),
-						Effect.map((found) => found.headRefName),
-					)
-				: null;
+			const headRefName =
+				deleteBranch && !fork
+					? yield* runGh(current.path, ["pr", "view", number, "--json", "headRefName"]).pipe(
+							Effect.catchTag(
+								"GhCommandError",
+								failGh(current.path, "gh pr view failed", new PullRequestReadError({ branch })),
+							),
+							Effect.flatMap((output) => decodeGh(GhHeadRef, output, branch)),
+							Effect.map((found) => found.headRefName),
+						)
+					: null;
 			yield* runGh(current.path, ["pr", "merge", number, MERGE_FLAGS[method]]).pipe(
 				Effect.catchTag(
 					"GhCommandError",

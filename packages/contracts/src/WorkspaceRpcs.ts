@@ -16,8 +16,8 @@ import {
 	WorktreeCreateError,
 	WorktreeRemoveError,
 } from "./Workspace.ts";
+import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "./ScriptRun.ts";
 import { GhNotAuthenticatedError, GhNotInstalledError, GitTimeoutError } from "./Git.ts";
-import { RunScriptMissingError, ScriptRun, ScriptRunOutput } from "./ScriptRun.ts";
 import { DaemonInternalError } from "./DaemonInternalError.ts";
 import { ProjectNotFoundError } from "./Project.ts";
 import { Rpc, RpcGroup } from "effect/rpc";
@@ -145,6 +145,19 @@ export class WorkspaceRpcs extends RpcGroup.make(
 			WorkspaceNotFoundError,
 			WorkspaceArchivedError,
 			RunScriptMissingError,
+			ProjectNotFoundError,
+			DaemonInternalError,
+		]),
+	}),
+	// Starts the project's setup script in the workspace, or returns the run already going. A failed run starts
+	// over. A fork's pull request never runs it on its own, so the user starts it here once they have read the code.
+	Rpc.make("startSetupScript", {
+		payload: { workspaceId: Schema.String },
+		success: ScriptRun,
+		error: Schema.Union([
+			WorkspaceNotFoundError,
+			WorkspaceArchivedError,
+			SetupScriptMissingError,
 			ProjectNotFoundError,
 			DaemonInternalError,
 		]),
