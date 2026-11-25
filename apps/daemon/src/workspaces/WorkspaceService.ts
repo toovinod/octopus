@@ -790,6 +790,22 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			});
 			yield* recoverScriptRuns.pipe(Effect.provide(services));
 
+			const pruneProjectWorktrees = Effect.fnUntraced(function* (owner: Project, ownedPaths: ReadonlySet<string>) {
+				const folder = join(worktreesDir, owner.id);
+				if (!(yield* fs.exists(folder))) return;
+				const realFolder = yield* fs.realPath(folder);
+				const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
+				for (const line of listed.split("\n")) {
+					if (!line.startsWith("worktree ")) continue;
+					const path = line.slice("worktree ".length);
+					if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
+					// Rows hold the path Octopus made, which git may list with symlinks resolved.
+					if (ownedPaths.has(join(folder, basename(path)))) continue;
+					yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
+					yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
+				}
+			});
+
 			// A crash between adding a worktree and saving its workspace leaves a folder that no workspace owns and
 			// that blocks its name. Nothing ran in it yet, so it goes. Its branch stays, in case it holds commits.
 			const pruneOrphanWorktrees = Effect.gen(function* () {
@@ -801,21 +817,21 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				);
 				const ownedPaths = new Set(owned.map((row) => row.path));
 				for (const owner of yield* projects.list) {
-					const folder = join(worktreesDir, owner.id);
-					if (!(yield* fs.exists(folder))) continue;
-					const realFolder = yield* fs.realPath(folder);
-					const listed = yield* runGit(owner.path, ["worktree", "list", "--porcelain"]);
-					for (const line of listed.split("\n")) {
-						if (!line.startsWith("worktree ")) continue;
-						const path = line.slice("worktree ".length);
-						if (!(yield* fs.exists(path)) || (yield* fs.realPath(dirname(path))) !== realFolder) continue;
-						// Rows hold the path Octopus made, which git may list with symlinks resolved.
-						if (ownedPaths.has(join(folder, basename(path)))) continue;
-						yield* runGit(owner.path, ["worktree", "remove", "--force", path]);
-						yield* Effect.logWarning("Removed a worktree that no workspace owns").pipe(Effect.annotateLogs({ path }));
-					}
+					// Per project, so one whose folder is gone does not keep the others' orphans.
+					const giveUp = (cause: unknown) =>
+						Effect.logError("Could not look for worktrees that no workspace owns", cause).pipe(
+							Effect.annotateLogs({ projectId: owner.id }),
+						);
+					yield* pruneProjectWorktrees(owner, ownedPaths).pipe(
+						Effect.catchTags({
+							PlatformError: giveUp,
+							GitCommandError: giveUp,
+							GitSpawnError: giveUp,
+							GitTimeoutError: giveUp,
+						}),
+					);
 				}
-			}).pipe(Effect.catch((cause) => Effect.logError("Could not look for worktrees that no workspace owns", cause)));
+			});
 			yield* pruneOrphanWorktrees.pipe(Effect.provide(services));
 
 			return {

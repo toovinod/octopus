@@ -613,6 +613,34 @@ describe("WorkspaceService", () => {
 		expect(result).toEqual({ orphanExists: false, ownedExists: true, orphanBranch: true });
 	});
 
+	test("on startup, a project that cannot be checked does not keep the others' orphans", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const dataDir = join(tempDir, "data");
+				// First lifetime: a project whose folder goes away later, then one with an orphan.
+				const { broken, orphan } = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const projects = yield* ProjectService;
+						const broken = yield* projects.add(yield* makeTestRepository(join(tempDir, "gone", "repo")));
+						yield* fs.makeDirectory(join(dataDir, "worktrees", broken.id), { recursive: true });
+						// Added later, so startup checks it after the broken one.
+						yield* Effect.sleep("10 millis");
+						const project = yield* projects.add(yield* makeTestRepository(join(tempDir, "kept", "repo")));
+						const orphan = join(dataDir, "worktrees", project.id, "orphan");
+						yield* runGit(project.path, ["worktree", "add", "-q", "-b", "orphan", orphan]);
+						return { broken, orphan };
+					}),
+				);
+				yield* fs.remove(broken.path, { recursive: true });
+				// Second lifetime: startup still finds the orphan.
+				yield* withServices(dataDir)(Effect.void);
+				return yield* fs.exists(orphan);
+			}),
+		);
+		expect(result).toBe(false);
+	});
+
 	test("removes the new worktree and branch when the workspace cannot be saved", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
