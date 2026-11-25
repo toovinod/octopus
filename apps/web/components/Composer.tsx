@@ -21,7 +21,7 @@ import {
 	updateSessionSettings,
 	useAppState,
 } from "../lib/store.ts";
-import { MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
+import { draftImageOf, MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
 import { type Draft, draftOf, keepDraft } from "../lib/drafts.ts";
 import { memo, useEffect, useId, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
@@ -269,10 +269,21 @@ export const Composer = memo(
 									onClick={() =>
 										void interruptSession(session.id).then((dropped) => {
 											if (dropped === null || dropped.length === 0) return;
-											// Queued messages never ran, so their text comes back to be edited or sent again.
+											// Queued messages never ran, so they come back to be edited or sent again.
+											const returned = dropped.flatMap(({ images }) => images);
+											const room = MAX_IMAGES_PER_MESSAGE - draft.images.length;
+											if (returned.length > room) {
+												toast(
+													`A message can carry ${MAX_IMAGES_PER_MESSAGE} images at most, so some were left out.`,
+													"info",
+												);
+											}
+											const images = returned.slice(0, Math.max(0, room)).map(draftImageOf);
 											setDraft((current) => ({
-												...current,
-												text: [...dropped, current.text].filter((text) => text !== "").join("\n\n"),
+												text: [...dropped.map(({ text }) => text), current.text]
+													.filter((text) => text !== "")
+													.join("\n\n"),
+												images: [...images, ...current.images],
 											}));
 										})
 									}

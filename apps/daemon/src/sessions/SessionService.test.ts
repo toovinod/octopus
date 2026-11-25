@@ -31,9 +31,9 @@ import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/A
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
+import { makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
-import { makeAgentSession } from "../agents/makeAgentSession.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
@@ -860,6 +860,49 @@ describe("SessionService", () => {
 			{ type: "turn.completed", turnId: "replay-0", result: { status: "interrupted" } },
 		]);
 		expect(result.status).toBe("interrupted");
+	});
+
+	test("a stop hands back a queued message with its images, and leaves it out of history and off disk", async () => {
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const fs = yield* FileSystem.FileSystem;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				yield* sessions.sendMessage(session.id, "then commit", [image], false);
+				const dropped = yield* sessions.interrupt(session.id);
+				yield* waitForStatus(session.id, "interrupted");
+				const directory = join(tempDir, "data", "attachments", session.id);
+				return {
+					dropped,
+					messages: (yield* storedEvents(session.id)).filter((row) => row.type === "user.message").length,
+					files: (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [],
+				};
+			}),
+		);
+		expect(result.dropped).toEqual([{ text: "then commit", images: [image] }]);
+		expect(result.messages).toBe(1);
+		expect(result.files).toEqual([]);
+	});
+
+	test("stopping a session with a queued message says it was not sent", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "awaitingApproval");
+				yield* sessions.sendMessage(session.id, "then commit", [], false);
+				yield* sessions.stop(session.id);
+				return yield* storedEvents(session.id);
+			}),
+		);
+		expect(result.map((row) => row.payload)).toContainEqual(
+			unsentNotice([{ id: "", text: "then commit", images: [] }]),
+		);
+		expect(result.filter((row) => row.type === "user.message")).toHaveLength(1);
 	});
 
 	test("stopSession ends the process and the next message resumes with the native id", async () => {

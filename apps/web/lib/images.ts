@@ -26,6 +26,13 @@ const readBase64 = (file: File) =>
 
 let nextImage = 0;
 
+// For an image the daemon hands back, like one of a queued message a stop dropped.
+export const draftImageOf = ({ mediaType, base64 }: ImageData): DraftImage => {
+	const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+	const previewUrl = URL.createObjectURL(new Blob([bytes], { type: mediaType }));
+	return { id: `image-${++nextImage}`, mediaType, base64, previewUrl };
+};
+
 // Turns pasted, dropped or picked files into draft images, with a reason for each file left out.
 export const readImages = async (files: ReadonlyArray<File>, room: number) => {
 	const images: Array<DraftImage> = [];

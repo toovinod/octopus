@@ -31,6 +31,7 @@ import {
 	type SessionSettings,
 	type StartSessionInput,
 	type UserImage,
+	type UserMessage,
 } from "../agents/AgentAdapter.ts";
 import {
 	type Cause,
@@ -81,6 +82,7 @@ import { ProjectService } from "../projects/ProjectService.ts";
 import { WorkspaceLock } from "../workspaces/WorkspaceLock.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { isForkCheckout } from "../workspaces/forkBranch.ts";
+import { unsentNotice } from "../agents/makeAgentSession.ts";
 import { SessionEvent } from "@repo/contracts/SessionEvent";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
@@ -116,6 +118,8 @@ interface Runtime {
 	nextSequence: number;
 	// Turns sent and not yet completed, including queued ones.
 	outstanding: number;
+	// Queued messages a stop dropped with nobody to hand them back to, for the chat to say they were not sent.
+	unsent: ReadonlyArray<UserMessage>;
 	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
 	readonly approvals: Map<string, Cancellation>;
 	// The status when no turn or approval is pending.
@@ -341,6 +345,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* Scope.close(runtime.scope, Exit.void);
 				// Nothing can answer what the process left open, so history closes it instead of offering it forever.
 				for (const cancellation of [...runtime.approvals.values()]) yield* record(runtime, cancellation);
+				if (runtime.unsent.length > 0) yield* record(runtime, unsentNotice(runtime.unsent));
 				if (runtime.outstanding > 0) {
 					const turnId = yield* newId.pipe(Effect.provide(services));
 					yield* record(runtime, { type: "turn.completed", turnId, result: { status: "interrupted" } });
@@ -386,6 +391,11 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				!runtime.ending && isBusy(runtime.status)
 					? runtime.handle.interrupt.pipe(
 							Effect.timeoutOption(STOP_GRACE),
+							Effect.flatMap((dropped) =>
+								Effect.sync(() => {
+									runtime.unsent = Option.getOrElse(dropped, () => []);
+								}),
+							),
 							Effect.catch((error) => Effect.logWarning("Could not interrupt the agent before stopping it", error)),
 						)
 					: Effect.void;
@@ -542,6 +552,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					idleSince: clock.currentTimeNanosUnsafe(),
 					nextSequence: (stored?.last ?? -1) + 1,
 					outstanding: 0,
+					unsent: [],
 					approvals: new Map(),
 					resting: isBusy(row.status) ? "idle" : row.status,
 					status: row.status,
@@ -629,7 +640,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				yield* refreshStatus(runtime);
 				// Taken when the message's turn starts, so a queued message's checkpoint holds the turns before it.
 				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
-				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn }).pipe(
+				// A queued message dropped before its turn is never stored, so nothing will ask for its images.
+				const discard = Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)), { discard: true });
+				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn, discard }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>
@@ -750,7 +763,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			yield* runtime.handle.answerQuestion(requestId, answers);
 		});
 
-		// Returns the text of the queued messages it dropped, so the user can send them again.
+		// Returns the queued messages it dropped, with their images, so the user can send them again.
 		const interrupt = Effect.fn("SessionService.interrupt")(function* (sessionId: string) {
 			const runtime = runtimes.get(sessionId);
 			if (runtime === undefined) {
@@ -760,7 +773,10 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			const dropped = yield* runtime.handle.interrupt;
 			runtime.outstanding = Math.max(0, runtime.outstanding - dropped.length);
 			yield* refreshStatus(runtime);
-			return dropped.map(({ text }) => text);
+			return dropped.map(({ text, images }) => ({
+				text,
+				images: images.map(({ mediaType, base64 }) => ({ mediaType, base64 })),
+			}));
 		});
 
 		const stop = Effect.fn("SessionService.stop")(
