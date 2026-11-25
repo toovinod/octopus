@@ -13,6 +13,7 @@ import { useTheme } from "next-themes";
 
 // Matches the daemon's scrollback, so a reattached terminal shows everything it kept.
 const SCROLLBACK_LINES = 5000;
+const RESIZE_SETTLE_MS = 100;
 
 export const TerminalPanel = ({ workspace, visible }: { readonly workspace: Workspace; readonly visible: boolean }) => {
 	const [terminals, setTerminals] = useState<ReadonlyArray<TerminalInfo>>([]);
@@ -148,12 +149,17 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 			terminal.loadAddon(fit);
 			terminal.open(host);
 			// Writes and resizes after the shell exited fail harmlessly. The attach stream reports the exit.
+			// Dragging the panel resizes on every frame, so only the size it settles on goes to the daemon.
+			let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 			const resize = () => {
 				if (host.clientWidth === 0) return;
 				fit.fit();
-				void callDaemon((daemon) =>
-					daemon.resizeTerminal({ terminalId, cols: Math.max(2, terminal.cols), rows: Math.max(2, terminal.rows) }),
-				).catch(() => undefined);
+				clearTimeout(resizeTimer);
+				resizeTimer = setTimeout(() => {
+					void callDaemon((daemon) =>
+						daemon.resizeTerminal({ terminalId, cols: Math.max(2, terminal.cols), rows: Math.max(2, terminal.rows) }),
+					).catch(() => undefined);
+				}, RESIZE_SETTLE_MS);
 			};
 			fitRef.current = resize;
 			const observer = new ResizeObserver(resize);
@@ -166,6 +172,7 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 				write: (data) => terminal.write(data),
 			});
 			cleanup = () => {
+				clearTimeout(resizeTimer);
 				stop();
 				input.dispose();
 				observer.disconnect();
