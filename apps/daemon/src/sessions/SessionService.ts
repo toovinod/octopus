@@ -189,7 +189,6 @@ const fromAuthStatus = (auth: AgentAuthStatus): AgentAvailability => {
 const toUnavailable = (agent: AgentKind) => (error: AgentError) =>
 	new AgentUnavailableError({ agent, availability: toAvailability(error) });
 
-const decodeEvent = Schema.decodeUnknownEffect(AgentEvent);
 const decodeEventOption = Schema.decodeUnknownOption(AgentEvent);
 const decodeMediaType = Schema.decodeUnknownOption(ImageMediaType);
 
@@ -783,7 +782,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					.from(sessionEvent)
 					.where(and(eq(sessionEvent.sessionId, sessionId), eq(sessionEvent.type, "user.message"))),
 			);
-			const messages = yield* Effect.forEach(rows, (row) => Effect.orDie(decodeEvent(row.payload)));
+			const messages = rows.flatMap((row) => Option.toArray(decodeEventOption(row.payload)));
 			// Looking the id up in stored messages also keeps it from naming any other file.
 			const attachment = messages
 				.flatMap((event) => (event.type === "user.message" ? event.attachments : []))
@@ -889,15 +888,30 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			(effect, sessionId) => withProcessLock(sessionId, effect),
 		);
 
+		// A row that no longer decodes, say after an event's shape changed, is skipped so the rest of the chat
+		// still loads.
 		const toSessionEvents = (rows: ReadonlyArray<typeof sessionEvent.$inferSelect>) =>
-			Effect.forEach(rows, (row) =>
-				// A row that no longer decodes means a corrupt database, not a user error.
-				Effect.map(
-					Effect.orDie(decodeEvent(row.payload)),
-					(event) =>
-						new SessionEvent({ sessionId: row.sessionId, sequence: row.sequence, event, createdAt: row.createdAt }),
-				),
-			);
+			Effect.gen(function* () {
+				const events: Array<SessionEvent> = [];
+				for (const row of rows) {
+					const event = decodeEventOption(row.payload);
+					if (Option.isNone(event)) {
+						yield* Effect.logWarning("Skipping a stored event that no longer decodes").pipe(
+							Effect.annotateLogs({ sessionId: row.sessionId, sequence: row.sequence }),
+						);
+						continue;
+					}
+					events.push(
+						new SessionEvent({
+							sessionId: row.sessionId,
+							sequence: row.sequence,
+							event: event.value,
+							createdAt: row.createdAt,
+						}),
+					);
+				}
+				return events;
+			});
 
 		// Up to limit stored events before beforeSequence, oldest first. null reads the latest ones, so a chat
 		// opens on its last page and subscribes after it.

@@ -581,6 +581,35 @@ describe("SessionService", () => {
 		expect(titles.length).toBeLessThan(5);
 	});
 
+	test("a stored event that no longer decodes is skipped and the rest of the chat loads", async () => {
+		const loaded = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				const payloads: Array<unknown> = [
+					{ type: "user.message", itemId: "m1", text: "hi", attachments: [] },
+					{ type: "message.completed", itemId: "a1" },
+					{ type: "message.completed", itemId: "a2", text: "ok" },
+				];
+				yield* database.query((db) =>
+					db.insert(sessionEvent).values(
+						payloads.map((payload, sequence) => ({
+							id: `event-${sequence}`,
+							sessionId: session.id,
+							sequence,
+							type: "message.completed",
+							payload,
+							createdAt: "2026-01-01T00:00:00.000Z",
+						})),
+					),
+				);
+				return (yield* sessions.history(session.id, null, 10)).map((stored) => stored.sequence);
+			}),
+		);
+		expect(loaded).toEqual([0, 2]);
+	});
+
 	test("marks sessions cut off by a restart as interrupted", async () => {
 		const statuses = await runInTempDir((tempDir) =>
 			Effect.gen(function* () {
