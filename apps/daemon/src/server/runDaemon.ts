@@ -42,6 +42,7 @@ export const runDaemon = (
 		Effect.tapCause((cause) =>
 			Option.match(Cause.findErrorOption(cause), {
 				onNone: () => Effect.void,
+				// A protocol line on stdout that the desktop shell reads, not a log, so it bypasses the logger.
 				onSome: (error) => Console.log(`${FAILED_LINE_PREFIX}${error.message.replaceAll("\n", " ")}`),
 			}),
 		),

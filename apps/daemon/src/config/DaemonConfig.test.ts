@@ -1,4 +1,4 @@
-import { Duration, Effect, Option, Redacted, Stdio, Stream } from "effect";
+import { ConfigProvider, Duration, Effect, Option, Redacted, Stdio, Stream } from "effect";
 import { DaemonConfig, TAURI_ORIGINS } from "./DaemonConfig.ts";
 import { describe, expect, test } from "bun:test";
 
@@ -31,6 +31,16 @@ const parentExitedWithin = (stdin: Stream.Stream<Uint8Array>, timeout: Duration.
 		}),
 	);
 
+const devOriginsWith = (env: Record<string, string>) =>
+	Effect.gen(function* () {
+		const { allowedOrigins } = yield* DaemonConfig;
+		return allowedOrigins;
+	}).pipe(
+		Effect.provide(DaemonConfig.devLayer),
+		Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+		Effect.runPromise,
+	);
+
 describe("DaemonConfig", () => {
 	test("reads the token from the first line of stdin", async () => {
 		const result = await configFromStdin("abc", "123\n", "ignored\n");
@@ -43,6 +53,15 @@ describe("DaemonConfig", () => {
 	test("allows only the desktop app's pages by default", async () => {
 		const result = await configFromStdin("abc\n");
 		expect(result).toMatchObject({ _tag: "Success", success: { allowedOrigins: TAURI_ORIGINS } });
+	});
+
+	test("in dev, allows the web dev server on localhost and on 127.0.0.1", async () => {
+		expect(await devOriginsWith({})).toEqual([...TAURI_ORIGINS, "http://localhost:3000", "http://127.0.0.1:3000"]);
+		expect(await devOriginsWith({ OCTOPUS_DAEMON_DEV_ORIGIN: "http://127.0.0.1:3100" })).toEqual([
+			...TAURI_ORIGINS,
+			"http://localhost:3100",
+			"http://127.0.0.1:3100",
+		]);
 	});
 
 	test("fails when stdin closes without a token", async () => {

@@ -49,7 +49,6 @@ function Button({
     asChild?: boolean
   }) {
   const Comp = asChild ? Slot.Root : "button"
-  // A plain button inside a form must not submit it; only an explicit type="submit" should.
 
   return (
     <Comp
@@ -57,6 +56,7 @@ function Button({
       data-variant={variant}
       data-size={size}
       className={cn(buttonVariants({ variant, size, className }))}
+      // A plain button inside a form must not submit it; only an explicit type="submit" should.
       type={asChild ? type : (type ?? "button")}
       {...props}
     />

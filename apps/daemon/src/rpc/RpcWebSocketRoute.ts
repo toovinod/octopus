@@ -33,10 +33,16 @@ export const RpcWebSocketRoute = Layer.effect(
 			"/rpc",
 			Effect.gen(function* () {
 				const { headers } = yield* HttpServerRequest.HttpServerRequest;
-				if (
-					headers.host !== expectedHost ||
-					(headers.origin !== undefined && !allowedOrigins.includes(headers.origin))
-				) {
+				if (headers.host !== expectedHost) {
+					yield* Effect.logWarning("Refused an RPC connection for another host").pipe(
+						Effect.annotateLogs({ host: headers.host, expectedHost }),
+					);
+					return forbidden;
+				}
+				if (headers.origin !== undefined && !allowedOrigins.includes(headers.origin)) {
+					yield* Effect.logWarning("Refused an RPC connection from a page on another origin").pipe(
+						Effect.annotateLogs({ origin: headers.origin, allowedOrigins: allowedOrigins.join(" ") }),
+					);
 					return forbidden;
 				}
 				const params = yield* HttpServerRequest.schemaSearchParams(RpcConnectionParams);
