@@ -559,6 +559,28 @@ describe("SessionService", () => {
 		]);
 	});
 
+	test("a watcher that reads slowly gets only each session's newest change", async () => {
+		const titles = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				const watched = yield* sessions.watch.pipe(
+					// Busy with the snapshot while the changes pile up.
+					Stream.tap(() => Effect.sleep("200 millis")),
+					Stream.takeUntil((changed) => changed.title === "Title 49"),
+					Stream.runCollect,
+					Effect.timeout("5 seconds"),
+					Effect.forkChild,
+				);
+				yield* Effect.sleep("50 millis");
+				for (let index = 0; index < 50; index++) yield* sessions.rename(session.id, `Title ${index}`);
+				return (yield* Fiber.join(watched)).map((changed) => changed.title);
+			}),
+		);
+		expect(titles.at(-1)).toBe("Title 49");
+		expect(titles.length).toBeLessThan(5);
+	});
+
 	test("marks sessions cut off by a restart as interrupted", async () => {
 		const statuses = await runInTempDir((tempDir) =>
 			Effect.gen(function* () {

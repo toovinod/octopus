@@ -228,7 +228,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const forgetModels = (agent: AgentKind) => void modelCache.delete(agent);
 		// A finished sign-in changes the account, and with it the models the agent offers. Clients hear about it
 		// here instead of asking again.
-		const agentLogins = yield* PubSub.unbounded<AgentLoginResult>();
+		// Only recent results matter, so a client that stops reading cannot make the backlog grow.
+		const agentLogins = yield* PubSub.sliding<AgentLoginResult>(16);
 		const loginsOf = (agent: AgentKind, results: Stream.Stream<{ readonly success: boolean }>) =>
 			Stream.map(results, ({ success }): AgentLoginResult => ({ agent, success }));
 		yield* Stream.merge(loginsOf("claude", claude.loginResults), loginsOf("codex", codex.loginResults)).pipe(
@@ -1002,6 +1003,26 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const watch = Stream.unwrap(
 			Effect.gen(function* () {
 				const subscription = yield* PubSub.subscribe(sessionChanges);
+				// Only each session's newest change waits for a client that reads slowly, so one that stops
+				// reading holds a session per chat, not every change since.
+				const latest = new Map<string, AgentSession>();
+				const changed = yield* Queue.sliding<void>(1);
+				yield* PubSub.take(subscription).pipe(
+					Effect.flatMap((session) => {
+						latest.delete(session.id);
+						latest.set(session.id, session);
+						return Queue.offer(changed, undefined);
+					}),
+					Effect.forever,
+					Effect.forkScoped,
+				);
+				const changes = Stream.fromQueue(changed).pipe(
+					Stream.flatMap(() => {
+						const batch = [...latest.values()];
+						latest.clear();
+						return Stream.fromIterable(batch);
+					}),
+				);
 				const rows = yield* database.query((db) =>
 					db
 						.select({ session: agentSession })
@@ -1010,10 +1031,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 						.where(eq(workspace.status, "active"))
 						.orderBy(asc(agentSession.createdAt)),
 				);
-				return Stream.concat(
-					Stream.fromIterable(rows.map((row) => toSession(row.session))),
-					Stream.fromSubscription(subscription),
-				);
+				return Stream.concat(Stream.fromIterable(rows.map((row) => toSession(row.session))), changes);
 			}),
 		);
 
