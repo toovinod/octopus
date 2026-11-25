@@ -590,6 +590,12 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}
 		});
 
+		// A file left behind only costs disk space, so the caller goes on, but the failure is logged.
+		const removeImage = (path: string) =>
+			fs
+				.remove(path)
+				.pipe(Effect.catchTag("PlatformError", (cause) => Effect.logWarning("Could not remove a stored image", cause)));
+
 		// Written to disk before the agent sees them: Codex reads them from there, and history shows them later.
 		const storeImages = Effect.fnUntraced(function* (sessionId: string, images: ReadonlyArray<ImageData>) {
 			if (images.length === 0) return [];
@@ -607,7 +613,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				}),
 			).pipe(
 				// The message is never sent then, so nothing will ask for the images already written.
-				Effect.onError(() => Effect.forEach(written, (path) => Effect.ignore(fs.remove(path)), { discard: true })),
+				Effect.onError(() => Effect.forEach(written, removeImage, { discard: true })),
 			);
 		}, Effect.provide(services));
 
@@ -641,7 +647,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				// Taken when the message's turn starts, so a queued message's checkpoint holds the turns before it.
 				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
 				// A queued message dropped before its turn is never stored, so nothing will ask for its images.
-				const discard = Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)), { discard: true });
+				const discard = Effect.forEach(message.images, ({ path }) => removeImage(path), { discard: true });
 				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn, discard }).pipe(
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
@@ -653,7 +659,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 									runtime.outstanding = Math.max(0, runtime.outstanding - 1);
 									yield* refreshStatus(runtime);
 									// The message was not stored, so nothing will ever ask for its images.
-									yield* Effect.forEach(message.images, ({ path }) => Effect.ignore(fs.remove(path)));
+									yield* Effect.forEach(message.images, ({ path }) => removeImage(path));
 								}),
 					),
 				);
