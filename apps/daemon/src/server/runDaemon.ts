@@ -4,15 +4,19 @@ import type { ClaudeAdapter } from "../agents/claude/ClaudeAdapter.ts";
 import type { CodexAdapter } from "../agents/codex/CodexAdapter.ts";
 import type { CredentialStore } from "../agents/CredentialStore.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
+import { Cause, Effect, Exit, Layer, type Stdio } from "effect";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
-import { Cause, Effect, Exit, Layer } from "effect";
 import { Shutdown } from "../shutdown/Shutdown.ts";
 import { DaemonServer } from "./DaemonServer.ts";
 
 type Agents = ClaudeAdapter | CodexAdapter | CredentialStore;
 
 // Starts the daemon with the given agents: the real ones in main.ts, replayed ones in devDaemon.ts.
-export const runDaemon = (agents: Layer.Layer<Agents, never, ProcessRegistry>) => {
+// The config comes from stdin and the environment, except in devDaemon.ts, which makes its own token.
+export const runDaemon = (
+	agents: Layer.Layer<Agents, never, ProcessRegistry>,
+	config: Layer.Layer<DaemonConfig, Layer.Error<typeof DaemonConfig.layer>, Stdio.Stdio> = DaemonConfig.layer,
+) => {
 	// Shutdown is built first, so it is closed last and its signal handlers and deadline cover
 	// every other finalizer. The process registry is shared by the services and the agent adapters,
 	// and is closed after both, once nothing is left to spawn.
@@ -20,7 +24,7 @@ export const runDaemon = (agents: Layer.Layer<Agents, never, ProcessRegistry>) =
 		Layer.provide(agents),
 		Layer.provideMerge(ProcessRegistry.layer.pipe(Layer.provide(BunServices.layer))),
 		Layer.provideMerge(Shutdown.layer),
-		Layer.provideMerge(DaemonConfig.layer),
+		Layer.provideMerge(config),
 		Layer.provideMerge(gitTimeoutSettingsFromConfig),
 		Layer.provide(BunStdio.layer),
 	);

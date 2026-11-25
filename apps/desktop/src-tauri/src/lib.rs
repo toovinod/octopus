@@ -168,6 +168,12 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
     Some(path) => sidecar = sidecar.env("PATH", path),
     None => log::warn!("Could not read PATH from the login shell, so octopusd keeps the app's own PATH"),
   }
+  // A debug build loads the web dev server, so octopusd must accept that page's origin as well as the app's own.
+  if cfg!(debug_assertions)
+    && let Some(dev_url) = &app.config().build.dev_url
+  {
+    sidecar = sidecar.env("OCTOPUS_DAEMON_DEV_ORIGIN", dev_url.origin().ascii_serialization());
+  }
   let (mut events, mut child) = sidecar.spawn()?;
   // Through stdin, not the environment: agents, scripts and git inherit the daemon's environment.
   child.write(format!("{token}\n").as_bytes())?;

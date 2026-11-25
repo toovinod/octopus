@@ -1,4 +1,4 @@
-import { TEST_TOKEN, testDaemonConfig } from "../testing/testDaemonConfig.ts";
+import { TEST_ORIGIN, TEST_TOKEN, testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
@@ -33,7 +33,8 @@ const runWithDaemon = <A, E>(
 const withClient = (baseUrl: string) =>
 	Effect.provide(DaemonClient.layer(`${baseUrl.replace("http", "ws")}/rpc?token=${TEST_TOKEN}`));
 
-const statusOf = (url: string) => Effect.promise(() => fetch(url).then((response) => response.status));
+const statusOf = (url: string, headers?: Record<string, string>) =>
+	Effect.promise(() => fetch(url, { headers }).then((response) => response.status));
 
 describe("DaemonServer", () => {
 	test("rejects connections without the right token", async () => {
@@ -41,6 +42,19 @@ describe("DaemonServer", () => {
 			Effect.all([statusOf(`${baseUrl}/rpc`), statusOf(`${baseUrl}/rpc?token=wrong`)]),
 		);
 		expect(statuses).toEqual([401, 401]);
+	});
+
+	test("refuses pages from other origins and requests for other hosts, even with the right token", async () => {
+		const statuses = await runWithDaemon((baseUrl) => {
+			const url = `${baseUrl}/rpc?token=${TEST_TOKEN}`;
+			return Effect.all([
+				statusOf(url, { Origin: "https://evil.example" }),
+				statusOf(url, { Host: `evil.example:${new URL(baseUrl).port}` }),
+				statusOf(url, { Origin: TEST_ORIGIN }),
+			]);
+		});
+		expect(statuses.slice(0, 2)).toEqual([403, 403]);
+		expect(statuses[2]).not.toBe(403);
 	});
 
 	test("answers health over a WebSocket with the right token", async () => {

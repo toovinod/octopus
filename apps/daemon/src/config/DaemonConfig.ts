@@ -1,4 +1,5 @@
 import { Config, Context, Effect, Layer, Option, Redacted, Schema, Sink, Stdio, Stream } from "effect";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -26,23 +27,49 @@ const readStdin = Effect.gen(function* () {
 	return { token: Redacted.make(token), parentExited: Effect.orDie(Stream.runDrain(rest)) };
 });
 
+// The pages the desktop shell serves the web app from: tauri://localhost on macOS and Linux, http://tauri.localhost on Windows.
+export const TAURI_ORIGINS = ["tauri://localhost", "http://tauri.localhost"];
+
+// The dev daemon makes its own token, prints it and listens on a known port next to the web dev server.
+const randomToken = Effect.sync(() => ({
+	token: Redacted.make(randomBytes(32).toString("hex")),
+	parentExited: Effect.never,
+}));
+
+const readConfig = <E, R>(
+	credentials: Effect.Effect<
+		{ readonly token: Redacted.Redacted<string>; readonly parentExited: Effect.Effect<void> },
+		E,
+		R
+	>,
+	defaults: { readonly port: number; readonly devOrigin: Option.Option<string> },
+) =>
+	Effect.gen(function* () {
+		const port = yield* Config.Port("OCTOPUS_DAEMON_PORT").pipe(Config.withDefault(defaults.port));
+		const { token, parentExited } = yield* credentials;
+		const dataDir = yield* Config.String("OCTOPUS_DATA_DIR").pipe(Config.withDefault(join(homedir(), ".octopus")));
+		// Set by a debug build of the desktop shell, whose window loads the web dev server instead of tauri://localhost.
+		const devOrigin = yield* Config.option(Config.String("OCTOPUS_DAEMON_DEV_ORIGIN"));
+		const allowedOrigins = [...TAURI_ORIGINS, ...Option.toArray(Option.orElse(devOrigin, () => defaults.devOrigin))];
+		return { port, token, dataDir, allowedOrigins, parentExited };
+	});
+
 export class DaemonConfig extends Context.Service<
 	DaemonConfig,
 	{
 		readonly port: number;
 		readonly token: Redacted.Redacted<string>;
 		readonly dataDir: string;
+		// Browsers send the page's Origin on a WebSocket and apply no CORS to it, so the daemon checks it itself.
+		readonly allowedOrigins: ReadonlyArray<string>;
 		// Completes when stdin closes, which means the app that started the daemon is gone.
 		readonly parentExited: Effect.Effect<void>;
 	}
 >()("octopus/daemon/config/DaemonConfig") {
-	static readonly layer = Layer.effect(
+	static readonly layer = Layer.effect(DaemonConfig, readConfig(readStdin, { port: 0, devOrigin: Option.none() }));
+
+	static readonly devLayer = Layer.effect(
 		DaemonConfig,
-		Effect.gen(function* () {
-			const port = yield* Config.Port("OCTOPUS_DAEMON_PORT").pipe(Config.withDefault(0));
-			const { token, parentExited } = yield* readStdin;
-			const dataDir = yield* Config.String("OCTOPUS_DATA_DIR").pipe(Config.withDefault(join(homedir(), ".octopus")));
-			return DaemonConfig.of({ port, token, dataDir, parentExited });
-		}),
+		readConfig(randomToken, { port: 4799, devOrigin: Option.some("http://localhost:3000") }),
 	);
 }

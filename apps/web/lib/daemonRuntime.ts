@@ -17,7 +17,7 @@ class DaemonConnectionError extends Schema.TaggedError<DaemonConnectionError>()(
 }
 
 // Outside the desktop shell (a browser during development) the daemon URL comes from the build environment,
-// for example NEXT_PUBLIC_OCTOPUS_DAEMON_URL=ws://127.0.0.1:4799/rpc?token=dev.
+// for example the URL that `bun run dev:replay` prints (see apps/web/README.md).
 const devDaemonUrl = process.env.NEXT_PUBLIC_OCTOPUS_DAEMON_URL;
 
 const DaemonClientFromShell = Layer.unwrap(
