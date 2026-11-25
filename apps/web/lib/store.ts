@@ -397,6 +397,20 @@ export const workspaceTabs = (
 		.filter((session) => session.workspaceId === workspaceId && !closedTabs.has(session.id))
 		.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
+// The chats in a workspace that are working or waiting on the user mid-turn, as one string so it can be selected.
+export const workingChats = (
+	sessions: ReadonlyArray<Pick<AgentSession, "id" | "workspaceId" | "status">>,
+	workspaceId: string,
+) =>
+	sessions
+		.filter(
+			(session) =>
+				session.workspaceId === workspaceId && (session.status === "running" || session.status === "awaitingApproval"),
+		)
+		.map((session) => session.id)
+		.sort()
+		.join(" ");
+
 export const selectWorkspace = (workspaceId: string) => {
 	rememberWorkspace(workspaceId);
 	const first = workspaceTabs(state.sessions, state.closedTabs, workspaceId)[0];

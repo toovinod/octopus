@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import type { AgentSession } from "@repo/contracts/AgentSession";
 import type { Follow } from "./daemonRuntime.ts";
 import { Predicate } from "effect";
 
@@ -94,6 +95,7 @@ const {
 	revertToMessage,
 	sendMessage,
 	updateSessionSettings,
+	workingChats,
 } = await import("./store.ts");
 
 // After the import, since sonner skips injecting its styles only when there is no document. boot sets the root font
@@ -234,5 +236,20 @@ describe("session changes", () => {
 		settleUpdate({ ...session, status: "idle", title: "Fix the build", updatedAt: "2" });
 		await rename;
 		expect(getState().sessions.s).toMatchObject({ status: "running", title: "Fix the build" });
+	});
+});
+
+describe("workingChats", () => {
+	test("changes only when a chat in the workspace starts or stops working", () => {
+		const of = (
+			...sessions: ReadonlyArray<{ readonly status: AgentSession["status"]; readonly workspaceId?: string }>
+		) =>
+			workingChats(
+				sessions.map((changes, index) => ({ id: String(index), workspaceId: "w", ...changes })),
+				"w",
+			);
+		expect(of({ status: "idle" }, { status: "failed" })).toBe("");
+		expect(of({ status: "running" }, { status: "awaitingApproval" })).toBe("0 1");
+		expect(of({ status: "running", workspaceId: "other" })).toBe("");
 	});
 });

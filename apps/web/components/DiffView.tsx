@@ -17,7 +17,7 @@ import {
 } from "../lib/diffComments.ts";
 import { Textarea } from "@repo/ui/components/textarea";
 import { callDaemon, errorMessage } from "../lib/daemonRuntime.ts";
-import { newChat, sendMessage, toast, updateSettings, useAppState } from "../lib/store.ts";
+import { newChat, sendMessage, toast, updateSettings, useAppState, workingChats } from "../lib/store.ts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -37,15 +37,8 @@ const STATUS_LETTERS = {
 	renamed: { letter: "R", tone: "text-running" },
 } as const;
 
-// Reloads when any chat in the workspace finishes a turn, since that is when files change.
-const useTurnsFinished = (workspaceId: string) =>
-	useAppState((current) =>
-		Object.values(current.sessions)
-			.filter((session) => session.workspaceId === workspaceId && session.status !== "running")
-			.map((session) => session.updatedAt)
-			.sort()
-			.at(-1),
-	);
+// Agents change files while they work, so the diff reloads every few seconds while a chat here works.
+const WORKING_RELOAD_MS = 5000;
 
 // Comments outlive the panel, so switching tabs and back keeps them until they are sent.
 const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
@@ -63,7 +56,7 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	// Files the user opened or closed, overriding startsOpen.
 	const [toggled, setToggled] = useState<ReadonlyMap<string, boolean>>(new Map());
 	const mode = useAppState((current) => current.settings.diffMode);
-	const finished = useTurnsFinished(workspace.id);
+	const working = useAppState((current) => workingChats(Object.values(current.sessions), workspace.id));
 	const reverts = useAppState((current) => current.reverts[workspace.id] ?? 0);
 	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
 	const [picked, setPicked] = useState<LineRange | null>(null);
@@ -108,10 +101,17 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		if (isLatest()) setLoading(false);
 	}, [workspace.id]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: finished and reverts are the reload signals.
+	// A chat starting or stopping work and a revert are when files change. Renames and model changes are not.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: working and reverts are the reload signals.
 	useEffect(() => {
 		void load();
-	}, [load, finished, reverts]);
+	}, [load, working, reverts]);
+
+	useEffect(() => {
+		if (working === "") return;
+		const timer = setInterval(() => void load(), WORKING_RELOAD_MS);
+		return () => clearInterval(timer);
+	}, [load, working]);
 
 	const loadFullFile = async (path: string) => {
 		const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
