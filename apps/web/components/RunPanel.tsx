@@ -9,6 +9,7 @@ import type { Workspace } from "@repo/contracts/Workspace";
 import { openDialog, toast, useAppState } from "../lib/store.ts";
 import { ExternalLinkIcon, PlayIcon, SquareIcon } from "lucide-react";
 import { openExternal } from "../lib/desktop.ts";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Button } from "@repo/ui/components/button";
 import { Tabs, TabsList, TabsTrigger } from "@repo/ui/components/tabs";
 
@@ -201,7 +202,7 @@ const RunScriptPorts = ({ workspaceId }: { readonly workspaceId: string }) => {
 
 const ScriptOutput = ({ scriptRunId, onEnd }: { readonly scriptRunId: string; readonly onEnd: () => void }) => {
 	const [lines, setLines] = useState<ReadonlyArray<string>>([]);
-	const scrollRef = useRef<HTMLPreElement>(null);
+	const scrollRef = useRef<HTMLDivElement>(null);
 	// Follows new output only while the user is at the end, so scrolling up to read is not undone by the next line.
 	const atEnd = useRef(true);
 
@@ -241,21 +242,45 @@ const ScriptOutput = ({ scriptRunId, onEnd }: { readonly scriptRunId: string; re
 		);
 	}, [scriptRunId, onEnd]);
 
+	// Only the lines in view are rendered, so a long output costs no more per frame than a short one.
+	const virtualizer = useVirtualizer({
+		count: lines.length,
+		getScrollElement: () => scrollRef.current,
+		estimateSize: () => 16,
+		overscan: 30,
+		paddingStart: 12,
+		paddingEnd: 12,
+	});
+
+	// Runs after every render, so rows measured taller than estimated still leave the end in view.
 	useLayoutEffect(() => {
 		const element = scrollRef.current;
 		if (element !== null && lines.length > 0 && atEnd.current) element.scrollTop = element.scrollHeight;
-	}, [lines]);
+	});
 
+	if (lines.length === 0) return <p className="p-3 font-mono text-xs text-muted-foreground">No output yet.</p>;
 	return (
-		<pre
+		<div
 			ref={scrollRef}
 			onScroll={(event) => {
 				const element = event.currentTarget;
 				atEnd.current = element.scrollHeight - element.scrollTop - element.clientHeight < STICK_DISTANCE;
 			}}
-			className="min-h-0 flex-1 overflow-auto p-3 font-mono text-xs whitespace-pre-wrap text-muted-foreground"
+			className="min-h-0 flex-1 overflow-auto font-mono text-xs text-muted-foreground"
 		>
-			{lines.length === 0 ? "No output yet." : lines.join("\n")}
-		</pre>
+			<div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+				{virtualizer.getVirtualItems().map((row) => (
+					<div
+						key={row.key}
+						data-index={row.index}
+						ref={virtualizer.measureElement}
+						className="absolute inset-x-0 min-h-4 px-3 break-all whitespace-pre-wrap"
+						style={{ transform: `translateY(${row.start}px)` }}
+					>
+						{lines[row.index]}
+					</div>
+				))}
+			</div>
+		</div>
 	);
 };
