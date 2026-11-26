@@ -47,7 +47,8 @@ export const createAuth = ({
 		},
 		hooks: { after: leaveOrganizationHook(publishMembershipEvent) },
 		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
-		rateLimit: { enabled: true },
+		// Counts live in Postgres, so every API instance enforces one shared limit per client.
+		rateLimit: { enabled: true, storage: "database" },
 		advanced: {
 			ipAddress: { ipAddressHeaders: [CLIENT_ADDRESS_HEADER] },
 			// The web app is a static site on its own origin that calls the API with credentials.
