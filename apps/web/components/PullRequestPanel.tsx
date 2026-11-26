@@ -40,6 +40,7 @@ import { Switch } from "@repo/ui/components/switch";
 import { Button } from "@repo/ui/components/button";
 import { Input } from "@repo/ui/components/input";
 import { feedbackMessage } from "../lib/feedbackMessage.ts";
+import { mergeReadiness } from "../lib/mergeReadiness.ts";
 import { ExternalLink } from "./ExternalLink.tsx";
 import { useEffect, useRef, useState } from "react";
 
@@ -253,7 +254,7 @@ const PullRequestDetails = ({
 							onChanged();
 						}}
 					/>
-					<MergeForm workspace={workspace} onMerged={onChanged} />
+					<MergeForm workspace={workspace} pullRequest={pullRequest} onMerged={onChanged} />
 				</>
 			) : null}
 		</div>
@@ -422,7 +423,16 @@ const ReviewForm = ({ workspace, onReviewed }: { readonly workspace: Workspace; 
 	);
 };
 
-const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; readonly onMerged: () => void }) => {
+const MergeForm = ({
+	workspace,
+	pullRequest,
+	onMerged,
+}: {
+	readonly workspace: Workspace;
+	readonly pullRequest: PullRequest;
+	readonly onMerged: () => void;
+}) => {
+	const readiness = mergeReadiness(pullRequest);
 	const [method, setMethod] = useState<PullRequestMergeMethod>("squash");
 	const [deleteBranch, setDeleteBranch] = useState(true);
 	const [confirming, setConfirming] = useState(false);
@@ -470,9 +480,12 @@ const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; rea
 					Delete the branch on GitHub
 				</Label>
 			</div>
-			{confirming ? (
+			{readiness.kind === "blocked" ? <p className="text-xs text-muted-foreground">{readiness.reason}</p> : null}
+			{confirming && readiness.kind !== "blocked" ? (
 				<div className="flex items-center gap-2">
-					<span className="flex-1 text-xs">Merge into {workspace.baseBranch}?</span>
+					<span className="flex-1 text-xs">
+						{readiness.kind === "warn" ? `${readiness.warning} ` : ""}Merge into {workspace.baseBranch}?
+					</span>
 					<Button size="sm" variant="ghost" onClick={() => setConfirming(false)}>
 						Cancel
 					</Button>
@@ -482,7 +495,13 @@ const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; rea
 					</Button>
 				</div>
 			) : (
-				<Button size="sm" variant="default" className="self-start" onClick={() => setConfirming(true)}>
+				<Button
+					size="sm"
+					variant="default"
+					className="self-start"
+					disabled={readiness.kind === "blocked"}
+					onClick={() => setConfirming(true)}
+				>
 					<GitMergeIcon />
 					Merge
 				</Button>
