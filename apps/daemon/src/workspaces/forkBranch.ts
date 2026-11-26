@@ -13,8 +13,9 @@ export const markForkBranch = Effect.fn("markForkBranch")(function* (repositoryP
 // Whether a folder's checked-out branch holds a fork's code: Octopus marked it, or it is set up the way
 // `gh pr checkout` sets up a fork's pull request, pulling from a URL or from a remote the user added for the fork,
 // or pulling the pull request's head (refs/pull/<n>/head) when the fork keeps maintainers out. git config cannot
-// tell a fork's remote from the project's own by its name, so only origin and the remote gh uses as the base
-// repository count as the project's: a branch on any other remote counts as a fork's. A detached HEAD shows neither.
+// tell a fork's remote from the project's own by its name, so only origin, upstream (by convention the repository a
+// fork was made from) and the remote gh uses as the base repository count as the project's: a branch on any other
+// remote counts as a fork's. A detached HEAD shows neither.
 // It reads the whole config in one call and filters it here, so a branch name needs no regex escaping and a
 // workspace listing spends two git calls per workspace rather than five.
 export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: string) {
@@ -28,7 +29,7 @@ export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: strin
 	if (remote === "" || remote === ".") return false;
 	const merge = config.get(`branch.${branch}.merge`) ?? "";
 	if (merge.startsWith("refs/pull/")) return true;
-	if (remote === "origin") return false;
+	if (remote === "origin" || remote === "upstream") return false;
 	// What `gh repo set-default`, or gh's own question in a repository with several remotes, records. Git keeps
 	// the remote name's case in the listing.
 	return config.get(`remote.${remote}.gh-resolved`) !== "base";

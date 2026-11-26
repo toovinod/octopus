@@ -42,14 +42,30 @@ describe("isForkCheckout", () => {
 			Effect.gen(function* () {
 				const path = yield* makeTestRepository(join(tempDir, "repo"));
 				yield* runGit(path, ["remote", "add", "origin", "https://example.com/owner/app.git"]);
-				yield* runGit(path, ["remote", "add", "upstream", "https://example.com/contributor/app.git"]);
+				yield* runGit(path, ["remote", "add", "contributor", "https://example.com/contributor/app.git"]);
 				yield* runGit(path, ["checkout", "-b", "feature"]);
-				yield* runGit(path, ["config", "branch.feature.remote", "upstream"]);
+				yield* runGit(path, ["config", "branch.feature.remote", "contributor"]);
 				yield* runGit(path, ["config", "branch.feature.merge", "refs/heads/feature"]);
 				return yield* isForkCheckout(path);
 			}),
 		);
 		expect(fork).toBe(true);
+	});
+
+	// The usual name for the repository a clone of a fork was forked from.
+	test("does not count a branch that tracks upstream, even where gh never chose a base", async () => {
+		const fork = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["remote", "add", "origin", "https://example.com/me/app.git"]);
+				yield* runGit(path, ["remote", "add", "upstream", "https://example.com/owner/app.git"]);
+				yield* runGit(path, ["checkout", "-b", "feature"]);
+				yield* runGit(path, ["config", "branch.feature.remote", "upstream"]);
+				yield* runGit(path, ["config", "branch.feature.merge", "refs/heads/main"]);
+				return yield* isForkCheckout(path);
+			}),
+		);
+		expect(fork).toBe(false);
 	});
 
 	test("does not count a branch that tracks the repository gh uses as the base", async () => {
