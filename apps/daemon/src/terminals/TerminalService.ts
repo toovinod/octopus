@@ -2,6 +2,7 @@ import { TerminalInfo, TerminalNotFoundError, type TerminalSpawnError } from "@r
 import { Config, Context, Deferred, Effect, Exit, FiberMap, Layer, PubSub, Stream } from "effect";
 import type { ProcessRegistry } from "../processes/ProcessRegistry.ts";
 import type { TerminalOutput } from "@repo/contracts/Terminal";
+import { terminalHasChild } from "./terminalHasChild.ts";
 import { spawnTerminal } from "./spawnTerminal.ts";
 import type { SecureRandom } from "effect/crypto";
 import { nowIso } from "../database/nowIso.ts";
@@ -20,6 +21,7 @@ type IndexedOutput = { readonly index: number; readonly output: TerminalOutput }
 interface RunningTerminal {
 	readonly info: TerminalInfo;
 	readonly pty: Bun.Terminal;
+	readonly pid: number;
 	readonly scrollback: Scrollback;
 	readonly output: PubSub.PubSub<IndexedOutput>;
 	readonly appended: { count: number };
@@ -67,7 +69,11 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 				const decoder = new TextDecoder();
 				const scrollback = new Scrollback();
 				const appended = { count: 0 };
-				const { terminal: pty, exited } = yield* spawnTerminal({
+				const {
+					terminal: pty,
+					pid,
+					exited,
+				} = yield* spawnTerminal({
 					command: [shell, "-l"],
 					cwd,
 					...size,
@@ -78,7 +84,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 						for (const piece of splitLiveOutput(data)) publish({ output, appended }, { type: "data", data: piece });
 					},
 				});
-				const terminal: RunningTerminal = { info, pty, scrollback, output, appended };
+				const terminal: RunningTerminal = { info, pty, pid, scrollback, output, appended };
 				return { terminal, exited };
 			});
 
@@ -118,6 +124,11 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		const list = (workspaceId: string) =>
 			[...terminals.values()].map((terminal) => terminal.info).filter((info) => info.workspaceId === workspaceId);
 
+		// Terminals running a command, across all workspaces. Spawns pgrep per terminal, so it stays off hot paths.
+		const countBusy = Effect.suspend(() =>
+			Effect.forEach([...terminals.values()], (terminal) => terminalHasChild(terminal.pid), { concurrency: 8 }),
+		).pipe(Effect.map((busy) => busy.filter(Boolean).length));
+
 		const attach = (terminalId: string): Stream.Stream<TerminalOutput, TerminalNotFoundError> =>
 			Stream.unwrap(
 				Effect.gen(function* () {
@@ -152,7 +163,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		const closeWorkspace = (workspaceId: string) =>
 			Effect.forEach(list(workspaceId), (info) => close(info.id), { discard: true });
 
-		return { open, list, attach, write, resize, close, closeWorkspace };
+		return { open, list, countBusy, attach, write, resize, close, closeWorkspace };
 	}),
 }) {
 	static readonly layer = Layer.effect(TerminalService, TerminalService.make);

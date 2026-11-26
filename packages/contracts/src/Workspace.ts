@@ -26,6 +26,12 @@ export class Workspace extends Schema.Class<Workspace>("Workspace")({
 	archivedAt: Schema.NullOr(Schema.String),
 }) {}
 
+// What would stop if Octopus quit now, across every workspace.
+export class WorkspaceActivity extends Schema.Class<WorkspaceActivity>("WorkspaceActivity")({
+	busyTerminals: Schema.Int,
+	runningScripts: Schema.Int,
+}) {}
+
 export class WorkspaceNotFoundError extends Schema.TaggedError<WorkspaceNotFoundError>()("WorkspaceNotFoundError", {
 	workspaceId: Schema.String,
 }) {

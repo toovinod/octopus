@@ -3,10 +3,11 @@
 import { OctopusLogo } from "./OctopusLogo.tsx";
 import { boot, closeTab, newChat, onWindowFocus, openDialog, setPanel, useAppState } from "../lib/store.ts";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup, usePanelRef } from "@repo/ui/components/resizable";
-import { isReason, onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
+import { callDaemon, isReason, onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
 import { isMac, shortcutKey } from "../lib/shortcutKey.ts";
 import { quitWarning } from "../lib/quitWarning.ts";
-import { setQuitWarning } from "../lib/desktop.ts";
+import { isDesktop, setQuitWarning } from "../lib/desktop.ts";
+import { logWarning } from "../lib/logWarning.ts";
 import { SidebarProvider } from "@repo/ui/components/sidebar";
 import { TooltipProvider } from "@repo/ui/components/tooltip";
 import { Toaster } from "@repo/ui/components/sonner";
@@ -56,9 +57,37 @@ const useShortcuts = () =>
 		};
 	}, []);
 
-// Keeps the shell's quit warning current, so quitting asks first while turns run or approvals wait.
+// Each check lists the processes of every terminal, so it runs rarely rather than on every change.
+const ACTIVITY_POLL_MS = 15_000;
+
+const noActivity = { busyTerminals: 0, runningScripts: 0 };
+
+// Terminals running a command and scripts still going. Only the desktop shell quits, so a browser never asks.
+const useActivity = () => {
+	const ready = useAppState((current) => current.connection.status === "ready");
+	const [activity, setActivity] = useState(noActivity);
+	useEffect(() => {
+		if (!ready || !isDesktop()) return;
+		const check = () =>
+			callDaemon((daemon) => daemon.listActivity()).then(setActivity, (error: unknown) =>
+				logWarning("Could not check what is running before a quit", error),
+			);
+		void check();
+		const timer = setInterval(check, ACTIVITY_POLL_MS);
+		// A daemon that went away took its terminals and scripts with it.
+		return () => {
+			clearInterval(timer);
+			setActivity(noActivity);
+		};
+	}, [ready]);
+	return activity;
+};
+
+// Keeps the shell's quit warning current, so quitting asks first while turns run, approvals wait, or terminals
+// and scripts are busy.
 const useQuitWarning = () => {
-	const warning = useAppState((current) => quitWarning(Object.values(current.sessions)));
+	const activity = useActivity();
+	const warning = useAppState((current) => quitWarning(Object.values(current.sessions), activity));
 	useEffect(() => {
 		void setQuitWarning(warning);
 	}, [warning]);

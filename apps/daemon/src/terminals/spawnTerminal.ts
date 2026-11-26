@@ -35,5 +35,5 @@ export const spawnTerminal = Effect.fn("spawnTerminal")(function* (options: {
 			}),
 	);
 	yield* registry.add(shell.pid);
-	return { terminal, exited: Effect.promise(() => shell.exited) };
+	return { terminal, pid: shell.pid, exited: Effect.promise(() => shell.exited) };
 });
