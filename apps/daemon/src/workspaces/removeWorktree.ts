@@ -34,6 +34,19 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 	return { changedFiles, unpushedCommits: Number(unpushed), ignoredFiles };
 });
 
+// Whether a folder is still a worktree of the repository, with `folder` as a real path. One whose `.git` is
+// gone, or that now holds another repository, is not, and git would refuse to stash in or remove it.
+export const isWorktreeOf = Effect.fn("isWorktreeOf")(function* (repositoryPath: string, folder: string) {
+	const locate = (cwd: string) =>
+		runGit(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]).pipe(
+			Effect.map((output) => output.split("\n")),
+		);
+	const here = yield* locate(folder).pipe(Effect.catchTag("GitCommandError", () => Effect.succeed(null)));
+	if (here === null) return false;
+	const [, repositoryCommonDir] = yield* locate(repositoryPath);
+	return here[0] === folder && here[1] === repositoryCommonDir;
+});
+
 // The stash a forced archive leaves, found again by this message when the workspace is restored.
 export const archiveStashMessage = (workspaceId: string) => `octopus-archive/${workspaceId}`;
 

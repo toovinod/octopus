@@ -6,9 +6,15 @@ import {
 	WorkspacePathInUseError,
 	type WorktreeRemoveError,
 } from "@repo/contracts/Workspace";
+import {
+	discardWorktree,
+	findUnsavedWork,
+	isWorktreeOf,
+	removeWorktree,
+	restoreArchiveStash,
+} from "./removeWorktree.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "@repo/contracts/ScriptRun";
 import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
-import { discardWorktree, findUnsavedWork, removeWorktree, restoreArchiveStash } from "./removeWorktree.ts";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { applyScriptRunEvent, runSetupScript, setupRetryDelay } from "./runSetupScript.ts";
@@ -425,7 +431,10 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						const owner = yield* projects
 							.get(current.projectId)
 							.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
-						if (yield* fs.exists(current.path).pipe(Effect.orDie)) {
+						const isWorktree =
+							(yield* fs.exists(current.path).pipe(Effect.orDie)) &&
+							(yield* isWorktreeOf(owner.path, yield* fs.realPath(current.path).pipe(Effect.orDie)));
+						if (isWorktree) {
 							const refuseUnsaved = Effect.fnUntraced(function* () {
 								const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
 								const hasUnsaved =
@@ -450,8 +459,9 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 								stashChanges: unsaved.changedFiles.length > 0,
 							});
 						} else {
-							// Someone deleted the folder already. Forget it in git and carry on.
-							yield* Effect.logWarning("Worktree folder is missing, pruning it").pipe(
+							// Someone deleted the folder, or what links it to the repository, already. Forget it in git and
+							// carry on. A folder that is left holds files git no longer knows, so it stays for the user.
+							yield* Effect.logWarning("Worktree folder is missing or no longer a worktree, pruning it").pipe(
 								Effect.annotateLogs({ workspaceId, path: current.path }),
 							);
 							yield* stopWorkspaceProcesses(workspaceId);

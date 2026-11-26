@@ -436,6 +436,28 @@ describe("WorkspaceService", () => {
 		expect(result.folderExists).toBe(false);
 	});
 
+	test("archives a worktree whose folder is no longer a worktree, and leaves the folder", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				// The `.git` file links the folder to the repository. Without it git cannot work in the folder.
+				yield* fs.remove(join(created.path, ".git"));
+				const archived = yield* workspaces.archive(created.id, { force: false });
+				return {
+					archived,
+					readme: yield* fs.exists(join(created.path, "README.md")),
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+				};
+			}),
+		);
+		expect(result.archived.status).toBe("archived");
+		expect(result.readme).toBe(true);
+		expect(result.worktrees).not.toContain("feature");
+	});
+
 	test("archiving an in-place workspace removes nothing", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
