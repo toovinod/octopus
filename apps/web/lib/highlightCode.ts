@@ -7,12 +7,13 @@ import {
 } from "shiki";
 
 // The JavaScript regex engine, not Oniguruma's WebAssembly, so the desktop shell's CSP can keep refusing
-// 'wasm-unsafe-eval'.
+// 'wasm-unsafe-eval'. It cannot run a few grammars' patterns, and forgiving skips those instead of failing the
+// whole block.
 const { codeToHtml } = createSingletonShorthands(
 	createBundledHighlighter({
 		langs: bundledLanguages,
 		themes: bundledThemes,
-		engine: () => createJavaScriptRegexEngine(),
+		engine: () => createJavaScriptRegexEngine({ forgiving: true }),
 	}),
 );
 
