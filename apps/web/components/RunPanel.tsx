@@ -63,7 +63,7 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 		workspace.kind === "worktree" &&
 		(run === undefined || run.status === "failed" || run.status === "deadLetter");
 
-	// Run and Stop stay disabled until the daemon answers, so a double click sends one request.
+	// Run, Stop and Run setup stay disabled until the daemon answers, so a double click sends one request.
 	const [busy, setBusy] = useState(false);
 
 	const start = async () => {
@@ -75,10 +75,12 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 		setBusy(false);
 	};
 	const startSetup = async () => {
+		setBusy(true);
 		await callDaemon((daemon) => daemon.startSetupScript({ workspaceId: workspace.id })).then(
 			reload,
 			(error: unknown) => toast(errorMessage(error)),
 		);
+		setBusy(false);
 	};
 	const stop = async () => {
 		setBusy(true);
@@ -137,7 +139,7 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 						</Button>
 					)
 				) : canStartSetup ? (
-					<Button size="xs" variant="default" onClick={() => void startSetup()}>
+					<Button size="xs" variant="default" disabled={busy} onClick={() => void startSetup()}>
 						<PlayIcon />
 						Run setup
 					</Button>
