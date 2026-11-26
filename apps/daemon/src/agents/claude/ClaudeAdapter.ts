@@ -10,21 +10,14 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
-import type {
-	CanUseTool,
-	Options,
-	PermissionResult,
-	PermissionMode,
-	PermissionUpdate,
-	SDKUserMessage,
-	SpawnOptions,
-} from "@anthropic-ai/claude-agent-sdk";
 import {
+	Config,
 	Context,
 	Deferred,
 	Effect,
 	Exit,
 	FiberHandle,
+	FileSystem,
 	Layer,
 	Option,
 	Predicate,
@@ -36,6 +29,15 @@ import {
 	Scope,
 	Stream,
 } from "effect";
+import type {
+	CanUseTool,
+	Options,
+	PermissionResult,
+	PermissionMode,
+	PermissionUpdate,
+	SDKUserMessage,
+	SpawnOptions,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
 	type AgentCapabilities,
 	type AgentMode,
@@ -63,6 +65,7 @@ import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 // Octopus runs the user's own `claude`, found on PATH unless this names another one. Inside a
 // `bun build --compile` binary the SDK cannot find the CLI it bundles, and the user's install
@@ -157,13 +160,20 @@ const withoutCredentials = (env: SpawnOptions["env"]): SpawnOptions["env"] =>
 
 // claude also takes these from the env block of its settings files, and a key from their apiKeyHelper. Flag settings
 // outrank every settings file, and empty values turn them off, but they never override claude's own environment
-// (checked with claude 2.1.332), so the environment is cleaned as well. An API key session keeps the key Octopus gives it.
-const credentialSettings = (mode: StartSessionInput["auth"]["mode"]) => ({
-	apiKeyHelper: "",
-	env: Object.fromEntries(
-		credentialEnv.filter((name) => mode === "subscription" || name !== "ANTHROPIC_API_KEY").map((name) => [name, ""]),
-	),
+// (checked with claude 2.1.332), so the environment is cleaned as well. Claude hands the env block on to the commands
+// its Bash tool runs, where an empty value is not the same as none (dotenv skips a set variable, and an SDK takes an
+// empty base URL as one), so only what a settings file sets is emptied.
+const blankSettings = (names: Iterable<string>, apiKeyHelper: boolean) => ({
+	...(apiKeyHelper ? { apiKeyHelper: "" } : {}),
+	env: Object.fromEntries([...names].map((name) => [name, ""])),
 });
+
+const ClaudeSettingsFile = Schema.fromJsonString(
+	Schema.Struct({
+		env: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+		apiKeyHelper: Schema.optional(Schema.Unknown),
+	}),
+);
 
 // claude prints the sign-in link as an OSC 8 hyperlink and as text. Both hold the same URL, and
 // requiring the character after it keeps a link split across two reads from matching early.
@@ -525,6 +535,12 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 		ClaudeAdapter,
 		Effect.gen(function* () {
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+			const fs = yield* FileSystem.FileSystem;
+			// A string with a default cannot fail to read.
+			const configDir = yield* Config.String("CLAUDE_CONFIG_DIR").pipe(
+				Config.withDefault(join(homedir(), ".claude")),
+				Effect.orDie,
+			);
 			const claudeQuery = yield* ClaudeQuery;
 			const registry = yield* ProcessRegistry;
 			// Holds the sign-in waiting for the browser. A new sign-in replaces it and stops its claude.
@@ -540,7 +556,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 						ChildProcess.make(
 							executable,
 							// Flag settings must come before the subcommand.
-							["--settings", JSON.stringify(credentialSettings("subscription")), "auth", "status", "--json"],
+							["--settings", JSON.stringify(blankSettings(credentialEnv, true)), "auth", "status", "--json"],
 							{ env: unsetCredentials, extendEnv: true },
 						),
 					)
@@ -636,6 +652,27 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				terminal.value.write(`${code.trim()}\r`);
 			});
 
+			// The settings files claude reads for this session, as its settingSources pick them.
+			const settingsCredentials = Effect.fnUntraced(function* (input: StartSessionInput) {
+				const files = [
+					join(configDir, "settings.json"),
+					...(input.trustProjectSettings
+						? [join(input.cwd, ".claude", "settings.json"), join(input.cwd, ".claude", "settings.local.json")]
+						: []),
+				];
+				const found = yield* Effect.forEach(files, (file) =>
+					fs.readFileString(file).pipe(Effect.flatMap(Schema.decodeUnknownEffect(ClaudeSettingsFile)), Effect.option),
+				);
+				const settings = found.flatMap((file) => (Option.isSome(file) ? [file.value] : []));
+				const names = new Set(settings.flatMap((file) => Object.keys(file.env ?? {})));
+				const apiKeyHelper = settings.some((file) => file.apiKeyHelper !== undefined);
+				// An API key session empties nothing, so a host or provider the user set in a settings file still applies.
+				return blankSettings(
+					input.auth.mode === "subscription" ? credentialEnv.filter((name) => names.has(name)) : [],
+					apiKeyHelper,
+				);
+			});
+
 			const startSession = Effect.fn("ClaudeAdapter.startSession")(function* (input: StartSessionInput) {
 				const { executable } = yield* ClaudeAdapterConfig;
 				// The SDK wants a path, not a command name.
@@ -644,6 +681,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					return yield* new AgentNotInstalledError({ executable });
 				}
 				const session = yield* makeAgentSession(capabilities);
+				const credentialSettings = yield* settingsCredentials(input);
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
@@ -761,7 +799,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// and approving a plan in Full access do. Only a trusted project may offer that mode.
 					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
-					settings: credentialSettings(input.auth.mode),
+					settings: credentialSettings,
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
 						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.

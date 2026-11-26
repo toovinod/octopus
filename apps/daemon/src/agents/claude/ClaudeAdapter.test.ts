@@ -5,16 +5,19 @@ import type {
 	PermissionUpdate,
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { ConfigProvider, Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
-import { Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const newSession: StartSessionInput = {
 	cwd: "/repo",
@@ -433,6 +436,9 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 
 const fakeClaude = `${import.meta.dir}/fixtures/fakeClaude.ts`;
 
+// Stands in for ~/.claude, so no test reads the real user's settings.
+const claudeConfigDir = mkdtempSync(join(tmpdir(), "octopus-claude-config-"));
+
 const runWithClaude = <A, E>(
 	program: Effect.Effect<A, E, ClaudeAdapter>,
 	permissions: Array<PermissionResult> = [],
@@ -447,6 +453,7 @@ const runWithClaude = <A, E>(
 			),
 		),
 		Effect.provideService(ClaudeAdapterConfig, { executable }),
+		Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { CLAUDE_CONFIG_DIR: claudeConfigDir } }))),
 		Effect.runPromise,
 	);
 
@@ -534,27 +541,43 @@ describe("ClaudeAdapter", () => {
 		expect(printed).toBe("|||||kept");
 	});
 
-	test("subscription mode empties the credentials claude's settings files could set, so it uses the claude.ai login", async () => {
-		await runSession(() => Effect.void);
-		expect(startedWith.at(-1)?.settings).toEqual({
-			apiKeyHelper: "",
-			env: expect.objectContaining({
-				ANTHROPIC_API_KEY: "",
-				ANTHROPIC_AUTH_TOKEN: "",
-				ANTHROPIC_BASE_URL: "",
-				CLAUDE_CODE_USE_BEDROCK: "",
-				CLAUDE_CODE_USE_VERTEX: "",
-			}),
-		});
-	});
+	describe("credentials in claude's settings files", () => {
+		const writeSettings = (dir: string, settings: unknown) => {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
+		};
+		const settingsFor = async (input: Partial<StartSessionInput>) => {
+			await runSession(() => Effect.void, { input: { ...newSession, ...input } });
+			return startedWith.at(-1)?.settings;
+		};
+		const project = () => mkdtempSync(join(tmpdir(), "octopus-claude-project-"));
+		const cleanUp = () => rmSync(join(claudeConfigDir, "settings.json"), { force: true });
 
-	test("API key mode empties every other credential claude's settings files could set, but not its own key", async () => {
-		await runSession(() => Effect.void, {
-			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
+		test("subscription mode empties only the ones they set, so claude's tools never see the rest as set but empty", async () => {
+			const cwd = project();
+			writeSettings(claudeConfigDir, { env: { ANTHROPIC_BASE_URL: "https://proxy.example.com", EDITOR: "vim" } });
+			writeSettings(join(cwd, ".claude"), { env: { CLAUDE_CODE_USE_BEDROCK: "1" }, apiKeyHelper: "print-key" });
+			const settings = await settingsFor({ cwd, trustProjectSettings: true }).finally(cleanUp);
+			expect(settings).toEqual({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: "", CLAUDE_CODE_USE_BEDROCK: "" } });
 		});
-		const settings = startedWith.at(-1)?.settings;
-		expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_BASE_URL: "" } });
-		expect(typeof settings === "object" && "ANTHROPIC_API_KEY" in (settings.env ?? {})).toBe(false);
+
+		test("subscription mode empties nothing when they set no credential", async () => {
+			expect(await settingsFor({})).toEqual({ env: {} });
+		});
+
+		test("an untrusted project's settings are not read, as claude does not read them either", async () => {
+			const cwd = project();
+			writeSettings(join(cwd, ".claude"), { env: { ANTHROPIC_AUTH_TOKEN: "tok" } });
+			expect(await settingsFor({ cwd, trustProjectSettings: false })).toEqual({ env: {} });
+		});
+
+		test("API key mode empties no env value, only an apiKeyHelper that would replace its key", async () => {
+			writeSettings(claudeConfigDir, { env: { ANTHROPIC_AUTH_TOKEN: "tok" }, apiKeyHelper: "print-key" });
+			const settings = await settingsFor({ auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } }).finally(
+				cleanUp,
+			);
+			expect(settings).toEqual({ apiKeyHelper: "", env: {} });
+		});
 	});
 
 	describe("sign-in", () => {
