@@ -47,6 +47,19 @@ const migrateUpTo = (url: Redacted.Redacted<string>, before: string) =>
 		yield* migrate(db, { migrationsFolder: folder });
 	}).pipe(withSql(url));
 
+// Runs queries against a new, fully migrated database.
+const inMigratedDatabase = <A, E>(effect: Effect.Effect<A, E, PgClient.PgClient>) =>
+	Effect.gen(function* () {
+		const url = yield* makeTestCloudDatabase(Option.getOrThrow(serverUrl));
+		return yield* effect.pipe(withSql(url));
+	}).pipe(Effect.scoped, Effect.runPromise);
+
+const insertAccount = (id: string) =>
+	PgClient.PgClient.use(
+		(sql) =>
+			sql`insert into account (id, account_id, provider_id, user_id, created_at, updated_at) values (${id}, '12345', 'github', 'user_1', now(), now())`,
+	);
+
 describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 	test("a user is a member of an org at most once, so removing the member removes their access", async () => {
 		const result = await Effect.gen(function* () {
@@ -73,5 +86,16 @@ describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 			return yield* membersOf.pipe(withSql(url));
 		}).pipe(Effect.scoped, Effect.runPromise);
 		expect(members).toEqual([{ id: "member_a", role: "member" }]);
+	});
+
+	test("one GitHub or Google identity links to one account row, so sign-in always finds the same user", async () => {
+		const result = await inMigratedDatabase(
+			Effect.gen(function* () {
+				yield* insertOrgAndUser;
+				yield* insertAccount("account_1");
+				return yield* Effect.result(insertAccount("account_2"));
+			}),
+		);
+		expect(result._tag).toBe("Failure");
 	});
 });

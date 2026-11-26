@@ -7,5 +7,8 @@ export const schemaConstraints = () =>
 		schema: {
 			// Accepting two invitations, or an accept racing a direct add, could make a user a member twice.
 			member: { fields: {}, indexes: [{ fields: ["organizationId", "userId"], unique: true }] },
+			// Better Auth looks an identity up by provider and provider account id, and two rows would
+			// make sign-in pick one user or the other.
+			account: { fields: {}, indexes: [{ fields: ["providerId", "accountId"], unique: true }] },
 		},
 	}) satisfies BetterAuthPlugin;

@@ -1,0 +1,65 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "477f429f-7987-4d45-a1e0-77a39bc81dad",
+  "prevIds": [
+    "3f873554-2793-40f9-92b1-5fbb0c062147"
+  ],
+  "footprints": [
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "account",
+        "account_providerId_accountId_uidx"
+      ],
+      "writes": [
+        "s|idx|public.account_providerId_accountId_uidx",
+        "n|idx|public.account_providerId_accountId_uidx",
+        "e|idx|public.account_providerId_accountId_uidx",
+        "n|rel|public.account_providerId_accountId_uidx"
+      ],
+      "reads": [
+        "n|tbl|public.account",
+        "n|sch|public",
+        "n|col|public.account.provider_id",
+        "n|col|public.account.account_id"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "account",
+        "name": "account_providerId_accountId_uidx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "provider_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          },
+          {
+            "value": "account_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": true,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    }
+  ]
+}
