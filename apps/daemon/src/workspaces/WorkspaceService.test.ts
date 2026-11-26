@@ -1115,6 +1115,37 @@ describe("WorkspaceService.unarchive", () => {
 		expect(restored).toMatchObject({ status: "active", fromFork: true });
 	});
 
+	test("a project removed while a workspace is being restored leaves no folder behind", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* workspaces.archive(created.id, { force: false });
+				const restoring = yield* Effect.forkChild(Effect.exit(workspaces.unarchive(created.id)));
+				// While git adds the worktree again, the project, with only archived workspaces, can still go.
+				yield* fs
+					.exists(created.path)
+					.pipe(
+						Effect.repeat({ schedule: Schedule.spaced("1 millis"), until: (exists) => exists }),
+						Effect.timeout("10 seconds"),
+					);
+				yield* projects.remove(project.id);
+				const restored = yield* Fiber.join(restoring);
+				return {
+					failure: restored._tag === "Failure" ? String(restored.cause) : null,
+					folderExists: yield* fs.exists(created.path),
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+				};
+			}),
+		);
+		expect(result.failure).toContain("WorkspaceNotFoundError");
+		expect(result.folderExists).toBe(false);
+		expect(result.worktrees).not.toContain("feature");
+	});
+
 	test("brings back a force-archived worktree with its stashed changes", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

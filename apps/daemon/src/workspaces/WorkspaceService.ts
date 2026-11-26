@@ -533,15 +533,23 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						);
 						setupRun = setupBefore > 0 && owner.setupScript !== null ? yield* newSetupRun(workspaceId) : null;
 					}
-					const restored = yield* database.query((db) =>
+					// The project can be removed meanwhile, with this workspace still archived, which deletes its row.
+					const outcome = yield* database.query((db) =>
 						db.transaction((tx) =>
 							Effect.gen(function* () {
+								const archived = yield* tx.$count(
+									workspace,
+									and(eq(workspace.id, workspaceId), eq(workspace.status, "archived")),
+								);
+								if (archived === 0) {
+									return "gone" as const;
+								}
 								const taken = yield* tx.$count(
 									workspace,
 									and(eq(workspace.path, current.path), eq(workspace.status, "active")),
 								);
 								if (taken > 0) {
-									return false;
+									return "pathInUse" as const;
 								}
 								yield* tx
 									.update(workspace)
@@ -550,15 +558,17 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 								if (setupRun !== null) {
 									yield* tx.insert(scriptRun).values(setupRun);
 								}
-								return true;
+								return "restored" as const;
 							}),
 						),
 					);
-					if (!restored) {
+					if (outcome !== "restored") {
 						if (current.kind === "worktree") {
 							yield* discardWorktree({ repositoryPath: owner.path, worktreePath: current.path, branch: null });
 						}
-						return yield* new WorkspacePathInUseError({ path: current.path });
+						return yield* outcome === "gone"
+							? new WorkspaceNotFoundError({ workspaceId })
+							: new WorkspacePathInUseError({ path: current.path });
 					}
 					if (current.kind === "worktree") {
 						yield* restoreArchiveStash(current.path, workspaceId);
