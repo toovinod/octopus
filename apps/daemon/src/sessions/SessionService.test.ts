@@ -25,8 +25,8 @@ import {
 	TEST_LOGIN_URL,
 	testAgentServices,
 } from "../testing/testAgentServices.ts";
+import { agentSession, sessionAttachment, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
-import { agentSession, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
 import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/AgentSession";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
@@ -1392,6 +1392,35 @@ describe("SessionService", () => {
 		expect(result.served).toEqual(image);
 		expect(result.unknown._tag).toBe("AttachmentNotFoundError");
 		expect(result.removed).toBe(true);
+	});
+
+	test("stores a lookup row with each sent image, and serves it only to its own session", async () => {
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				const other = yield* sessions.create({
+					workspaceId: session.workspaceId,
+					agent: "codex",
+					model: "replay",
+					effort: null,
+				});
+				yield* sessions.sendMessage(session.id, "look", [image], false);
+				yield* waitForStored(session.id, 2);
+				const lookups = yield* database.query((db) => db.select().from(sessionAttachment));
+				const attachmentId = lookups[0]?.id ?? "";
+				return {
+					lookups,
+					served: yield* sessions.getAttachment(session.id, attachmentId),
+					elsewhere: yield* Effect.flip(sessions.getAttachment(other.id, attachmentId)),
+				};
+			}),
+		);
+		expect(result.lookups.map(({ mediaType }) => mediaType)).toEqual(["image/png"]);
+		expect(result.served).toEqual(image);
+		expect(result.elsewhere._tag).toBe("AttachmentNotFoundError");
 	});
 
 	test("keeps sent images when archiving the workspace fails", async () => {

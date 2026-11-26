@@ -87,6 +87,19 @@ export const sessionEvent = sqliteTable(
 	(table) => [uniqueIndex("sessionEventSessionSequenceUnique").on(table.sessionId, table.sequence)],
 );
 
+// Each image a user message sent, so fetching one is a single lookup instead of a scan of the chat.
+export const sessionAttachment = sqliteTable(
+	"sessionAttachment",
+	{
+		id: text().primaryKey(),
+		sessionId: text()
+			.notNull()
+			.references(() => agentSession.id, { onDelete: "cascade" }),
+		mediaType: text().notNull(),
+	},
+	(table) => [index("sessionAttachmentSessionIdIndex").on(table.sessionId)],
+);
+
 export const scriptRun = sqliteTable(
 	"scriptRun",
 	{

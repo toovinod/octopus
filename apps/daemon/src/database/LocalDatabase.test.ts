@@ -1,5 +1,5 @@
+import { agentSession, project, sessionAttachment, sessionEvent, workspace } from "./schema.ts";
 import { DATABASE_FILE_NAME, LocalDatabase, runMigrations } from "./LocalDatabase.ts";
-import { agentSession, project, sessionEvent, workspace } from "./schema.ts";
 import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { embeddedMigrations } from "./embeddedMigrations.ts";
 import type { MigrationMeta } from "drizzle-orm/migrator";
@@ -189,5 +189,46 @@ describe("LocalDatabase", () => {
 		);
 		expect(error._tag).toBe("DatabaseIntegrityError");
 		expect(error.message).toContain("agentSession");
+	});
+
+	test("lists the images of messages sent before the attachment lookup existed", async () => {
+		const migrations = embeddedMigrations();
+		const before = migrations.slice(
+			0,
+			migrations.findIndex(({ name }) => name === "20261126183115_sessionAttachment"),
+		);
+		const rows = await run((dataDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				yield* fs.makeDirectory(dataDir, { recursive: true });
+				yield* Effect.gen(function* () {
+					yield* runMigrations(before);
+					const client = yield* SqliteClient.SqliteClient;
+					const message = JSON.stringify({
+						type: "user.message",
+						itemId: "u1",
+						text: "look",
+						attachments: [
+							{ id: "a1", mediaType: "image/png" },
+							{ id: "a2", mediaType: "image/jpeg" },
+						],
+					});
+					yield* client`INSERT INTO project (id, name, path, defaultBranch, createdAt) VALUES ('p1', 'repo', '/repo', 'main', '')`;
+					yield* client`INSERT INTO workspace (id, projectId, name, kind, path, branch, baseBranch, status, createdAt) VALUES ('w1', 'p1', 'repo', 'inPlace', '/repo', 'main', 'main', 'active', '')`;
+					yield* client`INSERT INTO agentSession (id, workspaceId, agent, model, authMode, status, createdAt, updatedAt) VALUES ('s1', 'w1', 'codex', 'gpt', 'subscription', 'idle', '', '')`;
+					yield* client`INSERT INTO sessionEvent (id, sessionId, sequence, type, payload, createdAt) VALUES ('e1', 's1', 0, 'user.message', ${message}, '')`;
+				}).pipe(Effect.provide(SqliteClient.layer({ filename: join(dataDir, DATABASE_FILE_NAME) })));
+				return yield* withDatabase(
+					LocalDatabase.use((database) =>
+						database.query((db) => db.select().from(sessionAttachment).orderBy(sessionAttachment.id)),
+					),
+					dataDir,
+				);
+			}),
+		);
+		expect(rows).toEqual([
+			{ id: "a1", sessionId: "s1", mediaType: "image/png" },
+			{ id: "a2", sessionId: "s1", mediaType: "image/jpeg" },
+		]);
 	});
 });

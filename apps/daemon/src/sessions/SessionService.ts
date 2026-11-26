@@ -70,8 +70,8 @@ import {
 	isLiveOnly,
 	type PlanAnswer,
 } from "@repo/contracts/AgentEvent";
+import { agentSession, project, sessionAttachment, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
-import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { CheckpointNotFoundError, WorkspaceAgentsBusyError } from "@repo/contracts/Checkpoint";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "@repo/contracts/Workspace";
 import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
@@ -349,10 +349,16 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					createdAt,
 				})),
 			);
+			const attachments = events.flatMap((event) =>
+				event.type === "user.message"
+					? event.attachments.map(({ id, mediaType }) => ({ id, sessionId, mediaType }))
+					: [],
+			);
 			return yield* database.query((db) =>
 				db.transaction((tx) =>
 					Effect.gen(function* () {
 						yield* tx.insert(sessionEvent).values(values);
+						if (attachments.length > 0) yield* tx.insert(sessionAttachment).values(attachments);
 						if (patch === undefined) return undefined;
 						const [row] = yield* tx
 							.update(agentSession)
@@ -904,17 +910,13 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			attachmentId: string,
 		) {
 			yield* getRow(sessionId);
-			const rows = yield* database.query((db) =>
+			// Looking the id up in the session's stored images also keeps it from naming any other file.
+			const [attachment] = yield* database.query((db) =>
 				db
-					.select({ payload: sessionEvent.payload })
-					.from(sessionEvent)
-					.where(and(eq(sessionEvent.sessionId, sessionId), eq(sessionEvent.type, "user.message"))),
+					.select()
+					.from(sessionAttachment)
+					.where(and(eq(sessionAttachment.id, attachmentId), eq(sessionAttachment.sessionId, sessionId))),
 			);
-			const messages = rows.flatMap((row) => Option.toArray(decodeEventOption(row.payload)));
-			// Looking the id up in stored messages also keeps it from naming any other file.
-			const attachment = messages
-				.flatMap((event) => (event.type === "user.message" ? event.attachments : []))
-				.find(({ id }) => id === attachmentId);
 			const mediaType = decodeMediaType(attachment?.mediaType);
 			if (attachment === undefined || Option.isNone(mediaType)) {
 				return yield* new AttachmentNotFoundError({ attachmentId });
