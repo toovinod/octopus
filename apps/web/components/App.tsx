@@ -134,12 +134,17 @@ export const App = () => {
 	}, []);
 
 	// Closing collapses the panel instead of unmounting it, so terminals, loaded diffs and scroll positions survive.
+	// A frame later, because a panel that just mounted has not told its group its size limits yet, and resizing it
+	// before then throws.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: the panel mounts again when a workspace is picked.
 	useEffect(() => {
-		const panel = panelRef.current;
-		if (panel === null) return;
-		if (panelOpen) panel.expand();
-		else panel.collapse();
+		const frame = requestAnimationFrame(() => {
+			const panel = panelRef.current;
+			if (panel === null) return;
+			if (panelOpen) panel.expand();
+			else panel.collapse();
+		});
+		return () => cancelAnimationFrame(frame);
 	}, [panelOpen, panelRef, hasWorkspace]);
 
 	if (daemonStopped !== null) return <DaemonStopped reason={daemonStopped.reason} />;
