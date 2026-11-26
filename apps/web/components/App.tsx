@@ -100,6 +100,27 @@ const DaemonStopped = ({ reason }: { reason: string | null }) => {
 	);
 };
 
+// Starts the daemon again if it stopped, then reloads, so the app connects from scratch.
+const RetryConnection = () => {
+	const [retrying, setRetrying] = useState(false);
+	const [failure, setFailure] = useState<string | null>(null);
+	const onRetry = () => {
+		setRetrying(true);
+		restartDaemon().catch((error: unknown) => {
+			setFailure(isReason(error) ? error : "Octopus could not start its daemon. Quit Octopus and open it again.");
+			setRetrying(false);
+		});
+	};
+	return (
+		<>
+			{failure === null ? null : <p className="max-w-sm text-sm text-muted-foreground">{failure}</p>}
+			<Button size="sm" className="mt-2" disabled={retrying} onClick={onRetry}>
+				{retrying ? "Retrying" : "Retry"}
+			</Button>
+		</>
+	);
+};
+
 export const App = () => {
 	const connection = useAppState((current) => current.connection);
 	const panelOpen = useAppState((current) => current.panel.open);
@@ -128,9 +149,10 @@ export const App = () => {
 			<main className="flex h-full flex-col items-center justify-center gap-2 text-center">
 				<OctopusLogo className="size-10" />
 				<p className="font-medium">Octopus</p>
-				<p className="text-sm text-muted-foreground">
+				<p className="max-w-sm text-sm text-muted-foreground">
 					{connection.status === "failed" ? connection.message : "Connecting to the daemon"}
 				</p>
+				{connection.status === "failed" ? <RetryConnection /> : null}
 			</main>
 		);
 	}

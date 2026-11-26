@@ -2,17 +2,21 @@ import { Cause, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema, Stream } fro
 import { DaemonClient } from "@repo/contracts/DaemonClient";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { logWarning } from "./logWarning.ts";
 
 const DaemonConnection = Schema.Struct({
 	url: Schema.String,
 	token: Schema.String,
 });
 
-class DaemonConnectionError extends Schema.TaggedError<DaemonConnectionError>()("DaemonConnectionError", {
+// The shell rejects with the daemon's own reason when it printed one before it stopped.
+const isReason = Schema.is(Schema.String);
+
+export class DaemonConnectionError extends Schema.TaggedError<DaemonConnectionError>()("DaemonConnectionError", {
 	cause: Schema.Defect(),
 }) {
 	override get message() {
-		return "Octopus could not reach its daemon. Restart the app.";
+		return isReason(this.cause) ? this.cause : "Octopus could not reach its daemon.";
 	}
 }
 
@@ -39,23 +43,37 @@ const daemonRuntime = ManagedRuntime.make(DaemonClientFromShell);
 // Must match DAEMON_STOPPED_EVENT in apps/desktop/src-tauri/src/lib.rs.
 const DAEMON_STOPPED_EVENT = "daemon-stopped";
 
-export const isReason = Schema.is(Schema.String);
+// Must match StoppedDaemon in apps/desktop/src-tauri/src/lib.rs. The shell answers null while the daemon runs.
+const isStoppedDaemon = Schema.is(Schema.Struct({ reason: Schema.NullOr(Schema.String) }));
+
+export { isReason };
 
 // Calls back when the desktop shell's daemon exits without the app quitting, with the daemon's own reason when it
-// printed one. Returns the function that stops listening.
+// printed one. The event fires once, possibly before this listens, so the shell is asked once listening has begun.
+// Returns the function that stops listening.
 export const onDaemonStopped = (listener: (reason: string | null) => void) => {
 	if (!isTauri()) return () => {};
 	const unlisten = listen<unknown>(DAEMON_STOPPED_EVENT, (event) =>
 		listener(isReason(event.payload) ? event.payload : null),
 	);
+	void unlisten
+		.then(() => invoke<unknown>("daemon_stopped"))
+		.then(
+			(stopped) => {
+				if (isStoppedDaemon(stopped)) listener(stopped.reason);
+			},
+			(error: unknown) => logWarning("Could not ask the desktop shell whether the daemon stopped", error),
+		);
 	return () => {
 		void unlisten.then((stop) => stop());
 	};
 };
 
 // The new daemon has a new URL and token. Reloading the window rebuilds the runtime, every stream and every list
-// against it, so nothing keeps talking to the daemon that is gone.
-export const restartDaemon = () => invoke("restart_daemon").then(() => window.location.reload());
+// against it, so nothing keeps talking to the daemon that is gone. In a browser there is no shell to restart it,
+// so a reload only tries the connection again.
+export const restartDaemon = () =>
+	isTauri() ? invoke("restart_daemon").then(() => window.location.reload()) : Promise.resolve(window.location.reload());
 
 export type Daemon = DaemonClient["Service"];
 

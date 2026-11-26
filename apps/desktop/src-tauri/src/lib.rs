@@ -93,6 +93,21 @@ fn failure_reason(event: &CommandEvent) -> Option<String> {
   String::from_utf8_lossy(line).trim().strip_prefix(FAILED_LINE_PREFIX).map(str::to_string)
 }
 
+// What the webview reads when it may have missed the stop event: it fires once, and can fire before the
+// webview listens, such as when octopusd fails at launch.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct StoppedDaemon {
+  reason: Option<String>,
+}
+
+// Quitting stops octopusd on purpose, so only an unexpected stop is reported.
+fn stopped_report(status: &DaemonStatus, quitting: bool) -> Option<StoppedDaemon> {
+  match status {
+    DaemonStatus::Stopped(reason) if !quitting => Some(StoppedDaemon { reason: reason.clone() }),
+    _ => None,
+  }
+}
+
 struct Daemon {
   status: watch::Sender<DaemonStatus>,
   // With the pid read at spawn: `CommandChild::pid` waits on a lock the plugin's waiter thread
@@ -126,6 +141,11 @@ async fn wait_for_connection(daemon: &Daemon) -> Result<DaemonConnection, String
   let mut status = daemon.status.subscribe();
   let settled = status.wait_for(|status| status.connection().is_some()).await.map_err(|error| error.to_string())?;
   settled.connection().expect("checked by wait_for")
+}
+
+#[tauri::command]
+fn daemon_stopped(daemon: State<'_, Daemon>) -> Option<StoppedDaemon> {
+  stopped_report(&daemon.status.borrow(), daemon.quitting.load(Ordering::SeqCst))
 }
 
 #[tauri::command]
@@ -233,11 +253,10 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
         _ => {}
       }
       let Some(status) = status else { continue };
-      let stopped = matches!(status, DaemonStatus::Stopped(_));
+      let report = stopped_report(&status, daemon.quitting.load(Ordering::SeqCst));
       daemon.status.send_replace(status);
-      // Quitting stops octopusd on purpose, so only an unexpected exit tells the webview.
-      if stopped && !daemon.quitting.load(Ordering::SeqCst) {
-        let _ = app.emit(DAEMON_STOPPED_EVENT, failure.clone());
+      if let Some(report) = report {
+        let _ = app.emit(DAEMON_STOPPED_EVENT, report.reason);
       }
     }
   });
@@ -305,7 +324,7 @@ pub fn run() {
         CloseAction::Quit => request_quit(window.app_handle()),
       }
     })
-    .invoke_handler(tauri::generate_handler![daemon_connection, restart_daemon, set_quit_warning])
+    .invoke_handler(tauri::generate_handler![daemon_connection, daemon_stopped, restart_daemon, set_quit_warning])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app, event| match event {
@@ -491,6 +510,18 @@ mod tests {
   fn closing_the_window_hides_it_only_on_macos() {
     let expected = if cfg!(target_os = "macos") { CloseAction::Hide } else { CloseAction::Quit };
     assert_eq!(CLOSE_ACTION, expected);
+  }
+
+  #[test]
+  fn a_stop_is_reported_until_the_daemon_starts_again_unless_the_app_is_quitting() {
+    let stopped = DaemonStatus::Stopped(Some("Another Octopus is already running.".to_string()));
+    assert_eq!(
+      stopped_report(&stopped, false),
+      Some(StoppedDaemon { reason: Some("Another Octopus is already running.".to_string()) })
+    );
+    assert_eq!(stopped_report(&stopped, true), None);
+    assert_eq!(stopped_report(&DaemonStatus::Starting, false), None);
+    assert_eq!(stopped_report(&DaemonStatus::Ready(connection()), false), None);
   }
 
   #[test]
