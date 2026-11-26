@@ -157,4 +157,38 @@ describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 		}).pipe(Effect.scoped, Effect.runPromise);
 		expect(rows).toEqual([{ expiresAt, expired: true }]);
 	});
+
+	// Rows written before a constraint existed cannot be fixed safely by a migration, so it must stop
+	// and say what to fix, not fail on a bare index or check error.
+	const upgradeFailureWith = <E>(rows: Effect.Effect<unknown, E, PgClient.PgClient>) =>
+		Effect.gen(function* () {
+			const url = yield* makeEmptyTestDatabase(Option.getOrThrow(serverUrl));
+			yield* migrateUpTo(url, "preflight_constraints");
+			yield* Effect.gen(function* () {
+				yield* insertOrgAndUser;
+				yield* rows;
+			}).pipe(withSql(url));
+			return Bun.inspect(yield* migrateCloudDatabase.pipe(withDatabaseUrl(url), Effect.flip));
+		}).pipe(Effect.scoped, Effect.runPromise);
+
+	test("upgrading stops with a clear error when one identity is linked to two accounts", async () => {
+		const failure = await upgradeFailureWith(
+			Effect.gen(function* () {
+				yield* insertAccount("account_1");
+				yield* insertAccount("account_2");
+			}),
+		);
+		expect(failure).toContain("Identities linked to more than one account row: 1");
+	});
+
+	test("upgrading stops with a clear error when a cloud workspace has a state the code does not know", async () => {
+		const failure = await upgradeFailureWith(
+			PgClient.PgClient.use(
+				(sql) => sql`insert into cloud_workspace
+					(id, organization_id, created_by, repository_url, branch, base_branch, requested_state, observed_state, sandbox_provider)
+					values ('workspace_1', 'org_1', 'user_1', 'https://github.com/acme/app', 'feat/x', 'main', 'paused', 'running', 'vercel')`,
+			),
+		);
+		expect(failure).toContain("cloud_workspace rows with a state or sandbox provider the code does not know: 1");
+	});
 });
