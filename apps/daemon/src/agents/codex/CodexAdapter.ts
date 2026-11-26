@@ -251,7 +251,7 @@ const describeWindow = (minutes: number) => {
 // Codex names a turn only in its turn/start reply, and the turn may finish before that reply arrives.
 type TurnState =
 	| { readonly _tag: "idle" }
-	| { readonly _tag: "starting"; readonly interruptRequested: boolean }
+	| { readonly _tag: "starting" }
 	| { readonly _tag: "running"; readonly turnId: string };
 
 const idle: TurnState = { _tag: "idle" };
@@ -847,7 +847,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						Effect.gen(function* () {
 							const threadId = yield* session.nativeSessionId;
 							const { model, effort, mode } = yield* Ref.get(settings);
-							yield* Ref.set(currentTurn, { _tag: "starting", interruptRequested: false });
+							yield* Ref.set(currentTurn, { _tag: "starting" });
 							yield* Ref.set(plans.turnPlan, Option.none());
 							const { turn } = yield* client
 								.request("turn/start", {
@@ -868,11 +868,10 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 									Effect.onError(() => Ref.set(currentTurn, idle)),
 								);
 							// A turn that already finished stays idle, so its id is never reused.
-							const before = yield* Ref.getAndUpdate(
+							yield* Ref.update(
 								currentTurn,
 								(state): TurnState => (state._tag === "starting" ? { _tag: "running", turnId: turn.id } : state),
 							);
-							if (before._tag === "starting" && before.interruptRequested) yield* interrupt(turn.id);
 						}),
 					steerTurn: (message) =>
 						Effect.gen(function* () {
@@ -906,11 +905,9 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							argumentHint: null,
 						})),
 					),
-					// Before Codex names the turn, the interrupt waits for the name.
+					// The session holds a stop back until turn/start returns, so a turn still starting is never stopped here.
 					interruptTurn: Effect.gen(function* () {
-						const state = yield* Ref.getAndUpdate(currentTurn, (state) =>
-							state._tag === "starting" ? { ...state, interruptRequested: true } : state,
-						);
+						const state = yield* Ref.get(currentTurn);
 						if (state._tag === "running") yield* interrupt(state.turnId);
 					}),
 				});
