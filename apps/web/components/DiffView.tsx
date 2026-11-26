@@ -21,6 +21,7 @@ import { newChat, sendMessage, toast, updateSettings, useAppState, workingChats 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { keepFullFiles } from "../lib/keepFullFiles.ts";
 import { commitPaths } from "../lib/commitPaths.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
@@ -58,6 +59,14 @@ interface LinePicking {
 
 export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const [diff, setDiff] = useState<WorkspaceDiff | null>(null);
+	// Read by loads, which must merge into what is shown now, not into the diff of the render that started them.
+	const shown = useRef<WorkspaceDiff | null>(null);
+	const show = useCallback((next: WorkspaceDiff) => {
+		shown.current = next;
+		setDiff(next);
+	}, []);
+	// Files the user asked to see in full, which a reload must not summarize again.
+	const loadedInFull = useRef(new Set<string>());
 	const [error, setError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	// Files the user opened or closed, overriding startsOpen.
@@ -103,6 +112,22 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		setPicked(null);
 	};
 
+	const loadFullFile = useCallback(
+		async (path: string) => {
+			loadedInFull.current.add(path);
+			const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
+				(failure: unknown) => {
+					toast(errorMessage(failure));
+					return null;
+				},
+			);
+			const current = shown.current;
+			if (file === null || current === null) return;
+			show({ ...current, files: current.files.map((item) => (item.path === path ? file : item)) });
+		},
+		[workspace.id, show],
+	);
+
 	// Loads can overlap, and an older one can answer last. Only the latest request may show its result.
 	const latestLoad = useRef(0);
 	const load = useCallback(async () => {
@@ -112,15 +137,17 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		await callDaemon((daemon) => daemon.getWorkspaceDiff({ workspaceId: workspace.id })).then(
 			(loaded) => {
 				if (!isLatest()) return;
-				setDiff(loaded);
+				const { files, stale } = keepFullFiles(shown.current?.files ?? [], loaded.files, loadedInFull.current);
+				show({ ...loaded, files });
 				setError(null);
+				for (const path of stale) void loadFullFile(path);
 			},
 			(failure: unknown) => {
 				if (isLatest()) setError(errorMessage(failure));
 			},
 		);
 		if (isLatest()) setLoading(false);
-	}, [workspace.id]);
+	}, [workspace.id, show, loadFullFile]);
 
 	// A chat starting or stopping work and a revert are when files change. Renames and model changes are not.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: working and reverts are the reload signals.
@@ -133,21 +160,6 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		const timer = setInterval(() => void load(), WORKING_RELOAD_MS);
 		return () => clearInterval(timer);
 	}, [load, working]);
-
-	const loadFullFile = async (path: string) => {
-		const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
-			(failure: unknown) => {
-				toast(errorMessage(failure));
-				return null;
-			},
-		);
-		if (file === null) return;
-		setDiff((current) =>
-			current === null
-				? current
-				: { ...current, files: current.files.map((item) => (item.path === path ? file : item)) },
-		);
-	};
 
 	const isOpen = useCallback((file: DiffFile) => toggled.get(file.path) ?? startsOpen(file), [toggled]);
 	const rows = useMemo(() => (diff === null ? [] : diffRows(diff.files, mode, isOpen)), [diff, mode, isOpen]);
