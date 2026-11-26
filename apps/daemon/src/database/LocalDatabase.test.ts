@@ -20,13 +20,14 @@ const run = <A, E>(program: (dataDir: string) => Effect.Effect<A, E, FileSystem.
 	}).pipe(Effect.scoped, Effect.provide(BunServices.layer), Effect.runPromise);
 
 describe("LocalDatabase", () => {
-	test("migrates a new file with WAL, foreign keys and a 5 second busy timeout", async () => {
+	test("migrates a new file with WAL, NORMAL sync, foreign keys and a 5 second busy timeout", async () => {
 		const pragmas = await run((dataDir) =>
 			withDatabase(
 				LocalDatabase.use((database) =>
 					database.query((db) =>
 						Effect.all([
 							db.get<{ journal_mode: string }>(sql`PRAGMA journal_mode`),
+							db.get<{ synchronous: number }>(sql`PRAGMA synchronous`),
 							db.get<{ foreign_keys: number }>(sql`PRAGMA foreign_keys`),
 							db.get<{ timeout: number }>(sql`PRAGMA busy_timeout`),
 							db.select().from(project),
@@ -36,7 +37,7 @@ describe("LocalDatabase", () => {
 				dataDir,
 			),
 		);
-		expect(pragmas).toEqual([{ journal_mode: "wal" }, { foreign_keys: 1 }, { timeout: 5000 }, []]);
+		expect(pragmas).toEqual([{ journal_mode: "wal" }, { synchronous: 1 }, { foreign_keys: 1 }, { timeout: 5000 }, []]);
 	});
 
 	test("reopening an existing file applies no migration twice", async () => {

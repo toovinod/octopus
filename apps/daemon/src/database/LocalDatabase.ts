@@ -80,14 +80,21 @@ export class LocalDatabase extends Context.Service<
 		Effect.gen(function* () {
 			const db = yield* SQLiteBunDrizzle.makeWithDefaults();
 			const client = yield* SqliteClient.SqliteClient;
+			// Under WAL a commit stays safe from crashes of the app and loses at most the last commits on power loss,
+			// without an fsync per write. Some SQLite builds already default to it, so it is set for all of them.
+			yield* client`PRAGMA synchronous = NORMAL`;
 			yield* runMigrations(embeddedMigrations());
 			yield* restrictDatabaseFiles;
 			// Runs after every layer that writes has closed and before the connection closes, so the
 			// WAL is folded into the database file and truncated.
+			// Optimize first, so the statistics it refreshes are part of the checkpointed file.
 			yield* Effect.addFinalizer(() =>
-				client`PRAGMA wal_checkpoint(TRUNCATE)`.pipe(
-					Effect.andThen(Effect.logDebug("Checkpointed the database")),
-					Effect.catch((cause) => Effect.logWarning("Could not checkpoint the database on shutdown", cause)),
+				client`PRAGMA optimize`.pipe(
+					Effect.andThen(client`PRAGMA wal_checkpoint(TRUNCATE)`),
+					Effect.andThen(Effect.logDebug("Optimized and checkpointed the database")),
+					Effect.catch((cause) =>
+						Effect.logWarning("Could not optimize and checkpoint the database on shutdown", cause),
+					),
 				),
 			);
 
