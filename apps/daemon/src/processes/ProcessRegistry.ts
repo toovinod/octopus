@@ -35,6 +35,8 @@ export class ProcessRegistry extends Context.Service<
 	{
 		readonly add: (pgid: number) => Effect.Effect<void>;
 		readonly remove: (pgid: number) => Effect.Effect<void>;
+		// SIGTERMs every recorded group at once and SIGKILLs those still alive after the stop grace.
+		readonly stopAll: Effect.Effect<void>;
 	}
 >()("octopus/daemon/processes/ProcessRegistry") {
 	static readonly layer = Layer.effect(
@@ -92,6 +94,12 @@ export class ProcessRegistry extends Context.Service<
 					Effect.gen(function* () {
 						if (groups.delete(pgid)) yield* save;
 					}),
+				stopAll: Effect.suspend(() =>
+					Effect.forEach([...groups.keys()], (pgid) => stopProcessGroup(pgid), {
+						concurrency: "unbounded",
+						discard: true,
+					}),
+				),
 			});
 		}),
 	);

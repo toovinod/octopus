@@ -14,6 +14,7 @@ describe("TrackedChildProcessSpawner", () => {
 			ProcessRegistry.of({
 				add: (pgid) => Effect.sync(() => events.push(`add ${pgid}`)),
 				remove: (pgid) => Effect.sync(() => events.push(`remove ${pgid}`)),
+				stopAll: Effect.void,
 			}),
 		);
 		const result = await Effect.gen(function* () {

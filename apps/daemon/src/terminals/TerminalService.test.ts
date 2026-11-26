@@ -98,7 +98,7 @@ describe("TerminalService", () => {
 			// Recording the group writes a file, so a shell can print before it finishes.
 			const slowRegistry = Layer.succeed(
 				ProcessRegistry,
-				ProcessRegistry.of({ add: () => Effect.sleep("300 millis"), remove: () => Effect.void }),
+				ProcessRegistry.of({ add: () => Effect.sleep("300 millis"), remove: () => Effect.void, stopAll: Effect.void }),
 			);
 			return yield* Effect.gen(function* () {
 				const terminals = yield* TerminalService;

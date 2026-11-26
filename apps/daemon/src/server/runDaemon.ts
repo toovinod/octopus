@@ -1,3 +1,4 @@
+import { StopChildrenBeforeDeadline } from "../shutdown/stopChildrenBeforeDeadline.ts";
 import { Cause, Console, Effect, Exit, Layer, Option, type Stdio } from "effect";
 import { gitTimeoutSettingsFromConfig } from "../git/GitTimeoutSettings.ts";
 import { BunRuntime, BunServices, BunStdio } from "@effect/platform-bun";
@@ -22,10 +23,12 @@ export const runDaemon = (
 ) => {
 	// Shutdown is built first, so it is closed last and its signal handlers and deadline cover
 	// every other finalizer. The process registry is shared by the services and the agent adapters,
-	// and is closed after both, once nothing is left to spawn.
+	// and is closed after both, once nothing is left to spawn. Until then, it stops what is left in time.
 	const DaemonLayer = DaemonServer.pipe(
 		Layer.provide(agents),
-		Layer.provideMerge(ProcessRegistry.layer.pipe(Layer.provide(BunServices.layer))),
+		Layer.provideMerge(
+			StopChildrenBeforeDeadline.pipe(Layer.provideMerge(ProcessRegistry.layer.pipe(Layer.provide(BunServices.layer)))),
+		),
 		Layer.provideMerge(Shutdown.layer),
 		Layer.provideMerge(config),
 		Layer.provideMerge(gitTimeoutSettingsFromConfig),
