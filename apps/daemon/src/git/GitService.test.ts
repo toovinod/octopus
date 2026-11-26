@@ -640,7 +640,7 @@ describe("GitService on a branch that tracks another remote", () => {
 		}
 	});
 
-	test("treats a branch that tracks a named remote such as upstream as the project's own, and pushes it to origin", async () => {
+	test("treats a branch that tracks the base repository gh resolved, such as upstream, as the project's own, and pushes it to origin", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
@@ -651,6 +651,8 @@ describe("GitService on a branch that tracks another remote", () => {
 				const upstream = join(tempDir, "upstream.git");
 				yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", upstream]);
 				yield* runGit(repositoryPath, ["remote", "add", "upstream", upstream]);
+				// What `gh repo set-default` and gh's first question in a repository with several remotes leave.
+				yield* runGit(repositoryPath, ["config", "remote.upstream.gh-resolved", "base"]);
 				yield* runGit(repositoryPath, ["config", "branch.feature.remote", "upstream"]);
 				yield* runGit(repositoryPath, ["config", "branch.feature.merge", "refs/heads/main"]);
 				yield* addMarkingHooks(tempDir, repositoryPath);
