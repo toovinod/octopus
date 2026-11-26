@@ -101,7 +101,8 @@ describe("WorkspaceService.create from a source", () => {
 			branch: "feat/login",
 			baseBranch: "main",
 		});
-		expect(result.created.path.endsWith(join(result.project.id, "feat-login"))).toBe(true);
+		// The slash becomes a hyphen, and a hash of the branch keeps it apart from a workspace named feat-login.
+		expect(result.created.path).toMatch(new RegExp(`${result.project.id}/feat-login-[0-9a-f]{8}$`));
 		expect(result.checkedOut).toBe("feat/login");
 	});
 

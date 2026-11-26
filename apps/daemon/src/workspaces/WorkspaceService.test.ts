@@ -86,6 +86,25 @@ describe("WorkspaceService", () => {
 		expect(new Set(paths).size).toBe(2);
 	});
 
+	test("branches whose names make the same folder name each get a folder of their own", async () => {
+		const paths = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const long = "a".repeat(70);
+				const branches = ["feat/x", `${long}-one`, `${long}-two`];
+				for (const branch of branches) yield* runGit(project.path, ["branch", branch]);
+				const named = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feat-x" });
+				const fromBranches = yield* Effect.forEach(branches, (branch) =>
+					workspaces.create({ kind: "branch", projectId: project.id, branch }),
+				);
+				return [named, ...fromBranches].map((created) => created.path);
+			}),
+		);
+		expect(new Set(paths).size).toBe(4);
+		expect(paths.every((path) => (path.split("/").at(-1)?.length ?? 0) <= 63)).toBe(true);
+	});
+
 	test("refuses a name whose branch already exists", async () => {
 		const error = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
