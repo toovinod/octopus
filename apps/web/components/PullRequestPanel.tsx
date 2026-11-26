@@ -17,6 +17,7 @@ import type {
 	PullRequestConversation,
 	PullRequestMergeMethod,
 	PullRequestReviewInput,
+	PullRequestStatus,
 } from "@repo/contracts/Git";
 import { newChat, sendMessage, toast, updateWorkspace, useAppState } from "../lib/store.ts";
 import {
@@ -29,6 +30,7 @@ import {
 import { Badge } from "@repo/ui/components/badge";
 import { Label } from "@repo/ui/components/label";
 import { callDaemon, errorMessage, followDaemon } from "../lib/daemonRuntime.ts";
+import { followReattaching } from "../lib/followReattaching.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { formatDateTime } from "../lib/format.ts";
@@ -56,12 +58,15 @@ export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace 
 	);
 	const checksPending =
 		loaded.state === "ready" && loaded.value.status === "found" && loaded.value.pullRequest.checks.pending > 0;
-	// The daemon polls GitHub while checks run and ends the watch once they are done. A failed poll only
-	// stops the updates; Reload still works.
+	// The daemon polls GitHub while checks run and ends the watch once they are done. A dropped connection attaches
+	// again, after a reload catches up on what changed meanwhile.
 	useEffect(() => {
 		if (!checksPending) return;
-		return followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), { onItem: replace });
-	}, [checksPending, workspace.id, replace]);
+		return followReattaching<PullRequestStatus>(
+			(handlers) => followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), handlers),
+			{ onItem: replace, onReattach: reload },
+		);
+	}, [checksPending, workspace.id, replace, reload]);
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
