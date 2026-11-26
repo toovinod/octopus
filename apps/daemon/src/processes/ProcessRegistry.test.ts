@@ -1,6 +1,6 @@
 import { isGoneWithin, killGroupOnExit, spawnDetachedShell, WITH_GRANDCHILD } from "../testing/processTesting.ts";
 import { Clock, Context, Duration, Effect, Exit, FileSystem, Layer, Option, Schema, Stream } from "effect";
-import { ProcessRegistry, REGISTRY_FILE_NAME, RegistryEntries } from "./ProcessRegistry.ts";
+import { ProcessRegistry, RECORD_AFTER, REGISTRY_FILE_NAME, RegistryEntries } from "./ProcessRegistry.ts";
 import { processExists, STOP_GRACE } from "./stopProcessGroup.ts";
 import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { runInTempDir } from "../testing/runServiceTest.ts";
@@ -150,4 +150,27 @@ describe("ProcessRegistry", () => {
 		expect(result.gone).toEqual([true, true]);
 		expect(result.took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
 	}, 20_000);
+
+	test("writes a child to the file only once it has run for a moment, and never one that is gone by then", async () => {
+		const result = await runInTempDir((dataDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const file = join(dataDir, REGISTRY_FILE_NAME);
+				const layer = ProcessRegistry.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]));
+				const registry = Context.get(yield* Layer.build(layer), ProcessRegistry);
+				// A short git call: added and removed again at once.
+				yield* registry.add(111111);
+				yield* registry.remove(111111);
+				yield* registry.add(222222);
+				const young = yield* fs.readFileString(file);
+				yield* Effect.sleep(Duration.sum(RECORD_AFTER, Duration.millis(200)));
+				const old = yield* fs.readFileString(file);
+				yield* registry.remove(222222);
+				return { young, old, removed: yield* fs.readFileString(file) };
+			}),
+		);
+		expect(result.young).toBe("[]");
+		expect(result.old).toContain('"pgid":222222');
+		expect(result.removed).toBe("[]");
+	});
 });
