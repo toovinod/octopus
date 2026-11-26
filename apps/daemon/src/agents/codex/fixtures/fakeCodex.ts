@@ -496,6 +496,13 @@ const serve = async () => {
 				if (text.includes("hang")) break;
 				// Like an app-server that crashes.
 				if (text.includes("quit now")) process.exit(1);
+				// Like an app-server that stops reading but keeps its output open, so only a write can tell. A child
+				// holds stdout while this process, the only reader of stdin, exits.
+				if (text.includes("close stdin")) {
+					reply();
+					Bun.spawn(["sleep", "3"], { stdin: "ignore", stdout: "inherit", stderr: "inherit" });
+					process.exit(0);
+				}
 				if (text.includes("early")) {
 					// The turn can finish before Codex answers turn/start.
 					completeTurn("completed");

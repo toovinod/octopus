@@ -269,6 +269,28 @@ describe("CodexAdapter", () => {
 		expect(error).toMatchObject({ _tag: "AgentProcessError", message: "Codex app-server exited." });
 	});
 
+	test("a failed write to Codex ends the session at once instead of waiting for deadlines", async () => {
+		const [request, session] = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("close stdin"));
+				yield* Effect.sleep("200 millis");
+				const request = yield* Effect.flip(handle.listCommands);
+				return [request, yield* Effect.flip(Stream.runDrain(handle.events))] as const;
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(CodexRequestSettings, { timeout: Duration.seconds(10) }),
+				Effect.timeout("3 seconds"),
+			),
+		);
+		const failed = {
+			_tag: "AgentProcessError",
+			message: "Octopus could not write to Codex, so the chat stopped. Start it again.",
+		};
+		expect(request).toMatchObject(failed);
+		expect(session).toMatchObject(failed);
+	});
+
 	test("runs a skill named with punctuation after it", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
