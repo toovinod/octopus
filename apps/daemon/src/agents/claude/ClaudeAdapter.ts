@@ -329,6 +329,9 @@ const toolResultText = (
 	return keepOutputTail(content.map((part) => ("text" in part ? part.text : "")).join("\n"));
 };
 
+// The answer to a Stop from a claude new enough to send one: the messages it still runs after the Stop.
+const InterruptReceipt = Schema.Struct({ still_queued: Schema.Array(Schema.String) });
+
 // interruptAgain stops a turn claude runs by itself after a Stop, from a steer it still had queued.
 const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, interruptAgain: Effect.Effect<void>) {
 	// Stream deltas and finished blocks share an item id: the message id plus the block index.
@@ -341,11 +344,33 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, i
 	const interrupting = yield* Ref.make(false);
 	// The uuid of the last message Octopus sent claude.
 	const lastSent = yield* Ref.make("");
+	// A Stop can leave a steer in claude's queue, which claude then runs as a turn of its own once the stopped turn
+	// ends. That turn takes a Stop only once it runs, so it is stopped at its first message, not at the stopped turn's
+	// result: claude may still be picking the steer up then, and a Stop sent in that moment reaches no turn.
+	const idleSteer = { queued: false, stoppedTurnEnded: false, steerTurnRunning: false, stopSent: false };
+	const queuedSteer = yield* Ref.make(idleSteer);
+	const stopSteerTurn = Ref.modify(queuedSteer, (steer) =>
+		steer.queued && steer.steerTurnRunning && !steer.stopSent ? [true, { ...steer, stopSent: true }] : [false, steer],
+	).pipe(Effect.flatMap((stop) => (stop ? interruptAgain : Effect.void)));
+	// The receipt lists the steer when claude still runs it. A claude too old to send one may run it too.
+	const stopped = (receipt: unknown) =>
+		Effect.gen(function* () {
+			const decoded = Schema.decodeUnknownOption(InterruptReceipt)(receipt);
+			const steer = yield* Ref.get(lastSent);
+			const queued = Option.isNone(decoded) || decoded.value.still_queued.includes(steer);
+			yield* Ref.update(queuedSteer, (current) => ({ ...current, queued }));
+			yield* stopSteerTurn;
+		});
+	const turnStarting = Ref.set(interrupting, false).pipe(Effect.andThen(Ref.set(queuedSteer, idleSteer)));
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
 	const handle = Effect.fnUntraced(function* (message: ClaudeMessage) {
 		yield* session.touch;
+		if (message.type !== "result" && (yield* Ref.get(queuedSteer)).stoppedTurnEnded) {
+			yield* Ref.update(queuedSteer, (steer) => ({ ...steer, steerTurnRunning: true }));
+			yield* stopSteerTurn;
+		}
 		// Subagent frames belong to the Task tool call that started them.
 		if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return;
 		switch (message.type) {
@@ -480,8 +505,9 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, i
 				// started ends only with the result for the last message it sent, so no result ends a later turn.
 				if (message.user_message_uuid !== undefined && message.user_message_uuid !== (yield* Ref.get(lastSent))) {
 					yield* Effect.logDebug("Claude ended a turn a later message continues");
-					// A Stop ended the running turn, but claude keeps a queued steer and runs it next, so it is stopped too.
-					if (yield* Ref.get(interrupting)) yield* interruptAgain;
+					if (yield* Ref.get(interrupting)) {
+						yield* Ref.update(queuedSteer, (steer) => ({ ...steer, stoppedTurnEnded: true }));
+					}
 					return;
 				}
 				const interrupted = yield* Ref.getAndSet(interrupting, false);
@@ -515,7 +541,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, i
 		}
 	});
 
-	return { handle, interrupting, lastSent };
+	return { handle, interrupting, lastSent, stopped, turnStarting };
 });
 
 // claude runs its own claude.ai sign-in on a terminal. Octopus shows its link and passes it a
@@ -685,20 +711,20 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
-				const { handle, interrupting, lastSent } = yield* makeMessageHandler(
+				const sessionScope = yield* Effect.scope;
+				const { handle, interrupting, lastSent, stopped, turnStarting } = yield* makeMessageHandler(
 					session,
 					// Sent on its own fiber, so the reader goes on delivering claude's messages while claude answers it.
-					Effect.suspend(() =>
-						Effect.sync(() =>
-							Effect.runForkWith(context)(
-								Effect.tryPromise(() => run.interrupt()).pipe(
-									Effect.catch((error) => Effect.logWarning("Could not stop a steer claude still had queued", error)),
-								),
-							),
-						),
+					Effect.tryPromise({
+						try: () => run.interrupt(),
+						catch: (cause) =>
+							new AgentProcessError({ message: "Could not stop a steer claude still had queued.", cause }),
+					}).pipe(
+						Effect.catchTag("AgentProcessError", (error) => Effect.logWarning(error.message, error.cause)),
+						Effect.forkIn(sessionScope),
+						Effect.asVoid,
 					),
 				);
-				const sessionScope = yield* Effect.scope;
 				let claudePid: number | undefined;
 
 				const proposePlan = (toolInput: Record<string, unknown>, request: Parameters<CanUseTool>[2]) =>
@@ -939,7 +965,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.
-					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
+					startTurn: (message) => turnStarting.pipe(Effect.andThen(sendMessage(message))),
 					steerTurn: (message) => Effect.as(sendMessage(message), true),
 					updateSettings: (next) =>
 						Effect.gen(function* () {
@@ -976,7 +1002,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					),
 					interruptTurn: Effect.gen(function* () {
 						yield* Ref.set(interrupting, true);
-						yield* Effect.tryPromise({
+						const receipt = yield* Effect.tryPromise({
 							try: () => run.interrupt(),
 							catch: (cause) =>
 								new AgentProcessError({
@@ -984,6 +1010,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 									cause,
 								}),
 						});
+						yield* stopped(receipt);
 					}),
 				});
 			});

@@ -40,6 +40,8 @@ const bashSuggestion: PermissionUpdate = {
 const startedWith: Array<Options> = [];
 const settingsChanges: Array<unknown> = [];
 const prompts: Array<SDKUserMessage> = [];
+// How many Stops claude had taken when it started a turn of its own for a queued steer.
+const stopsBeforeSteerTurn: Array<number> = [];
 
 const settingsChanged = Promise.withResolvers<void>();
 
@@ -49,6 +51,8 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			startedWith.push(options);
 			let resolveInterrupt = () => {};
 			let interrupts = 0;
+			// The steers a Stop leaves in claude's queue, which its receipt lists once claude has read the steer.
+			let stillQueued = Promise.resolve<Array<string>>([]);
 			const interruptCount = async (count: number) => {
 				while (interrupts < count) await new Promise((resolve) => setTimeout(resolve, 5));
 			};
@@ -88,27 +92,41 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						continue;
 					}
 					if (text.includes("steer, then stop")) {
-						// A Stop while the steer waits in claude's queue ends the running turn, and the queued steer still
-						// runs as a turn of its own unless it is stopped too.
+						// Not recorded; it follows the SDK's documented interrupt receipt. A Stop while the steer waits in
+						// claude's queue ends the running turn and lists the steer as still queued, and claude then runs
+						// the steer as a turn of its own, which takes a Stop only once it runs.
 						yield {
 							type: "assistant",
 							parent_tool_use_id: null,
 							message: { id: "msg_s1", content: [{ type: "text", text: "1, 2, 3" }] },
 						};
+						const read = Promise.withResolvers<Array<string>>();
+						stillQueued = read.promise;
 						const steer = await input.next();
 						if (steer.done) return;
 						prompts.push(steer.value);
+						// "unlisted" stands for a steer claude took into the stopped turn after all.
+						const listed = !text.includes("unlisted");
+						read.resolve(steer.value.uuid === undefined || !listed ? [] : [steer.value.uuid]);
 						await interruptCount(1);
+						stillQueued = Promise.resolve([]);
 						yield {
 							type: "result",
 							subtype: "error_during_execution",
 							uuid: "result-s1",
 							user_message_uuid: user.uuid,
 						};
-						await interruptCount(2);
+						stopsBeforeSteerTurn.push(interrupts);
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s2", content: [{ type: "text", text: "4, 5" }] },
+						};
+						if (listed) await interruptCount(2);
+						stopsBeforeSteerTurn.push(interrupts);
 						yield {
 							type: "result",
-							subtype: "error_during_execution",
+							subtype: listed ? "error_during_execution" : "success",
 							uuid: "result-s2",
 							user_message_uuid: steer.value.uuid,
 						};
@@ -414,8 +432,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 						throw new Error(`Claude Code returned an error result: ${missingSession}`);
 				},
 				interrupt: async () => {
+					const receipt = { still_queued: await stillQueued };
 					interrupts++;
 					resolveInterrupt();
+					return receipt;
 				},
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
@@ -1049,6 +1069,21 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(results).toEqual([{ type: "turn.completed", turnId: "result-s2", result: { status: "interrupted" } }]);
 		expect(next).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+		// The second Stop waits for the steer's turn to run, since one sent before reaches no turn.
+		expect(stopsBeforeSteerTurn.splice(0)).toEqual([1, 2]);
+	});
+
+	test("Stop sends no second Stop when claude's receipt does not list the steer as still queued", async () => {
+		await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer, then stop unlisted"));
+				yield* takeUntil(handle, "message.completed");
+				yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(stopsBeforeSteerTurn.splice(0)).toEqual([1, 1]);
 	});
 
 	test("a steer that claude runs as its own turn ends with the turn it was sent into", async () => {
