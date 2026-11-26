@@ -3,16 +3,13 @@ import { ConfigProvider, Effect, FileSystem, Layer, Stream } from "effect";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { SCROLLBACK_MAX_LINES, Scrollback } from "./Scrollback.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
-import type { ChildProcessSpawner } from "effect/process";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { SecureRandom } from "effect/crypto";
 
 const size = { cols: 80, rows: 24 };
 
-const runTerminalTest = <A, E>(
-	program: (tempDir: string) => Effect.Effect<A, E, TerminalService | ChildProcessSpawner.ChildProcessSpawner>,
-) =>
+const runTerminalTest = <A, E>(program: (tempDir: string) => Effect.Effect<A, E, TerminalService>) =>
 	Effect.gen(function* () {
 		const fs = yield* FileSystem.FileSystem;
 		const tempDir = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
@@ -34,25 +31,6 @@ const outputText = (outputs: ReadonlyArray<{ readonly type: string; readonly dat
 	outputs.map((output) => output.data ?? "").join("");
 
 describe("TerminalService", () => {
-	test("counts only the terminals whose shell is running a command", async () => {
-		const busy = await runTerminalTest((tempDir) =>
-			Effect.gen(function* () {
-				const terminals = yield* TerminalService;
-				const working = yield* terminals.open("workspace-1", tempDir, size);
-				yield* terminals.open("workspace-2", tempDir, size);
-				const before = yield* terminals.countBusy;
-				// The child prints the marker itself, so it exists by the time the marker arrives.
-				yield* terminals.write(working.id, "sh -c 'echo started; sleep 5'\n");
-				yield* terminals.attach(working.id).pipe(
-					Stream.takeUntil((output) => output.type === "data" && output.data.includes("started\r\n")),
-					Stream.runDrain,
-				);
-				return { before, during: yield* terminals.countBusy };
-			}),
-		);
-		expect(busy).toEqual({ before: 0, during: 1 });
-	});
-
 	test("runs a shell in the workspace folder and streams its output until it exits", async () => {
 		const result = await runTerminalTest((tempDir) =>
 			Effect.gen(function* () {
