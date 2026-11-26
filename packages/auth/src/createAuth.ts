@@ -2,7 +2,6 @@ import { bearer, deviceAuthorization, organization } from "better-auth/plugins";
 import { leaveOrganizationHook, membershipHooks } from "./membershipHooks.ts";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter/relations-v2";
 import type { InvitationEmailInput } from "@repo/email/invitationEmail";
-import type { BunSQLDatabase } from "drizzle-orm/bun-sql/postgres";
 import type { MembershipEvent } from "./MembershipEvents.ts";
 import * as authSchema from "@repo/db-cloud/authSchema";
 import { type Auth, betterAuth } from "better-auth";
@@ -17,7 +16,7 @@ export const CLIENT_ADDRESS_HEADER = "x-octopus-client-address";
 
 export interface CreateAuthInput {
 	readonly config: typeof AuthConfig.Service;
-	readonly database: BunSQLDatabase<typeof authSchema.authRelations>;
+	readonly database: Parameters<typeof drizzleAdapter>[0];
 	readonly sendInvitation: (input: InvitationEmailInput) => Promise<void>;
 	readonly publishMembershipEvent: (event: MembershipEvent) => Promise<void>;
 }
