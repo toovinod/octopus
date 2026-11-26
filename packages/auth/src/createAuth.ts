@@ -11,6 +11,10 @@ import { Redacted } from "effect";
 
 export const DESKTOP_CLIENT_ID = "octopus-desktop";
 
+// The API sets this to the client's address on every request, replacing any value the client sent.
+// Better Auth reads only this header, so rate limits never trust a forwarded header directly.
+export const CLIENT_ADDRESS_HEADER = "x-octopus-client-address";
+
 export interface CreateAuthInput {
 	readonly config: typeof AuthConfig.Service;
 	readonly database: BunSQLDatabase<typeof authSchema.authRelations>;
@@ -46,7 +50,7 @@ export const createAuth = ({
 		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
 		rateLimit: { enabled: true },
 		advanced: {
-			ipAddress: { ipAddressHeaders: [config.ipAddressHeader] },
+			ipAddress: { ipAddressHeaders: [CLIENT_ADDRESS_HEADER] },
 			// The web app is a static site on its own origin that calls the API with credentials.
 			defaultCookieAttributes: { sameSite: "none", secure: true },
 		},

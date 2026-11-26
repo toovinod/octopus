@@ -18,7 +18,6 @@ export const auth = createAuth({
 		webOrigin: "http://localhost",
 		secret: placeholder,
 		databaseUrl: placeholder,
-		ipAddressHeader: "x-forwarded-for",
 		github: oauthClient,
 		google: oauthClient,
 	},
