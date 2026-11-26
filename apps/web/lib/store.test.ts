@@ -1,10 +1,18 @@
-import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { AgentSession } from "@repo/contracts/AgentSession";
 import { errorMessage, errorTag } from "./errorMessage.ts";
 import { draftOf, keepDraft } from "./drafts.ts";
 import type { Follow } from "./daemonRuntime.ts";
 import { toast as sonnerToast } from "sonner";
 import { Predicate } from "effect";
+
+// Math.random is shared by every test file in the run, so a test that pins it puts it back afterwards.
+let restoreRandom = () => {};
+const pinRandom = () => {
+	const random = spyOn(Math, "random").mockReturnValue(0);
+	restoreRandom = () => random.mockRestore();
+};
+afterEach(() => restoreRandom());
 
 const project = { id: "p", name: "app", path: "/app", defaultBranch: "main", trusted: false };
 const workspace = { id: "w", projectId: "p", status: "active", kind: "worktree", name: "fix", path: "/app-fix" };
@@ -175,7 +183,7 @@ describe("reconnecting", () => {
 	});
 
 	beforeEach(async () => {
-		spyOn(Math, "random").mockReturnValue(0);
+		pinRandom();
 		listCalls = 0;
 		await boot();
 		expect(getState().connection.status).toBe("ready");
@@ -310,7 +318,7 @@ const subscriptions = () => follows.filter((follow) => follow.name === "subscrib
 
 describe("following the open chat", () => {
 	test("a dropped chat stream retries with a growing delay", async () => {
-		spyOn(Math, "random").mockReturnValue(0);
+		pinRandom();
 		await boot();
 		await sleep(0);
 		const before = subscriptions().length;
@@ -413,7 +421,7 @@ describe("queued messages", () => {
 
 describe("reconnecting after deletions", () => {
 	test("drops chats the daemon no longer lists, and their selection", async () => {
-		spyOn(Math, "random").mockReturnValue(0);
+		pinRandom();
 		await boot();
 		expect(getState().selectedSessionId).toBe("s");
 		sessionLists.push([]);
