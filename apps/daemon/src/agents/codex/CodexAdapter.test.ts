@@ -178,6 +178,45 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
+	test("a turn status this version does not know ends the turn as failed", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("new status"));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(Effect.timeout("3 seconds")),
+		);
+		expect(events.at(-1)).toEqual({
+			type: "turn.completed",
+			turnId: "turn-1",
+			result: { status: "failed", message: "Codex ended the turn with a status Octopus does not know: paused." },
+		});
+	});
+
+	test("a reply whose text moved into content parts still completes the message", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("new reply"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "message.completed")).toEqual({
+			type: "message.completed",
+			itemId: "msg-1",
+			text: "Hello",
+		});
+	});
+
+	test("a reply with no text Octopus can find shows an error instead of vanishing", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("new reply, unreadable"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
 	test("stops paging models when Codex repeats a cursor", async () => {
 		const { models } = await runWithCodex(
 			Effect.flatMap(CodexAdapter, (codex) => codex.listModels),

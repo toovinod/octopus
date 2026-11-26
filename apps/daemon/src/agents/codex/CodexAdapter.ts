@@ -328,11 +328,24 @@ const handleNotification = Effect.fnUntraced(function* (
 			if (item.type === "plan" && "text" in item) {
 				return yield* Ref.set(plans.turnPlan, Option.some({ id: item.id, text: item.text }));
 			}
-			if (item.type === "agentMessage" && "text" in item) {
+			if (item.type === "agentMessage") {
+				const text =
+					"text" in item ? item.text : "content" in item ? item.content.map((part) => part.text).join("") : null;
+				if (text !== null) {
+					return yield* session.emit({
+						type: "message.completed",
+						itemId: item.id,
+						text,
+					});
+				}
+				yield* Effect.logWarning("Codex sent a reply with no text Octopus could find").pipe(
+					Effect.annotateLogs({ itemId: item.id }),
+				);
 				return yield* session.emit({
-					type: "message.completed",
-					itemId: item.id,
-					text: item.text,
+					type: "error",
+					message:
+						"Codex sent a reply Octopus could not read, so it is missing here. Update Octopus if this keeps happening.",
+					willRetry: false,
 				});
 			}
 			if (item.type === "reasoning" && "summary" in item) {
@@ -361,18 +374,26 @@ const handleNotification = Effect.fnUntraced(function* (
 			if (turn.status === "failed" && turn.error !== null && isAuthFailure(turn.error)) {
 				return yield* new AgentAuthError({ agent: "codex", cause: turn.error });
 			}
+			const known = turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed";
+			if (!known) {
+				yield* Effect.logWarning("Codex ended a turn with an unknown status").pipe(
+					Effect.annotateLogs({ status: turn.status }),
+				);
+			}
 			yield* session.emit({
 				type: "turn.completed",
 				turnId: turn.id,
 				result:
-					turn.status === "interrupted"
-						? { status: "interrupted" }
-						: turn.status === "failed"
-							? {
+					turn.status === "completed"
+						? { status: "completed" }
+						: turn.status === "interrupted"
+							? { status: "interrupted" }
+							: {
 									status: "failed",
-									message: turn.error?.message ?? "The turn failed.",
-								}
-							: { status: "completed" },
+									message: known
+										? (turn.error?.message ?? "The turn failed.")
+										: `Codex ended the turn with a status Octopus does not know: ${turn.status}.`,
+								},
 			});
 			// A stopped or failed turn offers no plan, as in Codex's own prompt.
 			if (turn.status !== "completed" || Option.isNone(plan)) return;

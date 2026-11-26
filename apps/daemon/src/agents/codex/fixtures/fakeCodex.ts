@@ -255,6 +255,13 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	// What a newer Codex might send: a turn status this version lacks, and a reply whose fields changed.
+	if (text.includes("new status")) return completeTurn("paused");
+	if (text.includes("new reply")) {
+		const content = text.includes("unreadable") ? { parts: 2 } : { content: [{ type: "text", text: "Hello" }] };
+		notify("item/completed", { item: { type: "agentMessage", id: "msg-1", ...content }, threadId, turnId });
+		return completeTurn("completed");
+	}
 	if (text.includes("withdraw")) {
 		// Codex can take back a request it no longer needs, as when its auto-reviewer decides first.
 		const request = text.includes("question")

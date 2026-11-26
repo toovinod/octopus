@@ -110,6 +110,12 @@ export const ThreadItem = Schema.Union([
 		id: Schema.String,
 		text: Schema.String,
 	}),
+	// A newer Codex may move the reply's text into parts, and the reply must still reach the chat.
+	Schema.Struct({
+		type: Schema.Literal("agentMessage"),
+		id: Schema.String,
+		content: Schema.Array(Schema.Struct({ text: Schema.String })),
+	}),
 	Schema.Struct({ type: Schema.String, id: Schema.String }),
 ]);
 export type ThreadItem = typeof ThreadItem.Type;
@@ -119,7 +125,8 @@ export const ItemNotification = Schema.Struct({ item: ThreadItem });
 export const TurnCompleted = Schema.Struct({
 	turn: Schema.Struct({
 		id: Schema.String,
-		status: Schema.Literals(["completed", "interrupted", "failed", "inProgress"]),
+		// Any string, so a status a newer Codex adds still ends the turn instead of leaving it running.
+		status: Schema.String,
 		error: Schema.NullOr(
 			Schema.Struct({
 				message: Schema.String,
