@@ -61,6 +61,7 @@ import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 
 // Octopus runs the user's own `claude`, found on PATH unless this names another one. Inside a
@@ -306,6 +307,8 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	// Tool calls shown as a plan or question card instead.
 	const cardTools = new Set<string>();
 	const interrupting = yield* Ref.make(false);
+	// The uuid of the last message Octopus sent claude.
+	const lastSent = yield* Ref.make("");
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
@@ -434,6 +437,11 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 						contextWindow: message.modelUsage?.[usage.value.model]?.contextWindow ?? null,
 					});
 				}
+				// claude may run a steer as a turn of its own, whose result follows the running turn's. The turn Octopus
+				// started ends only with the result for the last message it sent, so no result ends a later turn.
+				if (message.user_message_uuid !== undefined && message.user_message_uuid !== (yield* Ref.get(lastSent))) {
+					return yield* Effect.logDebug("Claude ended a turn a later message continues");
+				}
 				const interrupted = yield* Ref.getAndSet(interrupting, false);
 				return yield* session.emit({
 					type: "turn.completed",
@@ -465,7 +473,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 		}
 	});
 
-	return { handle, interrupting };
+	return { handle, interrupting, lastSent };
 });
 
 // claude runs its own claude.ai sign-in on a terminal. Octopus shows its link and passes it a
@@ -598,7 +606,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				}
 				const session = yield* makeAgentSession(capabilities);
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
-				const { handle, interrupting } = yield* makeMessageHandler(session);
+				const { handle, interrupting, lastSent } = yield* makeMessageHandler(session);
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
 				const sessionScope = yield* Effect.scope;
@@ -816,8 +824,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					});
 
 				const sendMessage = ({ text, images }: UserMessage) =>
-					Effect.asVoid(
-						Queue.offer(prompts, {
+					Effect.gen(function* () {
+						const uuid = randomUUID();
+						yield* Ref.set(lastSent, uuid);
+						yield* Queue.offer(prompts, {
+							uuid,
 							type: "user",
 							message: {
 								role: "user",
@@ -833,8 +844,8 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 											],
 							},
 							parent_tool_use_id: null,
-						}),
-					);
+						});
+					});
 
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.

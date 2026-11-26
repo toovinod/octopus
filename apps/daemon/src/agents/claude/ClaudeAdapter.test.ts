@@ -62,7 +62,8 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 					};
 					throw new Error(`Claude Code returned an error result: ${missingSession}`);
 				}
-				for await (const user of prompt) {
+				const input = prompt[Symbol.asyncIterator]();
+				for await (const user of { [Symbol.asyncIterator]: () => input }) {
 					prompts.push(user);
 					turn++;
 					const text = typeof user.message.content === "string" ? user.message.content : "";
@@ -72,6 +73,26 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							subtype: "init",
 							session_id: options.resume ?? "claude-new",
 						};
+					}
+					if (text.includes("steer me")) {
+						// Recorded from claude 2.1.332: a message sent while a turn streams, or just after its last
+						// assistant message, runs as its own turn with its own result after the running one's.
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s1", content: [{ type: "text", text: "1, 2, 3" }] },
+						};
+						const steer = await input.next();
+						if (steer.done) return;
+						prompts.push(steer.value);
+						yield { type: "result", subtype: "success", uuid: "result-s1", user_message_uuid: user.uuid };
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s2", content: [{ type: "text", text: "1, 2, 3, DONE" }] },
+						};
+						yield { type: "result", subtype: "success", uuid: "result-s2", user_message_uuid: steer.value.uuid };
+						continue;
 					}
 					if (text.includes("think")) {
 						// Recorded from claude 2.1.331 with summarized thinking: the thinking block and the
@@ -883,6 +904,26 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(startedWith.at(-1)).toMatchObject({ model: "claude-haiku-5-5", effort: "low", permissionMode: "default" });
 		expect(startedWith.at(-1)?.resume).toBeUndefined();
+	});
+
+	test("a steer that claude runs as its own turn ends with the turn it was sent into", async () => {
+		const [steered, events, next] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer me"));
+				yield* takeUntil(handle, "message.completed");
+				const steered = yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				const events = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				return [steered, events, yield* takeUntil(handle, "turn.completed")] as const;
+			}),
+		);
+		expect(steered).toBe("steered");
+		expect(events.filter((event) => event.type === "message.completed").map((event) => event.text)).toEqual([
+			"1, 2, 3, DONE",
+		]);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", turnId: "result-s2" });
+		// The next message's turn ends with its own result, not the steer's.
+		expect(next.filter((event) => event.type === "message.completed").map((event) => event.text)).toEqual(["Hi"]);
 	});
 
 	test("loads only user settings and the default mode for an untrusted project", async () => {
