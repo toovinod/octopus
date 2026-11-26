@@ -272,4 +272,26 @@ describe("LocalDatabase", () => {
 			{ id: "a2", sessionId: "s1", mediaType: "image/jpeg" },
 		]);
 	});
+
+	test("refreshes the planner's statistics on open, since the daemon is often killed before it shuts down", async () => {
+		const analyzed = await run((dataDir) =>
+			Effect.gen(function* () {
+				yield* onFile(
+					dataDir,
+					Effect.gen(function* () {
+						yield* runMigrations(embeddedMigrations());
+						const client = yield* SqliteClient.SqliteClient;
+						yield* client`WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 2000) INSERT INTO project (id, name, path, defaultBranch, createdAt) SELECT 'p' || value, 'repo', '/repo/' || value, 'main', '' FROM n`;
+					}),
+				);
+				return yield* withDatabase(
+					LocalDatabase.use((database) =>
+						database.query((db) => db.all<{ tbl: string }>(sql`SELECT tbl FROM sqlite_stat1 WHERE tbl = 'project'`)),
+					),
+					dataDir,
+				);
+			}),
+		);
+		expect(analyzed.length).toBeGreaterThan(0);
+	});
 });

@@ -112,6 +112,9 @@ export class LocalDatabase extends Context.Service<
 			// without an fsync per write. Some SQLite builds already default to it, so it is set for all of them.
 			yield* client`PRAGMA synchronous = NORMAL`;
 			yield* runMigrations(embeddedMigrations());
+			// The daemon is often killed rather than shut down, so the shutdown optimize below may never run. This
+			// form is SQLite's advice for a connection that stays open: it analyzes only what needs it, with a limit.
+			yield* client`PRAGMA optimize=0x10002`;
 			yield* restrictDatabaseFiles;
 			// Runs after every layer that writes has closed and before the connection closes, so the
 			// WAL is folded into the database file and truncated.
