@@ -1250,6 +1250,54 @@ describe("SessionService", () => {
 		);
 	});
 
+	test("a session created while its workspace is being archived is refused and never stored", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const stopping = yield* Deferred.make<void>();
+				const release = yield* Deferred.make<void>();
+				const replay = makeReplayAdapter(commandWithApproval);
+				// An agent that takes its time to stop, so the archive is under way while the create arrives.
+				const codex: AgentAdapter = {
+					...replay,
+					startSession: (input) =>
+						replay.startSession(input).pipe(
+							Effect.map((handle) => ({
+								...handle,
+								interrupt: Deferred.succeed(stopping, undefined).pipe(
+									Effect.andThen(Deferred.await(release)),
+									Effect.andThen(handle.interrupt),
+								),
+							})),
+						),
+				};
+				return yield* withServices(
+					join(tempDir, "data"),
+					testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+				)(
+					Effect.gen(function* () {
+						const sessions = yield* SessionService;
+						const workspaces = yield* WorkspaceService;
+						const busy = yield* addSession(tempDir);
+						yield* sessions.sendMessage(busy.id, "run the tests", [], false);
+						yield* waitForStatus(busy.id, "awaitingApproval");
+						const archiving = yield* workspaces.archive(busy.workspaceId, { force: false }).pipe(Effect.forkChild);
+						yield* Deferred.await(stopping);
+						const creating = yield* sessions
+							.create({ workspaceId: busy.workspaceId, agent: "codex", model: "replay", effort: null })
+							.pipe(Effect.flip, Effect.forkChild);
+						// Give the create every chance to run its check and insert before the archive ends.
+						yield* Effect.sleep("100 millis");
+						yield* Deferred.succeed(release, undefined);
+						yield* Fiber.join(archiving);
+						return { error: yield* Fiber.join(creating), sessions: yield* sessions.list(busy.workspaceId) };
+					}),
+				);
+			}),
+		);
+		expect(result.error._tag).toBe("WorkspaceNotFoundError");
+		expect(result.sessions.length).toBe(1);
+	});
+
 	test("archiving a workspace stops its agent processes", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
