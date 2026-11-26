@@ -381,25 +381,32 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							),
 						),
 				);
-				for (const run of unfinished) {
-					yield* FiberMap.remove(runningScripts, run.id);
-					yield* applyScriptRunEvent(run.id, { _tag: "Cancelled", reason }).pipe(
-						// The script finished on its own between the query and the interrupt.
-						Effect.catchTag("IllegalJobTransitionError", (error) =>
-							Effect.logDebug("Script run ended before it was cancelled", error),
+				// At once: a script that ignores its stop signal takes the whole stop grace.
+				yield* Effect.forEach(
+					unfinished,
+					(run) =>
+						FiberMap.remove(runningScripts, run.id).pipe(
+							Effect.andThen(applyScriptRunEvent(run.id, { _tag: "Cancelled", reason })),
+							// The script finished on its own between the query and the interrupt.
+							Effect.catchTag("IllegalJobTransitionError", (error) =>
+								Effect.logDebug("Script run ended before it was cancelled", error),
+							),
 						),
-					);
-				}
+					{ concurrency: "unbounded", discard: true },
+				);
 			}, Effect.provide(services));
 
 			// Agents, terminals and scripts all run in the workspace folder, so they stop before it can be
 			// removed. Only once archiving goes ahead: a refused archive leaves them running.
 			const stopWorkspaceProcesses = (workspaceId: string) =>
-				Effect.gen(function* () {
-					yield* sessions.stopWorkspace(workspaceId);
-					yield* terminals.closeWorkspace(workspaceId);
-					yield* cancelScripts(workspaceId, "The workspace was archived.");
-				});
+				Effect.all(
+					[
+						sessions.stopWorkspace(workspaceId),
+						terminals.closeWorkspace(workspaceId),
+						cancelScripts(workspaceId, "The workspace was archived."),
+					],
+					{ concurrency: "unbounded", discard: true },
+				);
 
 			const archive = Effect.fn("WorkspaceService.archive")(
 				function* (workspaceId: string, options: { readonly force: boolean }) {

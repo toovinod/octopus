@@ -8,6 +8,7 @@ import { TerminalService } from "../terminals/TerminalService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
+import { STOP_GRACE } from "../processes/stopProcessGroup.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { scriptRun, workspace } from "../database/schema.ts";
 import { LINE_MAX_LENGTH } from "./capLineLength.ts";
@@ -782,6 +783,27 @@ describe("WorkspaceService", () => {
 		);
 		expect(results.map((archived) => archived.status)).toEqual(["archived", "archived", "archived", "archived"]);
 	});
+
+	test("archiving stops the workspace's scripts at once, not one after another", async () => {
+		const took = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				// Scripts that ignore SIGTERM, so each needs the whole stop grace and then SIGKILL.
+				const stubborn = "trap '' TERM; echo ready; while true; do sleep 0.1; done";
+				yield* projects.updateScripts(project.id, { setupScript: stubborn, runScript: stubborn });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const runs = [yield* workspaces.startSetupScriptRun(created.id), yield* workspaces.startRunScript(created.id)];
+				for (const run of runs) {
+					yield* workspaces.followScriptRunOutput(run.id).pipe(Stream.take(1), Stream.runDrain);
+				}
+				const [elapsed] = yield* Effect.timed(workspaces.archive(created.id, { force: false }));
+				return Duration.toMillis(elapsed);
+			}),
+		);
+		expect(took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
+	}, 20_000);
 
 	test("runs the run script, streams its output, and stops it", async () => {
 		const result = await runServiceTest((tempDir) =>

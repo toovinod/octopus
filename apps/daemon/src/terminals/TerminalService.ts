@@ -149,8 +149,9 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 
 		const close = (terminalId: string) => FiberMap.remove(fibers, terminalId);
 
+		// At once: a shell that ignores its stop signal takes the whole stop grace.
 		const closeWorkspace = (workspaceId: string) =>
-			Effect.forEach(list(workspaceId), (info) => close(info.id), { discard: true });
+			Effect.forEach(list(workspaceId), (info) => close(info.id), { concurrency: "unbounded", discard: true });
 
 		return { open, list, attach, write, resize, close, closeWorkspace };
 	}),
