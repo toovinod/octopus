@@ -17,8 +17,11 @@ export const followTerminal = (
 	screen: TerminalScreen,
 ): (() => void) => {
 	let replayed = false;
+	// Retries run every second while the daemon is away, so the screen says it once until output flows again.
+	let reconnecting = false;
 	return followReattaching(attach, {
 		onItem: (output) => {
+			reconnecting = false;
 			if (output.type === "exit") {
 				screen.write(note(`The shell exited${output.exitCode === null ? "" : ` with code ${output.exitCode}`}`));
 				return;
@@ -29,7 +32,11 @@ export const followTerminal = (
 			}
 			screen.write(output.data);
 		},
-		onDrop: () => screen.write(note("Disconnected. Reconnecting")),
+		onDrop: () => {
+			if (reconnecting) return;
+			reconnecting = true;
+			screen.write(note("Disconnected. Reconnecting"));
+		},
 		// The shell exited while we were away, or the daemon restarted without it, or the attach cannot work.
 		onEnd: (error) => {
 			if (error !== null) screen.write(note(errorMessage(error)));

@@ -50,6 +50,22 @@ describe("followTerminal", () => {
 		expect(view.text()).toBe("$ ls\r\nREADME.md\r\n");
 	});
 
+	test("says it is reconnecting once per outage, not on every retry", () => {
+		const daemon = fakeDaemon();
+		const view = fakeScreen();
+		followTerminal(daemon.attach, view.screen);
+		const drop = { _tag: "RpcClientError", message: "SocketCloseError: closed" };
+		daemon.attaches[0]?.onEnd?.(drop);
+		jest.advanceTimersByTime(1000);
+		daemon.attaches[1]?.onEnd?.(drop);
+		jest.advanceTimersByTime(1000);
+		expect(view.text().match(/Reconnecting/g)).toHaveLength(1);
+		daemon.attaches[2]?.onItem({ type: "data", data: "$ " });
+		daemon.attaches[2]?.onEnd?.(drop);
+		expect(view.text().match(/Reconnecting/g)).toHaveLength(1);
+		expect(view.text()).toBe("$ \r\n\x1b[2m[Disconnected. Reconnecting]\x1b[0m\r\n");
+	});
+
 	test("says the shell exited and does not reattach", () => {
 		const daemon = fakeDaemon();
 		const view = fakeScreen();
