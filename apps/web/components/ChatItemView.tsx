@@ -38,6 +38,7 @@ import { Input } from "@repo/ui/components/input";
 import { modeLabels } from "../lib/agentModes.ts";
 import type { ChatItem } from "../lib/chatReducer.ts";
 import { callDaemon } from "../lib/daemonRuntime.ts";
+import { logWarning } from "../lib/logWarning.ts";
 import { memo, useEffect, useRef, useState } from "react";
 import { ExternalLink } from "./ExternalLink.tsx";
 import { Predicate } from "effect";
@@ -176,7 +177,7 @@ const CodeBlock = ({ code, language }: { readonly code: string; readonly languag
 					if (live) setHtml(highlighted);
 				},
 				// Plain code is the fallback, and it is already on screen.
-				() => undefined,
+				(error: unknown) => logWarning("Code highlighting failed, showing plain code", error),
 			);
 		return () => {
 			live = false;
