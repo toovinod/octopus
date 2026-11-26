@@ -38,6 +38,8 @@ const startedWith: Array<Options> = [];
 const settingsChanges: Array<unknown> = [];
 const prompts: Array<SDKUserMessage> = [];
 
+const settingsChanged = Promise.withResolvers<void>();
+
 const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 	ClaudeQuery.of({
 		start: ({ prompt, options }) => {
@@ -48,7 +50,9 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			// any message, then exits.
 			const missingSession = `No conversation found with session ID: ${options.resume}`;
 			async function* messages() {
-				if (options.resume === "claude-gone") {
+				if (options.resume === "claude-gone" || options.resume === "claude-gone-later") {
+					// Holds its answer until the chat's settings change, so the change lands on this run.
+					if (options.resume === "claude-gone-later") await settingsChanged.promise;
 					yield {
 						type: "result",
 						subtype: "error_during_execution",
@@ -345,7 +349,7 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			return {
 				messages: messages(),
 				initializationResult: async () => {
-					if (options.resume === "claude-gone")
+					if (options.resume?.startsWith("claude-gone"))
 						throw new Error(`Claude Code returned an error result: ${missingSession}`);
 				},
 				interrupt: async () => resolveInterrupt(),
@@ -355,6 +359,7 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 					// Like a claude that refuses to bypass permissions.
 					if (permissionMode === "bypassPermissions") throw new Error("refused");
 					settingsChanges.push({ permissionMode });
+					settingsChanged.resolve();
 				},
 				supportedCommands: async () => [
 					{ name: "review", description: "Review the branch", argumentHint: "" },
@@ -864,6 +869,20 @@ describe("ClaudeAdapter", () => {
 		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
 		expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	test("the new session that replaces a lost one starts on the chat's current settings, not its first ones", async () => {
+		await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.updateSettings({ model: "claude-haiku-5-5", effort: "low", mode: "ask" });
+					yield* handle.sendMessage(userMessage("hi"));
+					yield* takeUntil(handle, "turn.completed");
+				}),
+			{ input: { ...newSession, mode: "fullAccess", trustProjectSettings: true, resumeId: "claude-gone-later" } },
+		);
+		expect(startedWith.at(-1)).toMatchObject({ model: "claude-haiku-5-5", effort: "low", permissionMode: "default" });
+		expect(startedWith.at(-1)?.resume).toBeUndefined();
 	});
 
 	test("loads only user settings and the default mode for an untrusted project", async () => {

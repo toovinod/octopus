@@ -694,18 +694,14 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 
 				const options: Options = {
 					cwd: input.cwd,
-					model: input.model,
 					includePartialMessages: true,
 					// Claude Code omits thinking text unless asked, and Octopus shows it.
 					thinking: { type: "adaptive", display: "summarized" },
 					canUseTool,
-					// Always set, so a settings file can never pick bypassPermissions on its own.
-					permissionMode: permissionModes[input.mode],
 					// Without it Claude refuses to switch a running session to bypassPermissions, as Full access
 					// and approving a plan in Full access do. Only a trusted project may offer that mode.
 					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
-					...Option.match(decodeEffort(input.effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
 						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
@@ -721,18 +717,30 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					},
 				};
 
+				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
+				// A run that replaces one that could not resume starts on them, not on the settings the chat opened with.
+				const settings = yield* Ref.make({ model: input.model, effort: input.effort, mode: input.mode });
+
 				// Each run has its own scope, so a claude that could not resume is stopped before the next one starts.
 				const startRun = Effect.fnUntraced(function* (resume: string | undefined) {
 					const scope = yield* Scope.fork(sessionScope);
 					// claude gets no message before it has started, so one that cannot start leaves them queued for the next.
 					const started = yield* Deferred.make<void>();
+					const { model, effort, mode } = yield* Ref.get(settings);
 					const run = yield* Effect.acquireRelease(
 						Effect.sync(() =>
 							claudeQuery.start({
 								prompt: Stream.toAsyncIterable(
 									Stream.fromEffectDrain(Deferred.await(started)).pipe(Stream.concat(Stream.fromQueue(prompts))),
 								),
-								options: resume === undefined ? options : { ...options, resume },
+								options: {
+									...options,
+									model,
+									// Always set, so a settings file can never pick bypassPermissions on its own.
+									permissionMode: permissionModes[mode],
+									...Option.match(decodeEffort(effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
+									...(resume === undefined ? {} : { resume }),
+								},
 							}),
 						),
 						(run) =>
@@ -796,8 +804,6 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					yield* readMessages(run);
 				}).pipe(Effect.andThen(session.end), Effect.catch(session.fail), Effect.forkScoped);
 
-				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
-				const modelAndEffort = yield* Ref.make({ model: input.model, effort: input.effort });
 				const settingsError = (cause: unknown) =>
 					new AgentProcessError({ message: "Could not change the chat's settings.", cause });
 				const setModelAndEffort = ({ model, effort }: { readonly model: string; readonly effort: string | null }) =>
@@ -836,7 +842,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					steerTurn: (message) => Effect.as(sendMessage(message), true),
 					updateSettings: (next) =>
 						Effect.gen(function* () {
-							const previous = yield* Ref.get(modelAndEffort);
+							const previous = yield* Ref.get(settings);
 							yield* setModelAndEffort(next).pipe(
 								Effect.andThen(
 									Effect.tryPromise({
@@ -853,7 +859,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 									),
 								),
 							);
-							yield* Ref.set(modelAndEffort, { model: next.model, effort: next.effort });
+							yield* Ref.set(settings, { model: next.model, effort: next.effort, mode: next.mode });
 						}),
 					listCommands: Effect.tryPromise({
 						try: () => run.supportedCommands(),
