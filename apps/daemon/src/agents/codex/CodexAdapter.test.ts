@@ -311,6 +311,26 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test.each([
+		["approval", "withdraw", { type: "approval.resolved", requestId: "", outcome: "cancelled" }],
+		["question", "withdraw question", { type: "question.resolved", requestId: "", outcome: { type: "cancelled" } }],
+	] satisfies ReadonlyArray<[string, string, AgentEvent]>)(
+		"a %s Codex withdraws is resolved as cancelled and never answered",
+		async (_kind, text, resolved) => {
+			const events = await runSession((handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage(text));
+					return yield* takeUntil(handle, "turn.completed");
+				}),
+			);
+			expect(events.find((event) => event.type === resolved.type)).toEqual({
+				...resolved,
+				requestId: expect.stringMatching(/:500$/),
+			});
+			expect(events.find((event) => event.type === "message.completed")).toMatchObject({ text: "answered false" });
+		},
+	);
+
 	test("an interrupt sent before Codex names the turn stops it once the name arrives", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {

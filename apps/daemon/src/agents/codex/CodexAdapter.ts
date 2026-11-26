@@ -19,6 +19,7 @@ import {
 	TurnCompleted,
 	TurnResponse,
 	SkillsResponse,
+	ServerRequestResolved,
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
@@ -35,6 +36,7 @@ import {
 import {
 	type CodexIncoming,
 	type CodexRpcClient,
+	type RequestId as CodexRequestId,
 	INVALID_PARAMS,
 	METHOD_NOT_FOUND,
 	makeCodexRpcClient,
@@ -251,14 +253,32 @@ interface PlanTracking {
 	readonly choices: ReadonlyArray<AgentMode>;
 }
 
+// The server requests still waiting for Octopus's answer, by their Octopus request id.
+interface OpenRequests {
+	readonly processId: string;
+	readonly ids: Set<string>;
+}
+
+const toRequestId = (requests: OpenRequests, id: CodexRequestId) => `${requests.processId}:${id}`;
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
 	currentTurn: Ref.Ref<TurnState>,
 	plans: PlanTracking,
+	requests: OpenRequests,
 	method: string,
 	params: unknown,
 ) {
 	switch (method) {
+		// A request Codex withdrew, as when it timed out or its auto-reviewer decided first, ends in Octopus
+		// too. The answer that cancelling it would send is dropped, since Codex no longer waits for one.
+		case "serverRequest/resolved": {
+			const requestId = toRequestId(requests, (yield* decodeCodex(ServerRequestResolved)(params)).requestId);
+			if (!requests.ids.delete(requestId)) return;
+			yield* Effect.logInfo("Codex withdrew a request").pipe(Effect.annotateLogs({ requestId }));
+			yield* session.cancelApproval(requestId);
+			return yield* session.cancelQuestions(requestId);
+		}
 		case "item/agentMessage/delta": {
 			const { itemId, delta } = yield* decodeCodex(AgentMessageDelta)(params);
 			return yield* session.emit({
@@ -393,11 +413,15 @@ const handleNotification = Effect.fnUntraced(function* (
 const handleServerRequest = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
-	processId: string,
+	requests: OpenRequests,
 	request: Extract<CodexIncoming, { _tag: "request" }>,
 ) {
-	const respond = (outcome: ApprovalOutcome) => client.respond(request.id, { decision: codexDecisions[outcome] });
-	const requestId = `${processId}:${request.id}`;
+	const requestId = toRequestId(requests, request.id);
+	requests.ids.add(requestId);
+	// Answers only a request Codex still waits on.
+	const answer = (result: unknown) =>
+		Effect.suspend(() => (requests.ids.delete(requestId) ? client.respond(request.id, result) : Effect.void));
+	const respond = (outcome: ApprovalOutcome) => answer({ decision: codexDecisions[outcome] });
 	switch (request.method) {
 		case "item/commandExecution/requestApproval": {
 			const params = yield* decodeCodex(CommandApprovalParams)(request.params);
@@ -446,7 +470,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 				},
 				// Unanswered questions get empty answers, so Codex goes on without them.
 				(outcome) =>
-					client.respond(request.id, {
+					answer({
 						answers: Object.fromEntries(
 							Object.entries(outcome.type === "answered" ? outcome.answers : {}).map(([id, answers]) => [
 								id,
@@ -458,6 +482,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 		}
 		default:
 			// Never leave Codex waiting on a request we cannot answer.
+			requests.ids.delete(requestId);
 			yield* client.respondError(request.id, METHOD_NOT_FOUND, `Octopus does not support ${request.method}`);
 			return yield* session.emit({
 				type: "error",
@@ -472,6 +497,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 const skipUnreadable = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
+	requests: OpenRequests,
 	message: CodexIncoming,
 	error: AgentProtocolError,
 ) {
@@ -479,6 +505,7 @@ const skipUnreadable = Effect.fnUntraced(function* (
 		Effect.annotateLogs({ method: message.method }),
 	);
 	if (message._tag === "request") {
+		requests.ids.delete(toRequestId(requests, message.id));
 		yield* client.respondError(message.id, INVALID_PARAMS, `Octopus could not read ${message.method}`);
 	}
 	yield* session.emit({
@@ -628,7 +655,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
-				const processId = yield* makeUniqueId;
+				const requests: OpenRequests = { processId: yield* makeUniqueId, ids: new Set() };
 				const currentTurn = yield* Ref.make(idle);
 				const plans: PlanTracking = {
 					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
@@ -653,10 +680,12 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						session.touch.pipe(
 							Effect.andThen(
 								message._tag === "notification"
-									? handleNotification(session, currentTurn, plans, message.method, message.params)
-									: handleServerRequest(session, client, processId, message),
+									? handleNotification(session, currentTurn, plans, requests, message.method, message.params)
+									: handleServerRequest(session, client, requests, message),
 							),
-							Effect.catchTag("AgentProtocolError", (error) => skipUnreadable(session, client, message, error)),
+							Effect.catchTag("AgentProtocolError", (error) =>
+								skipUnreadable(session, client, requests, message, error),
+							),
 						),
 					),
 					Effect.andThen(session.end),

@@ -158,6 +158,11 @@ export const ErrorNotification = Schema.Struct({
 	willRetry: Schema.Boolean,
 });
 
+// Codex sends it once a server request no longer needs an answer, also when it withdrew the request itself.
+export const ServerRequestResolved = Schema.Struct({
+	requestId: Schema.Union([Schema.String, Schema.Number]),
+});
+
 const optionalText = Schema.optionalKey(Schema.NullOr(Schema.String));
 
 export const CommandApprovalParams = Schema.Struct({

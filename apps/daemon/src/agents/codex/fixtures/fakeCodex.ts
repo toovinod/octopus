@@ -244,6 +244,38 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("withdraw")) {
+		// Codex can take back a request it no longer needs, as when its auto-reviewer decides first.
+		const request = text.includes("question")
+			? {
+					method: "item/tool/requestUserInput",
+					params: {
+						threadId,
+						turnId,
+						itemId: "input-1",
+						questions: [
+							{ id: "db", header: "Database", question: "Which?", isOther: true, isSecret: false, options: null },
+						],
+					},
+				}
+			: {
+					method: "item/commandExecution/requestApproval",
+					params: { threadId, turnId, itemId: "cmd-1", command: "bun test" },
+				};
+		let answered = false;
+		void ask(500, request.method, request.params).then(() => {
+			answered = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		notify("serverRequest/resolved", { threadId, requestId: 500 });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: `answered ${answered}` },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("ask me")) {
 		const answer = await ask(300, "item/tool/requestUserInput", {
 			threadId,
