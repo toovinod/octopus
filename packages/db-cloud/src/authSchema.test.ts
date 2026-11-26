@@ -108,4 +108,22 @@ describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 		);
 		expect(indexes).toHaveLength(1);
 	});
+
+	test("auth timestamps, which have no time zone, read back the instant written whatever the server's zone", async () => {
+		const expiresAt = new Date("2026-03-01T12:00:00.000Z");
+		const rows = await inMigratedDatabase(
+			Effect.gen(function* () {
+				const sql = yield* PgClient.PgClient;
+				yield* insertOrgAndUser;
+				yield* sql`insert into session (id, token, user_id, expires_at, created_at, updated_at)
+					values ('session_1', 'token', 'user_1', ${expiresAt}, now(), now())`;
+				return yield* sql<{
+					expiresAt: Date;
+					expired: boolean;
+				}>`select expires_at as "expiresAt", expires_at < now() as expired
+					from session where id = 'session_1'`;
+			}),
+		);
+		expect(rows).toEqual([{ expiresAt, expired: true }]);
+	});
 });
