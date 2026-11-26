@@ -48,13 +48,15 @@ import { readWorkspaceFile } from "../files/readWorkspaceFile.ts";
 import { holdsForkCode } from "../workspaces/forkBranch.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { leavesRoot } from "../files/leavesRoot.ts";
+import { runGit, runGitCapped } from "./runGit.ts";
 import { normalize } from "node:path";
-import { runGit } from "./runGit.ts";
 
 // The workspace diff sends at most this many changed lines per file and in total.
 // Anything past that is listed as too large and loaded one file at a time.
 export const DIFF_FILE_LINE_LIMIT = 2000;
 export const DIFF_TOTAL_LINE_LIMIT = 20_000;
+// The line limits leave a patch's size to how long its lines are, which in a minified or generated file is huge.
+export const PATCH_MAX_LENGTH = 32 * 1024 * 1024;
 // Loading one file on request still stops here, to keep the webview responsive.
 export const SINGLE_FILE_LINE_LIMIT = 50_000;
 const UNTRACKED_BYTE_LIMIT = 1024 * 1024;
@@ -254,21 +256,33 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const patch =
 				fitting.length === 0
 					? ""
-					: yield* runGit(cwd, [
-							"diff",
-							"-M",
-							"--no-color",
-							"--no-ext-diff",
-							mergeBase,
-							...pathspecs(
-								fitting.flatMap(({ changed }) =>
-									changed.oldPath === null ? [changed.path] : [changed.path, changed.oldPath],
+					: yield* runGitCapped(
+							cwd,
+							[
+								"diff",
+								"-M",
+								"--no-color",
+								"--no-ext-diff",
+								mergeBase,
+								...pathspecs(
+									fitting.flatMap(({ changed }) =>
+										changed.oldPath === null ? [changed.path] : [changed.path, changed.oldPath],
+									),
+								),
+							],
+							PATCH_MAX_LENGTH,
+						).pipe(
+							// No sections, so every fitting file shows as too large, with its line counts.
+							Effect.catchTag("GitOutputTooLargeError", (error) =>
+								Effect.logWarning("The patch passed the output cap, so its files show as too large", error).pipe(
+									Effect.annotateLogs({ workspaceId: current.id }),
+									Effect.as(""),
 								),
 							),
-						]);
+						);
 			const sections = parsePatch(patch);
 			const expected = fitting.length + fitting.filter(({ changed }) => changed.typeChanged).length;
-			if (sections.length !== expected) {
+			if (patch !== "" && sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
 				);

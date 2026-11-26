@@ -1,5 +1,5 @@
-import { STDOUT_MAX_LENGTH, runGit, STDERR_MAX_LENGTH } from "./runGit.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
+import { runGit, runGitCapped, STDERR_MAX_LENGTH } from "./runGit.ts";
 import { GitTimeoutSettings } from "./GitTimeoutSettings.ts";
 import { runInTempDir } from "../testing/runServiceTest.ts";
 import { Duration, Effect, FileSystem } from "effect";
@@ -86,14 +86,18 @@ describe("git output caps", () => {
 		expect(error._tag === "GitCommandError" && error.stderr.length).toBeLessThanOrEqual(STDERR_MAX_LENGTH);
 	});
 
-	test("fails a command whose stdout passes the cap, rather than return part of it", async () => {
-		const error = await runInTempDir((tempDir) =>
+	test("fails a capped command whose stdout passes the cap with an error of its own, and caps no other", async () => {
+		const result = await runInTempDir((tempDir) =>
 			Effect.gen(function* () {
 				const repo = yield* makeTestRepository(join(tempDir, "repo"));
-				yield* runGit(repo, ["config", "alias.flood", `!yes line | head -c ${STDOUT_MAX_LENGTH + 2}`]);
-				return yield* Effect.flip(runGit(repo, ["flood"]));
+				yield* runGit(repo, ["config", "alias.flood", "!yes line | head -c 4096"]);
+				return {
+					capped: yield* Effect.flip(runGitCapped(repo, ["flood"], 1024)),
+					whole: yield* runGit(repo, ["flood"]),
+				};
 			}),
 		);
-		expect(error).toMatchObject({ _tag: "GitCommandError", args: ["flood"] });
+		expect(result.capped).toMatchObject({ _tag: "GitOutputTooLargeError", args: ["flood"], maxLength: 1024 });
+		expect(result.whole.length).toBe(4096);
 	});
 });

@@ -1,4 +1,4 @@
-import { DIFF_FILE_LINE_LIMIT, DIFF_TOTAL_LINE_LIMIT, GitService } from "./GitService.ts";
+import { DIFF_FILE_LINE_LIMIT, DIFF_TOTAL_LINE_LIMIT, GitService, PATCH_MAX_LENGTH } from "./GitService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
@@ -93,6 +93,19 @@ describe("GitService diff", () => {
 		expect(byPath.get("new-name.txt")).toMatchObject({ status: "renamed", oldPath: "old-name.txt" });
 		expect(byPath.get("untracked.txt")).toMatchObject({ status: "untracked", additions: 1 });
 		expect(byPath.get("image.bin")?.content).toEqual({ kind: "binary" });
+	});
+
+	test("marks the files whose patch passes the output cap as too large, rather than fail the diff", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const created = yield* createWorkspace(tempDir);
+				// One line counts as one line against the budget, however long it is, as in a minified bundle.
+				yield* fs.writeFileString(join(created.path, "README.md"), `${"x".repeat(PATCH_MAX_LENGTH)}\n`);
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		expect(diff.files).toMatchObject([{ path: "README.md", additions: 1, content: { kind: "tooLarge" } }]);
 	});
 
 	test("shows only the changed line of a file that was renamed and edited", async () => {

@@ -1,6 +1,6 @@
 import { GhNotAuthenticatedError, GhNotInstalledError } from "@repo/contracts/Git";
-import { collectText, STDERR_MAX_LENGTH, STDOUT_MAX_LENGTH } from "./runGit.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { collectText, STDERR_MAX_LENGTH } from "./runGit.ts";
 import { withGitDeadline } from "./GitTimeoutSettings.ts";
 import { Context, Effect, Schema } from "effect";
 
@@ -29,15 +29,17 @@ export const runGh = Effect.fn("runGh")(
 			}),
 		);
 		const [stdout, stderr, exitCode] = yield* Effect.all(
-			[collectText(handle.stdout, STDOUT_MAX_LENGTH), collectText(handle.stderr, STDERR_MAX_LENGTH), handle.exitCode],
+			// stdout is uncapped: gh prints JSON for queries the daemon limits itself, and a cut would read as a failed
+			// command, such as a sign-in that is not there.
+			[
+				collectText(handle.stdout, Number.POSITIVE_INFINITY),
+				collectText(handle.stderr, STDERR_MAX_LENGTH),
+				handle.exitCode,
+			],
 			{ concurrency: "unbounded" },
 		);
-		if (exitCode !== 0 || stdout.cut) {
-			return yield* new GhCommandError({
-				args: [...args],
-				exitCode,
-				stderr: stdout.cut ? `The output passed ${STDOUT_MAX_LENGTH} characters.` : stderr.text.trim(),
-			});
+		if (exitCode !== 0) {
+			return yield* new GhCommandError({ args: [...args], exitCode, stderr: stderr.text.trim() });
 		}
 		return stdout.text.trim();
 	},
