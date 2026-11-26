@@ -1,6 +1,7 @@
 import type { OrganizationOptions } from "better-auth/plugins";
 import type { MembershipEvent } from "./MembershipEvents.ts";
 import { createAuthMiddleware } from "better-auth/api";
+import type { BetterAuthOptions } from "better-auth";
 import { Option, Schema } from "effect";
 
 export const membershipHooks = (publish: (event: MembershipEvent) => Promise<void>) =>
@@ -45,3 +46,15 @@ export const leaveOrganizationHook = (publish: (event: MembershipEvent) => Promi
 			await publish({ _tag: "memberRemoved", ...member.value });
 		}
 	});
+
+// Sign-out, revoking one or all sessions, and deleting a user all delete session rows through
+// Better Auth, which runs this hook once per row. A session that simply expires is not deleted,
+// so whoever holds a connection must also check the session's expiry.
+export const sessionHooks = (publish: (event: MembershipEvent) => Promise<void>) =>
+	({
+		session: {
+			delete: {
+				after: (session) => publish({ _tag: "sessionRevoked", userId: session.userId, sessionId: session.id }),
+			},
+		},
+	}) satisfies BetterAuthOptions["databaseHooks"];

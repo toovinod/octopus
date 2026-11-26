@@ -1,5 +1,5 @@
+import { leaveOrganizationHook, membershipHooks, sessionHooks } from "./membershipHooks.ts";
 import { bearer, deviceAuthorization, organization } from "better-auth/plugins";
-import { leaveOrganizationHook, membershipHooks } from "./membershipHooks.ts";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter/relations-v2";
 import type { InvitationEmailInput } from "@repo/email/invitationEmail";
 import { type Auth, type AuthContext, betterAuth } from "better-auth";
@@ -49,6 +49,7 @@ export const createAuth = ({
 			},
 		},
 		hooks: { after: leaveOrganizationHook(publishMembershipEvent) },
+		databaseHooks: sessionHooks(publishMembershipEvent),
 		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
 		// Counts live in Postgres, so every API instance enforces one shared limit per client.
 		rateLimit: { enabled: true, storage: "database" },

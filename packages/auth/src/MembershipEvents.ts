@@ -20,6 +20,11 @@ export const MembershipEvent = Schema.Union([
 	Schema.TaggedStruct("organizationDeleted", {
 		organizationId: Schema.String,
 	}),
+	// Sign-out or revocation. Connections authenticated with that session must close.
+	Schema.TaggedStruct("sessionRevoked", {
+		userId: Schema.String,
+		sessionId: Schema.String,
+	}),
 ]);
 export type MembershipEvent = typeof MembershipEvent.Type;
 
