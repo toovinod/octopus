@@ -73,19 +73,42 @@ describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 		expect(result._tag).toBe("Failure");
 	});
 
-	test("upgrading a database that already has duplicate members keeps each user's oldest membership", async () => {
-		const members = await Effect.gen(function* () {
+	// Inserts one user's duplicate rows into a database migrated up to the dedupe, then finishes migrating.
+	const membersAfterDedupe = (rows: ReadonlyArray<readonly [id: string, role: string, createdAt: string]>) =>
+		Effect.gen(function* () {
 			const url = yield* makeEmptyTestDatabase(Option.getOrThrow(serverUrl));
 			yield* migrateUpTo(url, "dedupe_members");
 			yield* Effect.gen(function* () {
 				yield* insertOrgAndUser;
-				yield* insertMember("member_b", "admin", "2026-01-02");
-				yield* insertMember("member_a", "member", "2026-01-01");
+				for (const [id, role, createdAt] of rows) yield* insertMember(id, role, createdAt);
 			}).pipe(withSql(url));
 			yield* migrateCloudDatabase.pipe(withDatabaseUrl(url));
 			return yield* membersOf.pipe(withSql(url));
 		}).pipe(Effect.scoped, Effect.runPromise);
-		expect(members).toEqual([{ id: "member_a", role: "member" }]);
+
+	test("upgrading a database with duplicate members keeps each user's highest role, so an owner is never demoted", async () => {
+		const members = await membersAfterDedupe([
+			["member_a", "member", "2026-01-01"],
+			["member_b", "admin", "2026-01-02"],
+			["member_c", "owner", "2026-01-03"],
+		]);
+		expect(members).toEqual([{ id: "member_c", role: "owner" }]);
+	});
+
+	test("upgrading reads a combined role such as 'member,owner' as its highest part", async () => {
+		const members = await membersAfterDedupe([
+			["member_a", "admin", "2026-01-01"],
+			["member_b", "member, owner", "2026-01-02"],
+		]);
+		expect(members).toEqual([{ id: "member_b", role: "member, owner" }]);
+	});
+
+	test("upgrading keeps the oldest of duplicate members with the same role", async () => {
+		const members = await membersAfterDedupe([
+			["member_b", "admin", "2026-01-02"],
+			["member_a", "admin", "2026-01-01"],
+		]);
+		expect(members).toEqual([{ id: "member_a", role: "admin" }]);
 	});
 
 	test("one GitHub or Google identity links to one account row, so sign-in always finds the same user", async () => {

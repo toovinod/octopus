@@ -1,0 +1,231 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "54147090-d766-4d4b-9494-f2d00203e546",
+  "prevIds": [
+    "dc399b9f-3053-4876-9f31-5a69651e6110"
+  ],
+  "footprints": [
+    {
+      "statementType": "drop_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "organization",
+        "organization_slug_uidx"
+      ],
+      "writes": [
+        "s|idx|public.organization_slug_uidx",
+        "n|idx|public.organization_slug_uidx",
+        "e|idx|public.organization_slug_uidx",
+        "n|rel|public.organization_slug_uidx"
+      ],
+      "reads": [
+        "n|tbl|public.organization",
+        "n|sch|public",
+        "e|col|public.organization.slug"
+      ],
+      "sharedWrites": [
+        "e|uniqueness|public.organization.slug"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "account",
+        "account_providerId_accountId_uidx"
+      ],
+      "writes": [
+        "s|idx|public.account_providerId_accountId_uidx",
+        "n|idx|public.account_providerId_accountId_uidx",
+        "e|idx|public.account_providerId_accountId_uidx",
+        "n|rel|public.account_providerId_accountId_uidx"
+      ],
+      "reads": [
+        "n|tbl|public.account",
+        "n|sch|public",
+        "n|col|public.account.provider_id",
+        "n|col|public.account.account_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "member",
+        "member_organizationId_userId_uidx"
+      ],
+      "writes": [
+        "s|idx|public.member_organizationId_userId_uidx",
+        "n|idx|public.member_organizationId_userId_uidx",
+        "e|idx|public.member_organizationId_userId_uidx",
+        "n|rel|public.member_organizationId_userId_uidx"
+      ],
+      "reads": [
+        "n|tbl|public.member",
+        "n|sch|public",
+        "n|col|public.member.organization_id",
+        "n|col|public.member.user_id"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "n|con|public.cloud_workspace.cloud_workspace_requested_state_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.requested_state"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "n|con|public.cloud_workspace.cloud_workspace_observed_state_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.observed_state"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "n|con|public.cloud_workspace.cloud_workspace_sandbox_provider_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.sandbox_provider"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "account",
+        "name": "account_providerId_accountId_uidx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "provider_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          },
+          {
+            "value": "account_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": true,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "member",
+        "name": "member_organizationId_userId_uidx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "organization_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          },
+          {
+            "value": "user_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": true,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_requested_state_check",
+        "value": "\"requested_state\" in ('running', 'stopped', 'archived')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_observed_state_check",
+        "value": "\"observed_state\" in ('provisioning', 'running', 'sleeping', 'stopped', 'failed', 'unknown')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_sandbox_provider_check",
+        "value": "\"sandbox_provider\" in ('vercel')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "drop",
+      "key": "indexes\u0000[\"public\",\"organization_slug_uidx\"]"
+    }
+  ]
+}
