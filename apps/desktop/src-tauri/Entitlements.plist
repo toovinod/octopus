@@ -3,7 +3,10 @@
 <plist version="1.0">
 <dict>
 	<!-- octopusd is a bun build --compile binary, and its JavaScript engine needs these under the hardened runtime
-	     that notarization requires. See https://bun.com/docs/guides/runtime/codesign-macos-executable. -->
+	     that notarization requires. See https://bun.com/docs/guides/runtime/codesign-macos-executable.
+	     The main app does not need them, but Tauri signs every binary in the bundle, sidecars included, with this one
+	     file (sign() in tauri-bundler's macos/sign.rs) and has no per-binary setting. Signing octopusd separately would
+	     be undone when the bundler signs it again, so scoping these needs signing outside `tauri bundle`. -->
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
