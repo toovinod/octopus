@@ -194,10 +194,12 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		incoming: Stream.fromQueue(incoming),
 		request: (method, params) =>
 			Effect.gen(function* () {
-				if (ended !== undefined) return yield* Effect.fail(ended);
 				const { timeout } = yield* CodexRequestSettings;
 				const id = nextId++;
 				const deferred = yield* Deferred.make<unknown, AgentError>();
+				// Checked right before the waiter is registered, with no yield in between, so end() either fails this
+				// waiter or has already run and fails the request here. Never left to wait out its deadline.
+				if (ended !== undefined) return yield* Effect.fail(ended);
 				pending.set(id, deferred);
 				return yield* send({ id, method, params }).pipe(
 					Effect.andThen(Deferred.await(deferred)),
