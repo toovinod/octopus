@@ -1,0 +1,40 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "04f79058-a3e8-46f5-99d7-2063704571ee",
+  "prevIds": [
+    "477f429f-7987-4d45-a1e0-77a39bc81dad"
+  ],
+  "footprints": [
+    {
+      "statementType": "drop_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "organization",
+        "organization_slug_uidx"
+      ],
+      "writes": [
+        "s|idx|public.organization_slug_uidx",
+        "n|idx|public.organization_slug_uidx",
+        "e|idx|public.organization_slug_uidx",
+        "n|rel|public.organization_slug_uidx"
+      ],
+      "reads": [
+        "n|tbl|public.organization",
+        "n|sch|public",
+        "e|col|public.organization.slug"
+      ],
+      "sharedWrites": [
+        "e|uniqueness|public.organization.slug"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "drop",
+      "key": "indexes\u0000[\"public\",\"organization_slug_uidx\"]"
+    }
+  ]
+}

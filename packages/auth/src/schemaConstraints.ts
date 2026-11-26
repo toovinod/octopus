@@ -10,5 +10,8 @@ export const schemaConstraints = () =>
 			// Better Auth looks an identity up by provider and provider account id, and two rows would
 			// make sign-in pick one user or the other.
 			account: { fields: {}, indexes: [{ fields: ["providerId", "accountId"], unique: true }] },
+			// The org plugin marks slug both unique and indexed, which made two identical unique indexes.
+			// This copies its definition without the index; the column's own UNIQUE remains.
+			organization: { fields: { slug: { type: "string", required: true, unique: true, sortable: true } } },
 		},
 	}) satisfies BetterAuthPlugin;

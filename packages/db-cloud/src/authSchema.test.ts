@@ -98,4 +98,14 @@ describe.skipIf(Option.isNone(serverUrl))("auth schema", () => {
 		);
 		expect(result._tag).toBe("Failure");
 	});
+
+	test("organization.slug has one unique index, not two identical ones", async () => {
+		const indexes = await inMigratedDatabase(
+			PgClient.PgClient.use(
+				(sql) => sql<{ indexname: string }>`select indexname from pg_indexes
+					where tablename = 'organization' and indexdef like 'CREATE UNIQUE INDEX%(slug)'`,
+			),
+		);
+		expect(indexes).toHaveLength(1);
+	});
 });
