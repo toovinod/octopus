@@ -15,6 +15,7 @@ import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { playChime, showNotification } from "./desktop.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
+import { releaseComments } from "./pendingComments.ts";
 import type { Project } from "@repo/contracts/Project";
 import type { DraftImage } from "./images.ts";
 import { useSyncExternalStore } from "react";
@@ -362,6 +363,7 @@ export const removeProject = async (projectId: string) => {
 		if (removed.has(sessionWorkspace(sessionId) ?? "")) releaseImages(sends.flatMap((send) => send.images));
 	}
 	releaseDrafts(Object.keys(state.sessions).filter((sessionId) => removed.has(sessionWorkspace(sessionId) ?? "")));
+	releaseComments(removed);
 	setState((current) => ({
 		projects: without(current.projects, projectId),
 		workspaces: kept(current.workspaces, (workspaceId) => workspaceId),
@@ -417,6 +419,7 @@ export const archiveWorkspace = async (workspaceId: string, force: boolean) => {
 			.filter((session) => session.workspaceId === workspaceId)
 			.map((session) => session.id),
 	);
+	releaseComments([workspaceId]);
 	setState((current) => ({
 		workspaces: { ...current.workspaces, [workspaceId]: archived },
 		...(current.selectedWorkspaceId === workspaceId ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),

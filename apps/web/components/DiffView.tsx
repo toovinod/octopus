@@ -22,6 +22,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { keepFullFiles } from "../lib/keepFullFiles.ts";
+import { commentsOf, keepComments } from "../lib/pendingComments.ts";
 import { commitPaths } from "../lib/commitPaths.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
@@ -41,9 +42,6 @@ const STATUS_LETTERS = {
 
 // Agents change files while they work, so the diff reloads every few seconds while a chat here works.
 const WORKING_RELOAD_MS = 5000;
-
-// Comments outlive the panel, so switching tabs and back keeps them until they are sent.
-const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
 
 // Which files the commit takes. Every file starts ticked.
 interface FileSelection {
@@ -74,7 +72,7 @@ export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace
 	const mode = useAppState((current) => current.settings.diffMode);
 	const working = useAppState((current) => workingChats(Object.values(current.sessions), workspace.id));
 	const reverts = useAppState((current) => current.reverts[workspace.id] ?? 0);
-	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
+	const [comments, setComments] = useState(() => commentsOf(workspace.id));
 	const [picked, setPicked] = useState<LineRange | null>(null);
 	const [excluded, setExcluded] = useState<ReadonlySet<string>>(new Set());
 	const selection = useMemo<FileSelection>(
@@ -92,7 +90,7 @@ export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace
 	);
 
 	useEffect(() => {
-		commentsByWorkspace.set(workspace.id, comments);
+		keepComments(workspace.id, comments);
 	}, [workspace.id, comments]);
 
 	const picking = useMemo<LinePicking>(
