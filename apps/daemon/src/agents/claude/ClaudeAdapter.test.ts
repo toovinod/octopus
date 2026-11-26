@@ -78,6 +78,12 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							session_id: options.resume ?? "claude-new",
 						};
 					}
+					if (text === "/clear") {
+						// Recorded from claude 2.1.332: /clear starts a new session and announces it like the first one.
+						yield { type: "system", subtype: "init", session_id: `claude-cleared-${turn}` };
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
 					if (text.includes("steer, then stop")) {
 						// A Stop while the steer waits in claude's queue ends the running turn, and the queued steer still
 						// runs as a turn of its own unless it is stopped too.
@@ -949,6 +955,19 @@ describe("ClaudeAdapter", () => {
 			{ input: { ...newSession, resumeId: "claude-old" } },
 		);
 		expect(id).toBe("claude-old");
+	});
+
+	test("reports the new session /clear starts, so a restart resumes it rather than the cleared one", async () => {
+		const [events, id] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("hi"));
+				yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("/clear"));
+				return [yield* takeUntil(handle, "turn.completed"), yield* handle.nativeSessionId] as const;
+			}),
+		);
+		expect(events).toContainEqual({ type: "session.started", nativeSessionId: "claude-cleared-2" });
+		expect(id).toBe("claude-cleared-2");
 	});
 
 	test("a resume of a session claude no longer has goes on in a new session with a notice", async () => {

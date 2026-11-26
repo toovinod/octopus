@@ -111,7 +111,9 @@ export interface AgentSession {
 export const makeAgentSession = Effect.fnUntraced(function* (capabilities: AgentCapabilities) {
 	const events = yield* Queue.bounded<AgentEvent, AgentError | Cause.Done>(EVENT_BUFFER);
 	yield* Effect.addFinalizer(() => endWith(Queue.end(events)));
+	// Resolves with the first native id. latestNativeId follows the ids the agent starts after it, as Claude does on /clear.
 	const nativeId = yield* Deferred.make<string, AgentError>();
+	const latestNativeId = yield* Ref.make(Option.none<string>());
 	const inbox = yield* Queue.bounded<{
 		readonly message: UserMessage;
 		readonly beforeTurn: Effect.Effect<void>;
@@ -150,6 +152,14 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	const waitingOnUser = () => approvals.size > 0 || plans.size > 0 || questions.size > 0;
 
 	const touch = Effect.flatMap(Clock.currentTimeMillis, (now) => Ref.set(lastEventAt, now));
+
+	// Waits for the first id, and fails as the session does if it ends before there is one.
+	const nativeSessionId = Effect.flatMap(Deferred.await(nativeId), (first) =>
+		Effect.map(
+			Ref.get(latestNativeId),
+			Option.getOrElse(() => first),
+		),
+	);
 
 	const emit = (agentEvent: AgentEvent) =>
 		Effect.gen(function* () {
@@ -309,7 +319,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			}).pipe(Effect.forever, Effect.catch(fail), Effect.forkScoped);
 
 			return {
-				nativeSessionId: Deferred.await(nativeId),
+				nativeSessionId,
 				events: Stream.fromQueue(events),
 				sendMessage: (message, options) =>
 					Effect.gen(function* () {
@@ -414,12 +424,14 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				yield* emit({ type: "question.asked", ...request });
 			}),
 		cancelQuestions,
-		nativeSessionId: Deferred.await(nativeId),
+		nativeSessionId,
 		setNativeSessionId: (id) =>
 			Effect.gen(function* () {
-				if (yield* Deferred.succeed(nativeId, id)) {
-					yield* emit({ type: "session.started", nativeSessionId: id });
-				}
+				const previous = yield* Ref.getAndSet(latestNativeId, Option.some(id));
+				if (Option.isSome(previous) && previous.value === id) return;
+				yield* Deferred.succeed(nativeId, id);
+				// Stored with the session, so a restart resumes the conversation the agent is in now.
+				yield* emit({ type: "session.started", nativeSessionId: id });
 			}),
 		fail,
 		end: endWith(Queue.end(events)),

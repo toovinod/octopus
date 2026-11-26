@@ -434,3 +434,23 @@ describe("makeAgentSession questions", () => {
 		expect(outcomes).toEqual([{ type: "cancelled" }, { type: "cancelled" }]);
 	});
 });
+
+describe("makeAgentSession native id", () => {
+	test("reports each new native id, as after /clear, so a restart resumes the latest conversation", async () => {
+		const [events, id] = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* session.setNativeSessionId("native-1");
+					yield* session.setNativeSessionId("native-1");
+					yield* session.setNativeSessionId("native-2");
+					return [yield* handle.events.pipe(Stream.take(2), Stream.runCollect), yield* handle.nativeSessionId] as const;
+				}),
+		);
+		expect(events).toEqual([
+			{ type: "session.started", nativeSessionId: "native-1" },
+			{ type: "session.started", nativeSessionId: "native-2" },
+		]);
+		expect(id).toBe("native-2");
+	});
+});
