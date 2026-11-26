@@ -3,6 +3,7 @@ import { leaveOrganizationHook, membershipHooks } from "./membershipHooks.ts";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter/relations-v2";
 import type { InvitationEmailInput } from "@repo/email/invitationEmail";
 import type { MembershipEvent } from "./MembershipEvents.ts";
+import { schemaConstraints } from "./schemaConstraints.ts";
 import * as authSchema from "@repo/db-cloud/authSchema";
 import { type Auth, betterAuth } from "better-auth";
 import type { AuthConfig } from "./AuthConfig.ts";
@@ -73,5 +74,6 @@ export const createAuth = ({
 			}),
 			// The desktop app sends the session token from the device flow as a bearer token.
 			bearer(),
+			schemaConstraints(),
 		],
 	});

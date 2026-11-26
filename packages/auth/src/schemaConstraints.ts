@@ -1,0 +1,11 @@
+import type { BetterAuthPlugin } from "better-auth";
+
+// Constraints Better Auth's own tables leave out. `bun run generate:schema` merges them into the tables it writes.
+export const schemaConstraints = () =>
+	({
+		id: "octopus-schema-constraints",
+		schema: {
+			// Accepting two invitations, or an accept racing a direct add, could make a user a member twice.
+			member: { fields: {}, indexes: [{ fields: ["organizationId", "userId"], unique: true }] },
+		},
+	}) satisfies BetterAuthPlugin;
