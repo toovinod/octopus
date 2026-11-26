@@ -1,5 +1,5 @@
-import { MembershipEvents } from "./MembershipEvents.ts";
-import { membershipHooks } from "./membershipHooks.ts";
+import { type MembershipEvent, MembershipEvents } from "./MembershipEvents.ts";
+import { membershipHooks, sessionHooks } from "./membershipHooks.ts";
 import { describe, expect, test } from "bun:test";
 import { Effect, PubSub } from "effect";
 
@@ -37,14 +37,20 @@ const invitation = {
 	createdAt: epoch,
 };
 
-const publishedBy = (callHook: (hooks: ReturnType<typeof membershipHooks>) => Promise<void>) =>
+const publishedWith = <Hooks>(
+	makeHooks: (publish: (event: MembershipEvent) => Promise<void>) => Hooks,
+	callHook: (hooks: Hooks) => Promise<void>,
+) =>
 	Effect.gen(function* () {
 		const events = yield* MembershipEvents;
 		const subscription = yield* events.subscribe;
 		const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
-		yield* Effect.promise(() => callHook(membershipHooks((event) => runPromise(events.publish(event)))));
+		yield* Effect.promise(() => callHook(makeHooks((event) => runPromise(events.publish(event)))));
 		return yield* PubSub.take(subscription);
 	}).pipe(Effect.scoped, Effect.provide(MembershipEvents.layer), Effect.runPromise);
+
+const publishedBy = (callHook: (hooks: ReturnType<typeof membershipHooks>) => Promise<void>) =>
+	publishedWith(membershipHooks, callHook);
 
 describe("membershipHooks", () => {
 	test("publishes memberRemoved after a member is removed", async () => {
@@ -95,5 +101,18 @@ describe("membershipHooks", () => {
 			_tag: "organizationDeleted",
 			organizationId: "org_1",
 		});
+	});
+
+	test("publishes sessionRevoked after Better Auth deletes a session", async () => {
+		const session = {
+			id: "session_1",
+			userId: user.id,
+			token: "token",
+			expiresAt: epoch,
+			createdAt: epoch,
+			updatedAt: epoch,
+		};
+		const event = await publishedWith(sessionHooks, (hooks) => hooks.session.delete.after(session));
+		expect(event).toEqual({ _tag: "sessionRevoked", userId: "user_1", sessionId: "session_1" });
 	});
 });

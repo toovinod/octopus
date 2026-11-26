@@ -37,4 +37,16 @@ describe("api", () => {
 		const other = await preflight("https://evil.test");
 		expect(other.headers.get("Access-Control-Allow-Origin")).toBeNull();
 	});
+
+	test("refuses a cross-site form post, the request a browser sends without a CORS preflight", async () => {
+		const post = (origin: string) =>
+			app.request("/api/workspaces", {
+				method: "POST",
+				headers: { Origin: origin, "Content-Type": "application/x-www-form-urlencoded", Cookie: "session=1" },
+				body: "name=x",
+			});
+
+		expect((await post("https://evil.test")).status).toBe(403);
+		expect((await post(WEB_ORIGIN)).status).toBe(404);
+	});
 });

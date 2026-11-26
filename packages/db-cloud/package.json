@@ -11,6 +11,7 @@
 		"test": "bun test",
 		"generate:migration": "drizzle-kit generate",
 		"db:migrate": "bun --env-file=../../.env src/migrateCloudDatabase.ts",
+		"db:migrate:deploy": "bun src/migrateCloudDatabase.ts",
 		"db:check": "drizzle-kit check"
 	},
 	"devDependencies": {

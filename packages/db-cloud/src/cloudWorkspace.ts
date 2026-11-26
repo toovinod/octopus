@@ -1,5 +1,6 @@
-import { index, integer, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { check, index, integer, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { defineRelationsPart, sql } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { organization, user } from "./authSchema.ts";
 
 // What the user asked for. The worker drives observedState towards it.
@@ -9,6 +10,11 @@ export const requestedStates = ["running", "stopped", "archived"] as const;
 export const observedStates = ["provisioning", "running", "sleeping", "stopped", "failed", "unknown"] as const;
 
 export const sandboxProviders = ["vercel"] as const;
+
+// Drizzle's enum option only types the column, so the database also checks the value. The values
+// are our own constants, written as SQL literals because a CHECK cannot take parameters.
+const isOneOf = (column: AnyPgColumn, values: ReadonlyArray<string>) =>
+	sql`${column} in (${sql.raw(values.map((value) => `'${value}'`).join(", "))})`;
 
 const timestampTz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 
@@ -51,6 +57,9 @@ export const cloudWorkspace = pgTable(
 	(table) => [
 		index("cloud_workspace_organization_id_idx").on(table.organizationId),
 		uniqueIndex("cloud_workspace_sandbox_uidx").on(table.sandboxProvider, table.sandboxId),
+		check("cloud_workspace_requested_state_check", isOneOf(table.requestedState, requestedStates)),
+		check("cloud_workspace_observed_state_check", isOneOf(table.observedState, observedStates)),
+		check("cloud_workspace_sandbox_provider_check", isOneOf(table.sandboxProvider, sandboxProviders)),
 	],
 );
 

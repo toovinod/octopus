@@ -1,10 +1,11 @@
+import { serveWithClientAddress, trustedProxiesConfig } from "./serveWithClientAddress.ts";
 import { Cause, Config, Duration, Effect, Exit, Layer, Runtime } from "effect";
 import { BunHttpServer, BunRuntime } from "@effect/platform-bun";
 import { MembershipEvents } from "@repo/auth/MembershipEvents";
 import { EmailService } from "@repo/email/EmailService";
-import { HttpEffect, HttpServer } from "effect/http";
 import { AuthConfig } from "@repo/auth/AuthConfig";
 import { createApp } from "./createApp.ts";
+import { HttpServer } from "effect/http";
 import { Auth } from "@repo/auth/Auth";
 
 const AppLayer = Auth.layer.pipe(
@@ -40,12 +41,13 @@ const ApiServer = Layer.unwrap(
 		const { webOrigin } = yield* AuthConfig;
 		const { handler } = yield* Auth;
 		const port = yield* Config.Port("API_PORT").pipe(Config.withDefault(3001));
+		const trustedProxies = yield* trustedProxiesConfig;
 		// Keep it below the platform's stop timeout so requests finish before the SIGKILL.
 		const grace = yield* Config.Duration("API_SHUTDOWN_GRACE").pipe(Config.withDefault(Duration.seconds(10)));
 		yield* exitIfShutdownHangs(Duration.sum(grace, Duration.seconds(5)));
 		yield* Effect.addFinalizer(() => Effect.logInfo("API stopped"));
 		const app = createApp({ webOrigin, authHandler: handler });
-		return HttpServer.serve(HttpEffect.fromWebHandler(async (request) => app.fetch(request))).pipe(
+		return HttpServer.serve(yield* serveWithClientAddress(trustedProxies, async (request) => app.fetch(request))).pipe(
 			HttpServer.withLogAddress,
 			Layer.provide(BunHttpServer.layer({ port, gracefulShutdownTimeout: grace })),
 		);

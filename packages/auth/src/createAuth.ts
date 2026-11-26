@@ -1,19 +1,23 @@
+import { leaveOrganizationHook, membershipHooks, sessionHooks } from "./membershipHooks.ts";
 import { bearer, deviceAuthorization, organization } from "better-auth/plugins";
-import { leaveOrganizationHook, membershipHooks } from "./membershipHooks.ts";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter/relations-v2";
 import type { InvitationEmailInput } from "@repo/email/invitationEmail";
-import type { BunSQLDatabase } from "drizzle-orm/bun-sql/postgres";
+import { type Auth, type AuthContext, betterAuth } from "better-auth";
 import type { MembershipEvent } from "./MembershipEvents.ts";
+import { schemaConstraints } from "./schemaConstraints.ts";
 import * as authSchema from "@repo/db-cloud/authSchema";
-import { type Auth, betterAuth } from "better-auth";
 import type { AuthConfig } from "./AuthConfig.ts";
 import { Redacted } from "effect";
 
 export const DESKTOP_CLIENT_ID = "octopus-desktop";
 
+// The API sets this to the client's address on every request, replacing any value the client sent.
+// Better Auth reads only this header, so rate limits never trust a forwarded header directly.
+export const CLIENT_ADDRESS_HEADER = "x-octopus-client-address";
+
 export interface CreateAuthInput {
 	readonly config: typeof AuthConfig.Service;
-	readonly database: BunSQLDatabase<typeof authSchema.authRelations>;
+	readonly database: Parameters<typeof drizzleAdapter>[0];
 	readonly sendInvitation: (input: InvitationEmailInput) => Promise<void>;
 	readonly publishMembershipEvent: (event: MembershipEvent) => Promise<void>;
 }
@@ -24,7 +28,9 @@ export const createAuth = ({
 	database,
 	sendInvitation,
 	publishMembershipEvent,
-}: CreateAuthInput): Pick<Auth, "handler" | "options"> =>
+}: CreateAuthInput): Pick<Auth, "handler" | "options"> & {
+	readonly $context: Promise<Pick<AuthContext, "authCookies">>;
+} =>
 	betterAuth({
 		baseURL: config.baseUrl,
 		secret: Redacted.value(config.secret),
@@ -43,13 +49,14 @@ export const createAuth = ({
 			},
 		},
 		hooks: { after: leaveOrganizationHook(publishMembershipEvent) },
+		databaseHooks: sessionHooks(publishMembershipEvent),
 		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
-		rateLimit: { enabled: true },
-		advanced: {
-			ipAddress: { ipAddressHeaders: [config.ipAddressHeader] },
-			// The web app is a static site on its own origin that calls the API with credentials.
-			defaultCookieAttributes: { sameSite: "none", secure: true },
-		},
+		// Counts live in Postgres, so every API instance enforces one shared limit per client.
+		rateLimit: { enabled: true, storage: "database" },
+		// The web app and the API must share one site (app.example.com and api.example.com), so Better
+		// Auth's default SameSite=Lax cookies reach the API from the web app, also in Safari and with
+		// third-party cookies blocked. SameSite=None broke both. Cookies are Secure when the API is on https.
+		advanced: { ipAddress: { ipAddressHeaders: [CLIENT_ADDRESS_HEADER] } },
 		plugins: [
 			organization({
 				sendInvitationEmail: ({ id, email, organization, inviter, invitation }) =>
@@ -69,5 +76,6 @@ export const createAuth = ({
 			}),
 			// The desktop app sends the session token from the device flow as a bearer token.
 			bearer(),
+			schemaConstraints(),
 		],
 	});

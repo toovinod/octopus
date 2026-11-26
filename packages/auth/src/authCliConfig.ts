@@ -1,8 +1,9 @@
 // Entry point for the Better Auth CLI (`bun run generate:schema`). The CLI only reads the
-// plugin list to generate tables, so no real secrets or database are needed here.
+// plugin list to generate tables, so no real secrets or database are needed here. The CLI loads this
+// file through jiti, which cannot import Bun built-ins, so the database is a pg-proxy that never connects.
 
 import { authRelations } from "@repo/db-cloud/authSchema";
-import { drizzle } from "drizzle-orm/bun-sql/postgres";
+import { drizzle } from "drizzle-orm/pg-proxy";
 import { createAuth } from "./createAuth.ts";
 import { Redacted } from "effect";
 
@@ -18,11 +19,10 @@ export const auth = createAuth({
 		webOrigin: "http://localhost",
 		secret: placeholder,
 		databaseUrl: placeholder,
-		ipAddressHeader: "x-forwarded-for",
 		github: oauthClient,
 		google: oauthClient,
 	},
-	database: drizzle.mock({ relations: authRelations }),
+	database: drizzle(() => Promise.reject(new Error("schema generation only")), { relations: authRelations }),
 	sendInvitation: () => Promise.resolve(),
 	publishMembershipEvent: () => Promise.resolve(),
 });

@@ -20,9 +20,17 @@ export const MembershipEvent = Schema.Union([
 	Schema.TaggedStruct("organizationDeleted", {
 		organizationId: Schema.String,
 	}),
+	// Sign-out or revocation. Connections authenticated with that session must close.
+	Schema.TaggedStruct("sessionRevoked", {
+		userId: Schema.String,
+		sessionId: Schema.String,
+	}),
 ]);
 export type MembershipEvent = typeof MembershipEvent.Type;
 
+// An in-process PubSub: only subscribers in the same API process see an event. Once the relay
+// lands and runs as its own process, or the API runs more than one instance, publish through a
+// shared bus (Redis pub/sub, or Postgres LISTEN/NOTIFY) instead, or revocations will be missed.
 export class MembershipEvents extends Context.Service<
 	MembershipEvents,
 	{

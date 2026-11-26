@@ -1,4 +1,5 @@
 import { cors } from "hono/cors";
+import { csrf } from "hono/csrf";
 import { Hono } from "hono";
 
 export interface CreateAppInput {
@@ -17,5 +18,8 @@ export const createApp = ({ webOrigin, authHandler }: CreateAppInput) =>
 				allowMethods: ["GET", "POST", "OPTIONS"],
 			}),
 		)
+		// A browser sends a cross-site form post with the user's cookies and no CORS preflight, so CORS
+		// alone does not stop it. Better Auth checks its own routes; this covers every other route too.
+		.use("*", csrf({ origin: webOrigin }))
 		.get("/health", (context) => context.json({ status: "ok" }))
 		.on(["GET", "POST"], "/api/auth/*", (context) => authHandler(context.req.raw));
