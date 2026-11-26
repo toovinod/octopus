@@ -10,13 +10,14 @@ const summary = big(900, { kind: "tooLarge" });
 const loaded = new Set(["big.json"]);
 
 describe("keepFullFiles", () => {
-	test("keeps a file the user loaded in full when a reload summarizes it again unchanged", () => {
-		expect(keepFullFiles([full], [summary], loaded)).toEqual({ files: [full], stale: [] });
+	test("keeps showing a file the user loaded in full when a reload summarizes it again, and loads it again", () => {
+		expect(keepFullFiles([full], [summary], loaded)).toEqual({ files: [full], stale: ["big.json"] });
 	});
 
-	test("asks again for a loaded file whose changes moved on", () => {
-		const grown = big(950, { kind: "tooLarge" });
-		expect(keepFullFiles([full], [grown], loaded)).toEqual({ files: [grown], stale: ["big.json"] });
+	// Equal counts do not mean equal content: a line edited in place adds one line and removes one.
+	test("loads a file again even when its counts did not move", () => {
+		const edited = big(900, { kind: "tooLarge" });
+		expect(keepFullFiles([full], [edited], loaded).stale).toEqual(["big.json"]);
 	});
 
 	test("leaves files nobody loaded in full as the reload sent them", () => {

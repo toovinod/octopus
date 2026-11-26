@@ -22,6 +22,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { keepFullFiles } from "../lib/keepFullFiles.ts";
+import { logWarning } from "../lib/logWarning.ts";
 import { commentsOf, keepComments } from "../lib/pendingComments.ts";
 import { commitPaths } from "../lib/commitPaths.ts";
 import { Hint } from "./Hint.tsx";
@@ -111,11 +112,13 @@ export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace
 	};
 
 	const loadFullFile = useCallback(
-		async (path: string) => {
+		// A reload loads files again in the background, where a toast on every poll would be noise.
+		async (path: string, background = false) => {
 			loadedInFull.current.add(path);
 			const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
 				(failure: unknown) => {
-					toast(errorMessage(failure));
+					if (background) logWarning("Could not load a file's full diff again", failure);
+					else toast(errorMessage(failure));
 					return null;
 				},
 			);
@@ -138,7 +141,7 @@ export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace
 				const { files, stale } = keepFullFiles(shown.current?.files ?? [], loaded.files, loadedInFull.current);
 				show({ ...loaded, files });
 				setError(null);
-				for (const path of stale) void loadFullFile(path);
+				for (const path of stale) void loadFullFile(path, true);
 			},
 			(failure: unknown) => {
 				if (isLatest()) setError(errorMessage(failure));
