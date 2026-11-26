@@ -181,6 +181,8 @@ const loadProjects = async () => {
 		workspaces: byId(workspaces),
 		sessions: byId(sessions),
 		attention: kept(current.attention),
+		queued: kept(current.queued),
+		closedTabs: new Set([...current.closedTabs].filter((sessionId) => sessionIds.has(sessionId))),
 		...(selectionGone ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionGone) closeChat();
@@ -366,6 +368,8 @@ export const removeProject = async (projectId: string) => {
 		sessions: kept(current.sessions, sessionWorkspace),
 		attention: kept(current.attention, sessionWorkspace),
 		failedSends: kept(current.failedSends, sessionWorkspace),
+		queued: kept(current.queued, sessionWorkspace),
+		closedTabs: new Set([...current.closedTabs].filter((sessionId) => !removed.has(sessionWorkspace(sessionId) ?? ""))),
 		...(selectionRemoved ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionRemoved) closeChat();

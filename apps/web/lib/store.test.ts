@@ -113,6 +113,7 @@ mock.module("./daemonRuntime.ts", () => ({
 
 const {
 	boot,
+	closeTab,
 	discardFailedSend,
 	failedSendsOf,
 	getState,
@@ -237,6 +238,19 @@ describe("removing a project", () => {
 		expect(state.selectedWorkspaceId).toBeNull();
 		expect(state.selectedSessionId).toBeNull();
 		expect(state.chat).toBeNull();
+	});
+
+	test("forgets the queued messages and closed tabs of its chats", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, status: "running", updatedAt: "7" });
+		await sendMessage("s", "later", [], false);
+		closeTab("s");
+		expect(queuedOf(getState(), "s")).toHaveLength(1);
+		expect(getState().closedTabs.has("s")).toBe(true);
+		expect(await removeProject("p")).toBe(true);
+		expect(getState().queued).toEqual({});
+		expect(getState().closedTabs.size).toBe(0);
 	});
 });
 
