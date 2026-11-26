@@ -1,20 +1,26 @@
 import type { DiffFile, DiffLine } from "@repo/contracts/Git";
+import { Schema } from "effect";
 
 // One side of the diff: "old" numbers a removed line, "new" every other line.
-export type DiffSide = "old" | "new";
+const DiffSide = Schema.Literals(["old", "new"]);
+export type DiffSide = typeof DiffSide.Type;
 
-export interface LineRange {
-	readonly path: string;
-	readonly side: DiffSide;
-	readonly start: number;
-	readonly end: number;
-}
+const LineRange = Schema.Struct({
+	path: Schema.String,
+	side: DiffSide,
+	start: Schema.Number,
+	end: Schema.Number,
+});
+export type LineRange = typeof LineRange.Type;
 
-export interface DiffComment extends LineRange {
-	readonly id: string;
-	readonly code: ReadonlyArray<string>;
-	readonly text: string;
-}
+// A schema, because unsent comments are kept across a window reload.
+export const DiffComment = Schema.Struct({
+	...LineRange.fields,
+	id: Schema.String,
+	code: Schema.Array(Schema.String),
+	text: Schema.String,
+});
+export type DiffComment = typeof DiffComment.Type;
 
 // The side a unified line is numbered on.
 export const sideOf = (line: DiffLine): DiffSide => (line.kind === "delete" ? "old" : "new");

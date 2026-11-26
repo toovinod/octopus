@@ -7,21 +7,22 @@ import {
 	saveSettings,
 	writeStored,
 } from "./settings.ts";
-import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession } from "@repo/contracts/AgentSession";
+import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession, ImageData } from "@repo/contracts/AgentSession";
 import type { ApprovalDecision, QuestionAnswers, PlanAnswer } from "@repo/contracts/AgentEvent";
 import { applyEvents, type ChatState, emptyChat, prependEvents } from "./chatReducer.ts";
 import { callDaemon, errorMessage, errorTag, followDaemon } from "./daemonRuntime.ts";
+import { allComments, keepComments, releaseComments } from "./pendingComments.ts";
 import { loginEnvMissing, playChime, showNotification } from "./desktop.ts";
+import { saveForReload, takeSavedForReload } from "./keepAcrossReload.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
+import { allDrafts, keepDraft, releaseDrafts } from "./drafts.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
+import { draftImageOf, type DraftImage } from "./images.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
-import { releaseComments } from "./pendingComments.ts";
 import type { Project } from "@repo/contracts/Project";
 import { isConnectionDrop } from "./errorMessage.ts";
-import type { DraftImage } from "./images.ts";
 import { logWarning } from "./logWarning.ts";
 import { useSyncExternalStore } from "react";
-import { releaseDrafts } from "./drafts.ts";
 import { toast as showToast } from "sonner";
 import { Redacted } from "effect";
 
@@ -212,6 +213,8 @@ export const boot = async () => {
 		},
 	);
 	if (!loaded) return;
+	restoreAfterReload();
+	addEventListener("pagehide", saveBeforeReload);
 	warnIfLoginEnvMissing();
 	// Checking the agents starts their CLIs and reads the keychain, so it never holds up files, terminals or history.
 	void refreshAgents();
@@ -221,6 +224,46 @@ export const boot = async () => {
 	const active = Object.values(state.workspaces).filter((workspace) => workspace.status === "active");
 	const start = active.find((workspace) => workspace.id === remembered) ?? active[0];
 	if (start !== undefined) selectWorkspace(start.id);
+};
+
+const imageDataOf = ({ mediaType, base64 }: ImageData) => ({ mediaType, base64 });
+
+// What lives only in memory and a reload would lose, as when restarting the daemon reloads the window.
+const saveBeforeReload = () =>
+	saveForReload({
+		drafts: Object.fromEntries(
+			[...allDrafts()].map(([sessionId, draft]) => [
+				sessionId,
+				{ text: draft.text, images: draft.images.map(imageDataOf) },
+			]),
+		),
+		comments: Object.fromEntries(allComments()),
+		failedSends: Object.fromEntries(
+			Object.entries(state.failedSends).map(([sessionId, sends]) => [
+				sessionId,
+				sends.map(({ text, images, error }) => ({ text, images: images.map(imageDataOf), error })),
+			]),
+		),
+	});
+
+// Only for chats and workspaces the daemon still lists.
+const restoreAfterReload = () => {
+	const saved = takeSavedForReload();
+	if (saved === null) return;
+	const live = (sessionId: string) => state.sessions[sessionId] !== undefined;
+	for (const [sessionId, draft] of Object.entries(saved.drafts)) {
+		if (live(sessionId)) keepDraft(sessionId, { text: draft.text, images: draft.images.map(draftImageOf) });
+	}
+	for (const [workspaceId, comments] of Object.entries(saved.comments)) {
+		if (state.workspaces[workspaceId]?.status === "active") keepComments(workspaceId, comments);
+	}
+	const failedSends = Object.entries(saved.failedSends)
+		.filter(([sessionId]) => live(sessionId))
+		.map(([sessionId, sends]) => [
+			sessionId,
+			sends.map((send) => ({ ...send, id: nextFailedSend++, images: send.images.map(draftImageOf) })),
+		]);
+	setState((current) => ({ failedSends: { ...current.failedSends, ...Object.fromEntries(failedSends) } }));
 };
 
 // Without the login shell's PATH, agents, git and gh can seem missing, and the reason would be invisible.

@@ -53,3 +53,5 @@ export const withReturned = (
 		leftOut: Math.max(0, images.length - room),
 	};
 };
+
+export const allDrafts = () => drafts.entries();

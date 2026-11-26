@@ -16,3 +16,5 @@ export const keepComments = (workspaceId: string, kept: ReadonlyArray<DiffCommen
 export const releaseComments = (workspaceIds: Iterable<string>) => {
 	for (const workspaceId of workspaceIds) comments.delete(workspaceId);
 };
+
+export const allComments = () => comments.entries();

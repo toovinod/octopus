@@ -462,6 +462,32 @@ describe("reconnecting after an outage", () => {
 	});
 });
 
+describe("reloading the window", () => {
+	test("keeps drafts and refused messages across a reload, as a daemon restart does", async () => {
+		const items = new Map<string, string>();
+		Object.assign(globalThis, {
+			sessionStorage: {
+				getItem: (key: string) => items.get(key) ?? null,
+				setItem: (key: string, value: string) => items.set(key, value),
+				removeItem: (key: string) => items.delete(key),
+			},
+		});
+		await boot();
+		keepDraft("s", { text: "half a thought", images: [] });
+		outcomes.push("busy");
+		await sendMessage("s", "refused", [], false);
+		dispatchEvent(new Event("pagehide"));
+		keepDraft("s", { text: "", images: [] });
+		discardFailedSend("s", failedSendsOf(getState(), "s")[0]?.id ?? -1);
+
+		await boot();
+		expect(draftOf("s").text).toBe("half a thought");
+		expect(failedSendsOf(getState(), "s").map(({ text }) => text)).toEqual(["refused"]);
+		discardFailedSend("s", failedSendsOf(getState(), "s")[0]?.id ?? -1);
+		keepDraft("s", { text: "", images: [] });
+	});
+});
+
 describe("watching sign-ins", () => {
 	test("says so when the watch fails for another reason than a dropped socket", async () => {
 		const shown = spyOn(sonnerToast, "error");
