@@ -1,7 +1,9 @@
+import { KeepThroughShutdown } from "../processes/ProcessRegistry.ts";
 import { WorktreeRemoveError } from "@repo/contracts/Workspace";
+import { Array as Arr, Effect, FileSystem } from "effect";
 import { resolveBranchRef } from "./createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
-import { Effect } from "effect";
+import { join } from "node:path";
 
 // Folders that installs and builds fill, matched as the directory entries `git ls-files --directory` lists.
 const REGENERABLE_FOLDER =
@@ -80,39 +82,121 @@ const keepDetachedCommits = Effect.fn("keepDetachedCommits")(function* (worktree
 // Removes the worktree folder and keeps its branch, so commits stay reachable.
 // With `stashChanges`, uncommitted and untracked files are stashed first; stashes live in the
 // shared repository, so they survive the folder. If the folder cannot be removed, the stash goes back into it.
-export const removeWorktree = Effect.fn("removeWorktree")(function* (options: {
-	readonly repositoryPath: string;
-	readonly worktreePath: string;
-	readonly workspaceId: string;
-	readonly stashChanges: boolean;
-}) {
-	const { repositoryPath, worktreePath, workspaceId, stashChanges } = options;
-	yield* keepDetachedCommits(worktreePath, workspaceId);
-	if (stashChanges) {
-		yield* runGit(worktreePath, ["stash", "push", "--include-untracked", "-m", archiveStashMessage(workspaceId)]);
-		yield* Effect.logInfo("Stashed uncommitted changes before archiving").pipe(
-			Effect.annotateLogs({ worktreePath, workspaceId }),
+// Its git commands are kept through shutdown: one cut short mid-way could leave the folder half cleaned.
+export const removeWorktree = Effect.fn("removeWorktree")(
+	function* (options: {
+		readonly repositoryPath: string;
+		readonly worktreePath: string;
+		readonly workspaceId: string;
+		readonly stashChanges: boolean;
+	}) {
+		const { repositoryPath, worktreePath, workspaceId, stashChanges } = options;
+		yield* keepDetachedCommits(worktreePath, workspaceId);
+		if (stashChanges) {
+			const before = yield* stashTip(worktreePath);
+			yield* runGit(worktreePath, [
+				"stash",
+				"push",
+				"--include-untracked",
+				"-m",
+				archiveStashMessage(workspaceId),
+			]).pipe(
+				// git saves the stash before it cleans the folder, so a push that fails or is killed can leave the
+				// changes only in the stash, with the folder half cleaned.
+				Effect.onError(() =>
+					stashTip(worktreePath).pipe(
+						Effect.flatMap((after) =>
+							after === before ? Effect.void : putBackFailedStash(worktreePath, workspaceId, after),
+						),
+						Effect.catch((cause) =>
+							Effect.logError(
+								"Could not put back the changes a failed stash push saved, they are still in git stash",
+								cause,
+							),
+						),
+					),
+				),
+			);
+			yield* Effect.logInfo("Stashed uncommitted changes before archiving").pipe(
+				Effect.annotateLogs({ worktreePath, workspaceId }),
+			);
+		}
+		// Forced, since git refuses any worktree with submodules otherwise. The caller has already checked for
+		// unsaved work, or stashed it. A locked worktree still refuses.
+		yield* runGit(repositoryPath, ["worktree", "remove", "--force", worktreePath]).pipe(
+			// On any failure, not just git's refusal: the workspace stays active, so its changes go back into its folder.
+			Effect.onError(() =>
+				stashChanges
+					? restoreArchiveStash(worktreePath, workspaceId).pipe(
+							Effect.catch((cause) =>
+								Effect.logError("Could not restore the stashed changes, they are still in git stash", cause),
+							),
+						)
+					: Effect.void,
+			),
+			Effect.catchTag("GitCommandError", (cause) =>
+				Effect.logError("git worktree remove failed", cause).pipe(
+					Effect.andThen(Effect.fail(new WorktreeRemoveError({ path: worktreePath }))),
+				),
+			),
+		);
+	},
+	Effect.provideService(KeepThroughShutdown, true),
+);
+
+const stashTip = (worktreePath: string) =>
+	runGit(worktreePath, ["rev-parse", "--quiet", "--verify", "refs/stash"]).pipe(
+		Effect.catchTag("GitCommandError", () => Effect.succeed("")),
+	);
+
+// Makes the folder and its index what the stash saved, whatever part of the cleaning git got through, then drops
+// the stash. A plain `stash apply` refuses here, since files git did not get to clean are still changed.
+const putBackFailedStash = Effect.fn("putBackFailedStash")(function* (
+	worktreePath: string,
+	workspaceId: string,
+	sha: string,
+) {
+	// Another worktree's push may have moved the shared stash meanwhile.
+	const subject = yield* runGit(worktreePath, ["log", "-1", "--format=%s", sha]);
+	if (!subject.endsWith(`: ${archiveStashMessage(workspaceId)}`)) return;
+	// Tracked files as the stash saved them, so a file the user deleted is deleted again.
+	yield* runGit(worktreePath, ["restore", `--source=${sha}`, "--worktree", "--", "."]);
+	const hasUntracked = yield* runGit(worktreePath, ["rev-parse", "--quiet", "--verify", `${sha}^3`]).pipe(
+		Effect.as(true),
+		Effect.catchTag("GitCommandError", () => Effect.succeed(false)),
+	);
+	if (hasUntracked) {
+		// git cleans an untracked file by deleting it, so one still there is whole and only the deleted ones come back.
+		const fs = yield* FileSystem.FileSystem;
+		const saved = (yield* runGit(worktreePath, ["ls-tree", "-r", "-z", "--name-only", `${sha}^3`]))
+			.split("\0")
+			.filter((file) => file !== "");
+		const missing = yield* Effect.filter(saved, (file) =>
+			fs.exists(join(worktreePath, file)).pipe(Effect.map((there) => !there)),
+		);
+		yield* Effect.forEach(
+			Arr.chunksOf(missing, 200),
+			(files) => runGit(worktreePath, ["checkout", `${sha}^3`, "--", ...files], { GIT_LITERAL_PATHSPECS: "1" }),
+			{ discard: true },
 		);
 	}
-	// Forced, since git refuses any worktree with submodules otherwise. The caller has already checked for
-	// unsaved work, or stashed it. A locked worktree still refuses.
-	yield* runGit(repositoryPath, ["worktree", "remove", "--force", worktreePath]).pipe(
-		// On any failure, not just git's refusal: the workspace stays active, so its changes go back into its folder.
-		Effect.onError(() =>
-			stashChanges
-				? restoreArchiveStash(worktreePath, workspaceId).pipe(
-						Effect.catch((cause) =>
-							Effect.logError("Could not restore the stashed changes, they are still in git stash", cause),
-						),
-					)
-				: Effect.void,
-		),
-		Effect.catchTag("GitCommandError", (cause) =>
-			Effect.logError("git worktree remove failed", cause).pipe(
-				Effect.andThen(Effect.fail(new WorktreeRemoveError({ path: worktreePath }))),
-			),
-		),
+	// The index as it was, which also leaves the untracked files untracked again.
+	yield* runGit(worktreePath, ["read-tree", `${sha}^2`]);
+	yield* dropStash(worktreePath, sha);
+	yield* Effect.logWarning("A stash push failed after saving the changes, so they were put back").pipe(
+		Effect.annotateLogs({ worktreePath, workspaceId }),
 	);
+});
+
+const dropStash = Effect.fn("dropStash")(function* (worktreePath: string, sha: string) {
+	const list = yield* runGit(worktreePath, ["stash", "list", "--format=%H %gd"]);
+	const ref = list
+		.split("\n")
+		.map((line) => line.split(" "))
+		.find((fields) => fields[0] === sha)?.[1];
+	if (ref !== undefined) {
+		yield* runGit(worktreePath, ["stash", "drop", ref]);
+	}
 });
 
 // Undoes adding a worktree when the workspace could not be saved. A branch the worktree created is new,

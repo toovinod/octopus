@@ -297,6 +297,44 @@ describe("WorkspaceService", () => {
 		expect(result.stashes).toContain(`octopus-archive/${result.workspace.id}`);
 	});
 
+	test("a forced archive whose stash push fails after saving puts the changes back and drops that stash", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				yield* fs.writeFileString(join(created.path, "notes.txt"), "mine\n");
+				// git saves the stash, then cannot delete this untracked file, so the push fails with the folder half
+				// cleaned, as a kill in the middle of it would leave it.
+				const locked = join(created.path, "locked");
+				yield* fs.makeDirectory(locked);
+				yield* fs.writeFileString(join(locked, "draft.txt"), "draft\n");
+				yield* fs.chmod(locked, 0o555);
+				const failed = yield* Effect.flip(workspaces.archive(created.id, { force: true })).pipe(
+					Effect.ensuring(fs.chmod(locked, 0o755).pipe(Effect.ignore)),
+				);
+				return {
+					failed,
+					workspace: yield* workspaces.get(created.id),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+					notes: yield* fs.readFileString(join(created.path, "notes.txt")),
+					draft: yield* fs.readFileString(join(locked, "draft.txt")),
+					status: yield* runGit(created.path, ["status", "--porcelain"]),
+					stashes: yield* runGit(project.path, ["stash", "list"]),
+				};
+			}),
+		);
+		expect(result.failed).toBeDefined();
+		expect(result.workspace.status).toBe("active");
+		expect(result.readme).toBe("edited\n");
+		expect(result.notes).toBe("mine\n");
+		expect(result.draft).toBe("draft\n");
+		expect(result.status.split("\n").sort()).toEqual([" M README.md", "?? locked/", "?? notes.txt"]);
+		expect(result.stashes).toBe("");
+	});
+
 	test("a forced archive on a detached HEAD keeps the commits made there on a branch", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

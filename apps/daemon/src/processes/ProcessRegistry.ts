@@ -13,6 +13,12 @@ export const REGISTRY_FILE_NAME = "children.json";
 // not reaped, which leaves at most a command a moment from finishing.
 export const RECORD_AFTER = Duration.seconds(1);
 
+// Set around a command that must not be cut short at shutdown, such as the archive's git commands, which can
+// leave a worktree half cleaned. Such a child is still recorded, so a crash leaves it for the next start.
+export const KeepThroughShutdown = Context.Reference<boolean>("octopus/daemon/processes/KeepThroughShutdown", {
+	defaultValue: () => false,
+});
+
 export const RegistryEntries = Schema.Array(Schema.Struct({ pgid: Schema.Int, startedAt: Schema.Number }));
 const RegistryFile = Schema.fromJsonString(RegistryEntries);
 
@@ -38,9 +44,10 @@ const reapEntry = Effect.fn("reapEntry")(function* (entry: { readonly pgid: numb
 export class ProcessRegistry extends Context.Service<
 	ProcessRegistry,
 	{
-		readonly add: (pgid: number) => Effect.Effect<void>;
+		readonly add: (pgid: number, options?: { readonly keepThroughShutdown?: boolean }) => Effect.Effect<void>;
 		readonly remove: (pgid: number) => Effect.Effect<void>;
-		// SIGTERMs every recorded group at once and SIGKILLs those still alive after the stop grace.
+		// SIGTERMs every recorded group at once, except those kept through shutdown, and SIGKILLs those still
+		// alive after the stop grace.
 		readonly stopAll: Effect.Effect<void>;
 	}
 >()("octopus/daemon/processes/ProcessRegistry") {
@@ -66,7 +73,10 @@ export class ProcessRegistry extends Context.Service<
 			}
 
 			// Every live group with when it started, and whether it is in the file yet.
-			const groups = new Map<number, { readonly startedAt: number; recorded: boolean }>();
+			const groups = new Map<
+				number,
+				{ readonly startedAt: number; readonly keepThroughShutdown: boolean; recorded: boolean }
+			>();
 			// The wait before each young group goes into the file.
 			const pending = yield* FiberMap.make<number>();
 			const lock = yield* Semaphore.make(1);
@@ -97,9 +107,13 @@ export class ProcessRegistry extends Context.Service<
 			);
 
 			return ProcessRegistry.of({
-				add: (pgid) =>
+				add: (pgid, options) =>
 					Effect.gen(function* () {
-						const group = { startedAt: yield* Clock.currentTimeMillis, recorded: false };
+						const group = {
+							startedAt: yield* Clock.currentTimeMillis,
+							keepThroughShutdown: options?.keepThroughShutdown ?? false,
+							recorded: false,
+						};
 						groups.set(pgid, group);
 						yield* FiberMap.run(
 							pending,
@@ -122,10 +136,14 @@ export class ProcessRegistry extends Context.Service<
 						if (group?.recorded) yield* save;
 					}),
 				stopAll: Effect.suspend(() =>
-					Effect.forEach([...groups.keys()], (pgid) => stopProcessGroup(pgid), {
-						concurrency: "unbounded",
-						discard: true,
-					}),
+					Effect.forEach(
+						[...groups].filter(([, group]) => !group.keepThroughShutdown).map(([pgid]) => pgid),
+						(pgid) => stopProcessGroup(pgid),
+						{
+							concurrency: "unbounded",
+							discard: true,
+						},
+					),
 				),
 			});
 		}),

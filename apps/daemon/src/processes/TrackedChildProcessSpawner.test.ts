@@ -1,8 +1,8 @@
 import { isGoneWithin, WITH_GRANDCHILD } from "../testing/processTesting.ts";
 import { TrackedChildProcessSpawner } from "./TrackedChildProcessSpawner.ts";
+import { KeepThroughShutdown, ProcessRegistry } from "./ProcessRegistry.ts";
 import { Duration, Effect, Layer, Option, Schedule, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { ProcessRegistry } from "./ProcessRegistry.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 
@@ -38,6 +38,28 @@ describe("TrackedChildProcessSpawner", () => {
 		);
 		expect(result.grandchildGone).toBe(true);
 		expect(result.events).toEqual([`add ${result.pid}`, `remove ${result.pid}`]);
+	});
+
+	test("tells the registry which children are kept through shutdown", async () => {
+		const added: Array<boolean> = [];
+		const recordingRegistry = Layer.succeed(
+			ProcessRegistry,
+			ProcessRegistry.of({
+				add: (_pgid, options) => Effect.sync(() => added.push(options?.keepThroughShutdown ?? false)),
+				remove: () => Effect.void,
+				stopAll: Effect.void,
+			}),
+		);
+		await Effect.gen(function* () {
+			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+			const run = spawner.string(ChildProcess.make("/bin/sh", ["-c", "true"]));
+			yield* run;
+			yield* run.pipe(Effect.provideService(KeepThroughShutdown, true));
+		}).pipe(
+			Effect.provide(TrackedChildProcessSpawner.pipe(Layer.provide([recordingRegistry, BunServices.layer]))),
+			Effect.runPromise,
+		);
+		expect(added).toEqual([false, true]);
 	});
 
 	test("keeps a group recorded after its leader exits, while a grandchild still holds it", async () => {

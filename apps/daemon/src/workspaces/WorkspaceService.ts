@@ -425,7 +425,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					let remove: Effect.Effect<
 						void,
 						WorktreeRemoveError | GitCommandError | GitSpawnError | GitTimeoutError,
-						ChildProcessSpawner.ChildProcessSpawner
+						ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
 					> = Effect.void;
 					if (current.kind === "worktree") {
 						// The foreign key keeps the project while it has workspaces.

@@ -1,7 +1,7 @@
+import { KeepThroughShutdown, ProcessRegistry } from "./ProcessRegistry.ts";
 import { signalProcessGroup, STOP_GRACE } from "./stopProcessGroup.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { Duration, Effect, Layer, Schedule } from "effect";
-import { ProcessRegistry } from "./ProcessRegistry.ts";
 
 // Effect already spawns each command in its own process group and SIGTERMs the group when the
 // scope closes. Without forceKillAfter it would wait forever for a child that ignores SIGTERM.
@@ -23,7 +23,7 @@ export const TrackedChildProcessSpawner = Layer.effect(
 		return ChildProcessSpawner.make((command) =>
 			Effect.gen(function* () {
 				const handle = yield* spawner.spawn(withStopGrace(command));
-				yield* registry.add(handle.pid);
+				yield* registry.add(handle.pid, { keepThroughShutdown: yield* KeepThroughShutdown });
 				// Removed only once nothing is left in the group, not when its scope starts closing or its leader
 				// exits: a crash during the stop grace, or while a child the leader left behind runs on, still
 				// leaves it in the registry.

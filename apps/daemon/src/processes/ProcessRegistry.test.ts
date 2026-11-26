@@ -151,6 +151,28 @@ describe("ProcessRegistry", () => {
 		expect(result.took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
 	}, 20_000);
 
+	test("leaves a group kept through shutdown out of stopAll", async () => {
+		const result = await runInTempDir((dataDir) =>
+			Effect.gen(function* () {
+				const [stopped, kept] = yield* Effect.all([
+					spawnDetachedShell("echo $$; exec sleep 30"),
+					spawnDetachedShell("echo $$; exec sleep 30"),
+				]);
+				for (const { shell } of [stopped, kept]) yield* killGroupOnExit(shell.pid);
+				const layer = ProcessRegistry.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]));
+				const registry = Context.get(yield* Layer.build(layer), ProcessRegistry);
+				yield* registry.add(stopped.shell.pid);
+				yield* registry.add(kept.shell.pid, { keepThroughShutdown: true });
+				yield* registry.stopAll;
+				return {
+					stoppedGone: yield* isGoneWithin(stopped.shell.pid),
+					keptAlive: yield* processExists(kept.shell.pid),
+				};
+			}),
+		);
+		expect(result).toEqual({ stoppedGone: true, keptAlive: true });
+	});
+
 	test("writes a child to the file only once it has run for a moment, and never one that is gone by then", async () => {
 		const result = await runInTempDir((dataDir) =>
 			Effect.gen(function* () {
