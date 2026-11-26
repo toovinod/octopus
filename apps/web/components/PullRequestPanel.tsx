@@ -463,6 +463,10 @@ const MergeForm = ({
 	const [deleteBranch, setDeleteBranch] = useState(true);
 	const [confirming, setConfirming] = useState(false);
 	const [busy, setBusy] = useState(false);
+	// A pull request that turns blocked, say back to a draft, must not come back already asking to merge.
+	useEffect(() => {
+		if (readiness.kind === "blocked") setConfirming(false);
+	}, [readiness.kind]);
 	const merge = async () => {
 		setBusy(true);
 		await callDaemon((daemon) => daemon.mergePullRequest({ workspaceId: workspace.id, method, deleteBranch })).then(
