@@ -178,17 +178,20 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
-	test("a turn status this version does not know ends the turn as failed", async () => {
+	test.each([
+		["a status this version does not know", "new status", "paused"],
+		["inProgress, which cannot end a turn", "new status, in progress", "inProgress"],
+	])("a turn that ends with %s ends as failed", async (_kind, text, status) => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
-				yield* handle.sendMessage(userMessage("new status"));
+				yield* handle.sendMessage(userMessage(text));
 				return yield* takeUntil(handle, "turn.completed");
 			}).pipe(Effect.timeout("3 seconds")),
 		);
 		expect(events.at(-1)).toEqual({
 			type: "turn.completed",
 			turnId: "turn-1",
-			result: { status: "failed", message: "Codex ended the turn with a status Octopus does not know: paused." },
+			result: { status: "failed", message: `Codex ended the turn with an unexpected status: ${status}.` },
 		});
 	});
 

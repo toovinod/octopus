@@ -406,7 +406,7 @@ const handleNotification = Effect.fnUntraced(function* (
 			}
 			const known = turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed";
 			if (!known) {
-				yield* Effect.logWarning("Codex ended a turn with an unknown status").pipe(
+				yield* Effect.logWarning("Codex ended a turn with an unexpected status").pipe(
 					Effect.annotateLogs({ status: turn.status }),
 				);
 			}
@@ -422,7 +422,7 @@ const handleNotification = Effect.fnUntraced(function* (
 									status: "failed",
 									message: known
 										? (turn.error?.message ?? "The turn failed.")
-										: `Codex ended the turn with a status Octopus does not know: ${turn.status}.`,
+										: `Codex ended the turn with an unexpected status: ${turn.status}.`,
 								},
 			});
 			// A stopped or failed turn offers no plan, as in Codex's own prompt.
