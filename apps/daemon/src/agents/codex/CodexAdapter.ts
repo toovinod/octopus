@@ -111,6 +111,12 @@ const threadPolicy = {
 	sandbox: "workspace-write",
 } as const satisfies Pick<ThreadStartParams, "approvalPolicy" | "sandbox">;
 
+// Codex 0.172.0 trusts a folder for good, in the user's ~/.codex/config.toml, the first time a workspace-write
+// thread starts in it, and then loads the folder's .codex config, hooks and exec policies. Marking the folder
+// untrusted for the thread keeps a project Octopus does not trust from configuring Codex, and writes nothing.
+const projectTrust = ({ cwd, trustProjectSettings }: StartSessionInput) =>
+	trustProjectSettings ? {} : { config: { projects: { [cwd]: { trust_level: "untrusted" } } } };
+
 const codexDecisions = {
 	allowOnce: "accept",
 	allowForSession: "acceptForSession",
@@ -662,6 +668,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					model: input.model,
 					cwd: input.cwd,
 					...threadPolicy,
+					...projectTrust(input),
 				} satisfies ThreadStartParams);
 
 				yield* Effect.gen(function* () {
@@ -675,6 +682,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 										model: input.model,
 										cwd: input.cwd,
 										...threadPolicy,
+										...projectTrust(input),
 									} satisfies ThreadResumeParams)
 									.pipe(
 										// A thread whose files are gone can never resume, so the chat goes on in a new one rather

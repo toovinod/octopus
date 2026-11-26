@@ -21,6 +21,8 @@ let turns = 0;
 let turnId = "";
 let interrupted = false;
 let experimentalApi = false;
+// The config overrides the thread was started or resumed with.
+let threadConfig: unknown = null;
 const waiting = new Map<number, (answer: Answer) => void>();
 
 const notify = (method: string, params: object) => send({ method, params });
@@ -162,6 +164,14 @@ const runTurn = async (
 				id: "msg-1",
 				text: JSON.stringify([params.approvalPolicy, params.sandboxPolicy?.type]),
 			},
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
+	if (text.includes("thread config")) {
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(threadConfig) },
 			threadId,
 			turnId,
 		});
@@ -399,6 +409,7 @@ const serve = async () => {
 					});
 					break;
 				}
+				threadConfig = message.params.config ?? null;
 				if (message.method === "thread/start") {
 					send({ id: message.id, result: { thread: { id: threadId } } });
 					break;

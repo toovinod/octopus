@@ -412,6 +412,24 @@ describe("CodexAdapter", () => {
 		});
 	});
 
+	// Codex trusts a folder for good once a workspace-write thread starts in it, then loads its .codex config.
+	test.each([
+		["starts", false, undefined, { projects: { [import.meta.dir]: { trust_level: "untrusted" } } }],
+		["resumes", false, "thread-old", { projects: { [import.meta.dir]: { trust_level: "untrusted" } } }],
+		["starts", true, undefined, null],
+	] as const)("%s a thread with trustProjectSettings %p", async (_, trustProjectSettings, resumeId, expected) => {
+		const reply = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("thread config"));
+					const events = yield* takeUntil(handle, "turn.completed");
+					return events.find((event) => event.type === "message.completed");
+				}),
+			{ ...newSession, trustProjectSettings, ...(resumeId === undefined ? {} : { resumeId }) },
+		);
+		expect(reply).toMatchObject({ text: JSON.stringify(expected) });
+	});
+
 	test("resumes an existing thread", async () => {
 		const id = await runSession((handle) => handle.nativeSessionId, {
 			...newSession,
