@@ -22,8 +22,8 @@ import {
 	updateSessionSettings,
 	useAppState,
 } from "../lib/store.ts";
-import { draftImageOf, MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
-import { type Draft, draftOf, keepDraft } from "../lib/drafts.ts";
+import { MAX_IMAGES_PER_MESSAGE, readImages } from "../lib/images.ts";
+import { addImages, type Draft, draftOf, keepDraft, withReturned } from "../lib/drafts.ts";
 import { memo, useEffect, useId, useRef, useState } from "react";
 import type { AgentInfo, AgentSession } from "@repo/contracts/AgentSession";
 import type { ChatState } from "../lib/chatReducer.ts";
@@ -56,7 +56,16 @@ export const Composer = memo(
 		readonly usage: ChatState["usage"];
 		readonly rateLimit: ChatState["rateLimit"];
 	}) => {
-		const [draft, setDraft] = useState<Draft>(() => draftOf(session.id));
+		const [draft, setShownDraft] = useState<Draft>(() => draftOf(session.id));
+		// Kept as the chat's draft at once, not after a render, so an update builds on the latest draft: two quick
+		// pastes see each other's images, and messages a Stop hands back after a switch to another chat still land.
+		const setDraft = (update: (current: Draft) => Draft) => {
+			const next = update(draftOf(session.id));
+			keepDraft(session.id, next);
+			setShownDraft(next);
+		};
+		const tooManyImages = () =>
+			toast(`A message can carry ${MAX_IMAGES_PER_MESSAGE} images at most, so some were left out.`, "info");
 		const [dragging, setDragging] = useState(false);
 		const textRef = useRef<HTMLTextAreaElement>(null);
 		const fileRef = useRef<HTMLInputElement>(null);
@@ -81,10 +90,6 @@ export const Composer = memo(
 		}, [token?.start, token?.query]);
 
 		useEffect(() => {
-			keepDraft(session.id, draft);
-		}, [session.id, draft]);
-
-		useEffect(() => {
 			textRef.current?.focus();
 		}, []);
 
@@ -94,9 +99,11 @@ export const Composer = memo(
 				toast(`${model?.label ?? "This model"} cannot read images. Pick another model to attach them.`, "info");
 				return;
 			}
-			const { images, problems } = await readImages(files, MAX_IMAGES_PER_MESSAGE - draft.images.length);
+			const { images, problems } = await readImages(files, MAX_IMAGES_PER_MESSAGE - draftOf(session.id).images.length);
 			for (const problem of problems) toast(problem, "info");
-			setDraft((current) => ({ ...current, images: [...current.images, ...images] }));
+			const added = addImages(draftOf(session.id), images, MAX_IMAGES_PER_MESSAGE);
+			if (added.leftOut > 0) tooManyImages();
+			setDraft(() => added.draft);
 		};
 
 		const removeImage = (id: string) =>
@@ -118,7 +125,7 @@ export const Composer = memo(
 			const text = draft.text.trim();
 			if (text === "" && draft.images.length === 0) return;
 			const { images } = draft;
-			setDraft({ text: "", images: [] });
+			setDraft(() => ({ text: "", images: [] }));
 			// A refused message comes back as a failed send above the composer, apart from the new draft.
 			void sendMessage(session.id, text, images, steer);
 		};
@@ -281,22 +288,9 @@ export const Composer = memo(
 									onClick={() =>
 										void interruptSession(session.id).then((dropped) => {
 											if (dropped === null || dropped.length === 0) return;
-											// Queued messages never ran, so they come back to be edited or sent again.
-											const returned = dropped.flatMap(({ images }) => images);
-											const room = MAX_IMAGES_PER_MESSAGE - draft.images.length;
-											if (returned.length > room) {
-												toast(
-													`A message can carry ${MAX_IMAGES_PER_MESSAGE} images at most, so some were left out.`,
-													"info",
-												);
-											}
-											const images = returned.slice(0, Math.max(0, room)).map(draftImageOf);
-											setDraft((current) => ({
-												text: [...dropped.map(({ text }) => text), current.text]
-													.filter((text) => text !== "")
-													.join("\n\n"),
-												images: [...images, ...current.images],
-											}));
+											const returned = withReturned(draftOf(session.id), dropped, MAX_IMAGES_PER_MESSAGE);
+											if (returned.leftOut > 0) tooManyImages();
+											setDraft(() => returned.draft);
 										})
 									}
 								>

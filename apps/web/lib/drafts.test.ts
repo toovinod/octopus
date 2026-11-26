@@ -1,4 +1,4 @@
-import { draftOf, keepDraft, releaseDrafts } from "./drafts.ts";
+import { addImages, draftOf, keepDraft, releaseDrafts, withReturned } from "./drafts.ts";
 import { describe, expect, spyOn, test } from "bun:test";
 
 const image = { id: "i", mediaType: "image/png", base64: "", previewUrl: "blob:preview" } as const;
@@ -18,5 +18,37 @@ describe("drafts", () => {
 		expect(draftOf("b").images).toEqual([]);
 		expect(revoke).toHaveBeenCalledWith("blob:preview");
 		revoke.mockRestore();
+	});
+});
+
+const imageNumbered = (n: number) => ({ ...image, id: `i${n}`, previewUrl: `blob:${n}` });
+
+describe("addImages", () => {
+	test("adds only as many images as the message still has room for, and gives back the rest", () => {
+		const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+		const full = [1, 2, 3].map(imageNumbered);
+		const first = addImages({ text: "", images: [] }, full, 4);
+		expect(first).toEqual({ draft: { text: "", images: full }, leftOut: 0 });
+		// A second paste read before the first one landed still cannot pass the limit.
+		const second = addImages(first.draft, [4, 5].map(imageNumbered), 4);
+		expect(second.draft.images.map(({ id }) => id)).toEqual(["i1", "i2", "i3", "i4"]);
+		expect(second.leftOut).toBe(1);
+		expect(revoke).toHaveBeenCalledWith("blob:5");
+		revoke.mockRestore();
+	});
+});
+
+describe("withReturned", () => {
+	test("puts the messages a stop handed back ahead of what is being typed", () => {
+		const returned = withReturned(
+			{ text: "still typing", images: [] },
+			[
+				{ text: "first", images: [] },
+				{ text: "", images: [] },
+				{ text: "second", images: [] },
+			],
+			4,
+		);
+		expect(returned).toEqual({ draft: { text: "first\n\nsecond\n\nstill typing", images: [] }, leftOut: 0 });
 	});
 });
