@@ -22,7 +22,9 @@ export class Auth extends Context.Service<
 			// Better Auth's callbacks are promise based, so they run here with this layer's services.
 			const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
 
-			// Better Auth needs a promise-based Drizzle client. Our own queries use CloudDatabase.
+			// Better Auth needs a promise-based Drizzle client. Our own queries use CloudDatabase, whose
+			// @effect/sql-pg pool is private and speaks its own protocol, so the two cannot share connections.
+			// An instance that provides both holds two pools: size Postgres' connection limit for both.
 			const client = yield* Effect.acquireRelease(
 				Effect.sync(() => new SQL(Redacted.value(config.databaseUrl))),
 				(client) => Effect.promise(() => client.close()),

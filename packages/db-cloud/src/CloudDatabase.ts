@@ -22,6 +22,7 @@ export const toCloudDatabaseError = (error: EffectDrizzleQueryError | SqlError):
 const makeDatabase = PgDrizzle.makeWithDefaults({ relations });
 export type CloudDrizzle = Effect.Success<typeof makeDatabase>;
 
+// Better Auth keeps its own Bun SQL pool (see Auth in @repo/auth), so a process with both holds two.
 export class CloudDatabase extends Context.Service<
 	CloudDatabase,
 	{
