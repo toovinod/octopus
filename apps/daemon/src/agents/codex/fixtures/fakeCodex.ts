@@ -254,6 +254,27 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("more access")) {
+		// A command that also asks for access past the sandbox, for this command or as a managed-network prompt.
+		const extra = text.includes("network host")
+			? { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }
+			: text.includes("nothing")
+				? { additionalPermissions: { network: null, fileSystem: null } }
+				: {
+						additionalPermissions: {
+							network: { enabled: true },
+							fileSystem: { read: null, write: ["/etc"], entries: [] },
+						},
+					};
+		await ask(700, "item/commandExecution/requestApproval", {
+			threadId,
+			turnId,
+			itemId: "cmd-1",
+			command: "bun install",
+			...extra,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("grant")) {
 		// A patch that also asks for writes under a root for the rest of the session.
 		await ask(600, "item/fileChange/requestApproval", {

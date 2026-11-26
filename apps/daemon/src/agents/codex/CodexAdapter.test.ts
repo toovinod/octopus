@@ -388,6 +388,27 @@ describe("CodexAdapter", () => {
 		});
 	});
 
+	test.each([
+		[
+			"more access, network host",
+			"bun install (also asks for network access to registry.npmjs.org over https)",
+			["allowOnce", "deny"],
+		],
+		["more access", "bun install (also asks for network access, write access to /etc)", ["allowOnce", "deny"]],
+		["more access, nothing", "bun install", ["allowOnce", "allowForSession", "deny"]],
+	])(
+		"a command approval asking for %s shows it and never widens access for the session",
+		async (text, summary, choices) => {
+			const requested = await runSession((handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage(text));
+					return (yield* takeUntil(handle, "approval.requested")).at(-1);
+				}),
+			);
+			expect(requested).toMatchObject({ kind: "command", summary, choices });
+		},
+	);
+
 	test("a resumed chat's approvals never reuse the ids of an earlier app-server", async () => {
 		const askOnce = (input: StartSessionInput) =>
 			runSession(

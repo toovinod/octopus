@@ -127,6 +127,21 @@ const approvalChoices = ["allowOnce", "allowForSession", "deny"] as const;
 const fileChangeChoices = (grantRoot: string | null | undefined) =>
 	grantRoot ? (["allowOnce", "deny"] as const) : approvalChoices;
 
+// What a command asks for past the sandbox, in words. Allowing any of it for the session would keep it for every
+// later command, which session approvals must never do, so such a command can only be allowed once.
+const extraAccess = ({ additionalPermissions, networkApprovalContext }: typeof CommandApprovalParams.Type) => {
+	const files = additionalPermissions?.fileSystem;
+	return [
+		networkApprovalContext
+			? `network access to ${networkApprovalContext.host} over ${networkApprovalContext.protocol}`
+			: null,
+		additionalPermissions?.network?.enabled ? "network access" : null,
+		files?.read?.length ? `read access to ${files.read.join(", ")}` : null,
+		files?.write?.length ? `write access to ${files.write.join(", ")}` : null,
+		files?.entries?.length ? "other file access" : null,
+	].filter(Predicate.isNotNull);
+};
+
 // Set on every thread so the user's own Codex config cannot turn Octopus's approvals off.
 const threadPolicy = {
 	approvalPolicy: "on-request",
@@ -469,14 +484,16 @@ const handleServerRequest = Effect.fnUntraced(function* (
 	switch (request.method) {
 		case "item/commandExecution/requestApproval": {
 			const params = yield* decodeCodex(CommandApprovalParams)(request.params);
+			const extra = extraAccess(params);
+			const command = params.command ?? "Run a command";
 			return yield* session.requestApproval(
 				{
 					requestId,
 					itemId: params.itemId,
 					kind: "command",
-					summary: params.command ?? "Run a command",
+					summary: extra.length === 0 ? command : `${command} (also asks for ${extra.join(", ")})`,
 					reason: params.reason ?? null,
-					choices: approvalChoices,
+					choices: extra.length === 0 ? approvalChoices : (["allowOnce", "deny"] as const),
 				},
 				respond,
 			);

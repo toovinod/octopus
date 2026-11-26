@@ -172,10 +172,32 @@ export const ServerRequestResolved = Schema.Struct({
 
 const optionalText = Schema.optionalKey(Schema.NullOr(Schema.String));
 
+const optionalPaths = Schema.optionalKey(Schema.NullOr(Schema.Array(Schema.String)));
+
 export const CommandApprovalParams = Schema.Struct({
 	itemId: Schema.String,
 	command: optionalText,
 	reason: optionalText,
+	// Access past the sandbox the command also asks for. Allowing it for the session would keep it.
+	additionalPermissions: Schema.optionalKey(
+		Schema.NullOr(
+			Schema.Struct({
+				network: Schema.optionalKey(Schema.NullOr(Schema.Struct({ enabled: Schema.NullOr(Schema.Boolean) }))),
+				fileSystem: Schema.optionalKey(
+					Schema.NullOr(
+						Schema.Struct({
+							read: optionalPaths,
+							write: optionalPaths,
+							entries: Schema.optionalKey(Schema.Array(Schema.Unknown)),
+						}),
+					),
+				),
+			}),
+		),
+	),
+	networkApprovalContext: Schema.optionalKey(
+		Schema.NullOr(Schema.Struct({ host: Schema.String, protocol: Schema.String })),
+	),
 });
 
 export const FileChangeApprovalParams = Schema.Struct({
