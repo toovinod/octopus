@@ -451,6 +451,13 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, i
 				if (isAuthFailureText(failure)) {
 					return yield* new AgentAuthError({ agent: "claude", cause: failure });
 				}
+				// A tool claude cut off, as on a Stop, never gets a result, so it ends with claude's turn rather than
+				// running forever in the chat.
+				for (const [itemId, tool] of tools) {
+					yield* session.emit({ type: "tool.completed", itemId, tool, status: "failed", output: null });
+				}
+				tools.clear();
+				cardTools.clear();
 				const usage = yield* Ref.getAndSet(lastUsage, Option.none());
 				if (Option.isSome(usage)) {
 					yield* session.emit({

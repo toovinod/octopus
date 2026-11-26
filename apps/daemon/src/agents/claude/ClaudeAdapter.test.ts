@@ -860,6 +860,14 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(events).toEqual([
 			{ type: "approval.resolved", requestId: "toolu_1", outcome: "cancelled" },
+			// Claude cut the tool off, so it never sends its result. It ends with the turn instead of running forever.
+			{
+				type: "tool.completed",
+				itemId: "toolu_1",
+				tool: { kind: "command", command: "bun test", cwd: null },
+				status: "failed",
+				output: null,
+			},
 			{
 				type: "turn.completed",
 				turnId: "result-1",
