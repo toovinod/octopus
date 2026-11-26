@@ -1,5 +1,5 @@
+import { shortcutKey, shortcutLabel } from "./shortcutKey.ts";
 import { describe, expect, test } from "bun:test";
-import { shortcutKey } from "./shortcutKey.ts";
 
 const press = (key: string, modifiers: { meta?: boolean; ctrl?: boolean; alt?: boolean; repeat?: boolean } = {}) => ({
 	key,
@@ -25,5 +25,13 @@ describe("shortcutKey", () => {
 		expect(shortcutKey(press("t", { meta: true, repeat: true }), true, false)).toBeNull();
 		expect(shortcutKey(press("t", { meta: true, alt: true }), true, false)).toBeNull();
 		expect(shortcutKey(press("t", { meta: true }), true, true)).toBeNull();
+	});
+});
+
+describe("shortcutLabel", () => {
+	test("shows the key that makes the shortcut on this system", () => {
+		expect(shortcutLabel("T", true)).toBe("⌘T");
+		expect(shortcutLabel("T", false)).toBe("Ctrl+T");
+		expect(shortcutLabel(",", false)).toBe("Ctrl+,");
 	});
 });

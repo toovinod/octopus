@@ -1,5 +1,6 @@
 "use client";
 
+import { useShortcutLabel } from "../lib/shortcutKey.ts";
 import { OctopusLogo } from "./OctopusLogo.tsx";
 import {
 	closeTab,
@@ -211,9 +212,10 @@ const ChatTab = memo(
 
 const NewChatMenu = () => {
 	const agents = useAppState((current) => current.agents);
+	const shortcut = useShortcutLabel("T");
 	return (
 		<DropdownMenu>
-			<Hint label="New chat (⌘T)">
+			<Hint label={`New chat (${shortcut})`}>
 				<DropdownMenuTrigger asChild>
 					<Button variant="ghost" size="icon-sm" aria-label="New chat">
 						<PlusIcon />
@@ -238,7 +240,7 @@ const EmptyWorkspace = ({ name }: { readonly name: string }) => (
 		<p className="text-muted-foreground">No chat is open in {name}.</p>
 		<Button variant="default" onClick={() => void newChat()}>
 			Start a chat
-			<Kbd className="bg-primary-foreground/15 text-primary-foreground">⌘T</Kbd>
+			<Kbd className="bg-primary-foreground/15 text-primary-foreground">{useShortcutLabel("T")}</Kbd>
 		</Button>
 	</div>
 );

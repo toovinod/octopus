@@ -1,5 +1,6 @@
 "use client";
 
+import { useShortcutLabel } from "../lib/shortcutKey.ts";
 import {
 	Sidebar as SidebarRoot,
 	SidebarContent,
@@ -114,11 +115,11 @@ export const Sidebar = () => {
 		<SidebarRoot collapsible="none" className="w-full">
 			<SidebarHeader className="pt-3">
 				<SidebarMenu className="gap-0.5">
-					<SidebarAction icon={<SquarePenIcon />} label="New chat" shortcut="⌘T" onClick={() => void newChat()} />
+					<SidebarAction icon={<SquarePenIcon />} label="New chat" shortcut="T" onClick={() => void newChat()} />
 					<SidebarAction
 						icon={<SearchIcon />}
 						label="Search"
-						shortcut="⌘K"
+						shortcut="K"
 						onClick={() => openDialog({ kind: "palette" })}
 					/>
 				</SidebarMenu>
@@ -147,7 +148,7 @@ export const Sidebar = () => {
 					<SidebarAction
 						icon={<SettingsIcon />}
 						label="Settings"
-						shortcut="⌘,"
+						shortcut=","
 						onClick={() => openDialog({ kind: "settings", tab: "accounts" })}
 					/>
 				</SidebarMenu>
@@ -171,7 +172,7 @@ const SidebarAction = ({
 		<SidebarMenuButton size="sm" onClick={onClick} className="text-muted-foreground">
 			{icon}
 			<span className="flex-1">{label}</span>
-			<Kbd className="bg-transparent opacity-0 group-hover/menu-item:opacity-100">{shortcut}</Kbd>
+			<Kbd className="bg-transparent opacity-0 group-hover/menu-item:opacity-100">{useShortcutLabel(shortcut)}</Kbd>
 		</SidebarMenuButton>
 	</SidebarMenuItem>
 );
