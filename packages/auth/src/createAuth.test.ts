@@ -147,4 +147,25 @@ describe.skipIf(Option.isNone(serverUrl))("createAuth", () => {
 		expect((await first.post("/organization/delete", token, { organizationId: id })).status).toBe(200);
 		expect(first.events).toContainEqual({ _tag: "organizationDeleted", organizationId: id });
 	});
+
+	// Better Auth refuses a second invitation to a pending address, but two sent at once both get through.
+	test("accepting two pending invitations to one org makes the user a member once", async () => {
+		const [ownerToken = ""] = await signIn(first.sql, "user_inviter", ["session_inviter"]);
+		const created = await first.post("/organization/create", ownerToken, { name: "Acme", slug: "acme-invites" });
+		const { id } = Schema.decodeUnknownSync(Schema.Struct({ id: Schema.String }))(await created.json());
+		const [inviteeToken = ""] = await signIn(first.sql, "user_invitee", ["session_invitee"]);
+		for (const invitationId of ["invitation_a", "invitation_b"]) {
+			await first.sql`insert into invitation (id, organization_id, email, role, status, expires_at, created_at, inviter_id)
+				values (${invitationId}, ${id}, 'user_invitee@example.com', 'member', 'pending', now() + interval '1 day', now(), 'user_inviter')`;
+		}
+		expect(
+			(await first.post("/organization/accept-invitation", inviteeToken, { invitationId: "invitation_a" })).status,
+		).toBe(200);
+		expect(
+			(await first.post("/organization/accept-invitation", inviteeToken, { invitationId: "invitation_b" })).ok,
+		).toBe(false);
+		expect(await first.sql`select count(*)::int as count from member where user_id = 'user_invitee'`).toEqual([
+			{ count: 1 },
+		]);
+	});
 });
