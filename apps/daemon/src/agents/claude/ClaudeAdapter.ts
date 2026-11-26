@@ -135,14 +135,35 @@ const models: AgentModels = {
 	defaultModel: "claude-opus-5-5",
 };
 
-// A key or token in the shell that started Octopus would make claude bill the API instead of the
-// subscription, or bill another key than the one stored for Octopus. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
-const apiCredentials = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
-const withoutApiCredentials = ({
-	ANTHROPIC_API_KEY: _key,
-	ANTHROPIC_AUTH_TOKEN: _token,
-	...env
-}: SpawnOptions["env"]): SpawnOptions["env"] => env;
+// What would make claude bill the API instead of the subscription, bill another key than the one stored for
+// Octopus, or send its requests elsewhere: a key or token, another API host, or a cloud provider.
+// CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
+const credentialEnv = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"CLAUDE_CODE_USE_MANTLE",
+	"CLAUDE_CODE_USE_GATEWAY",
+] as const;
+const credentialNames = new Set<string>(credentialEnv);
+const unsetCredentials = Object.fromEntries(credentialEnv.map((name) => [name, undefined]));
+const withoutCredentials = (env: SpawnOptions["env"]): SpawnOptions["env"] =>
+	Object.fromEntries(Object.entries(env).filter(([name]) => !credentialNames.has(name)));
+
+// claude also takes these from the env block of its settings files, and a key from their apiKeyHelper. Flag settings
+// outrank every settings file, and empty values turn them off, but they never override claude's own environment
+// (checked with claude 2.1.332), so the environment is cleaned as well. An API key session keeps the key Octopus gives it.
+const credentialSettings = (mode: StartSessionInput["auth"]["mode"]) => ({
+	apiKeyHelper: "",
+	env: Object.fromEntries(
+		credentialEnv.filter((name) => mode === "subscription" || name !== "ANTHROPIC_API_KEY").map((name) => [name, ""]),
+	),
+});
 
 // claude prints the sign-in link as an OSC 8 hyperlink and as text. Both hold the same URL, and
 // requiring the character after it keeps a link split across two reads from matching early.
@@ -508,7 +529,14 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 			const checkAuth = Effect.gen(function* () {
 				const { executable } = yield* ClaudeAdapterConfig;
 				const output = yield* spawner
-					.string(ChildProcess.make(executable, ["auth", "status", "--json"], { env: apiCredentials, extendEnv: true }))
+					.string(
+						ChildProcess.make(
+							executable,
+							// Flag settings must come before the subcommand.
+							["--settings", JSON.stringify(credentialSettings("subscription")), "auth", "status", "--json"],
+							{ env: unsetCredentials, extendEnv: true },
+						),
+					)
 					.pipe(Effect.mapError(toAgentError(executable, "Could not run claude auth status.")));
 				const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ClaudeAuthStatus))(output);
 				if (Option.isNone(decoded)) {
@@ -726,10 +754,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// and approving a plan in Full access do. Only a trusted project may offer that mode.
 					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
+					settings: credentialSettings(input.auth.mode),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
 						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
-						const env = withoutApiCredentials(spawnOptions.env);
+						const env = withoutCredentials(spawnOptions.env);
 						const child = spawnInProcessGroup({
 							...spawnOptions,
 							env:

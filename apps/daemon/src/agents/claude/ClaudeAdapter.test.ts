@@ -489,16 +489,35 @@ describe("ClaudeAdapter", () => {
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
 	});
 
-	test("subscription mode never hands claude an API key or auth token from the environment", async () => {
+	test("checks the claude.ai login, not an apiKeyHelper from claude's settings file", async () => {
+		process.env.FAKE_CLAUDE_API_KEY_HELPER = "1";
+		const status = await runWithClaude(Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth)).finally(() => {
+			delete process.env.FAKE_CLAUDE_API_KEY_HELPER;
+		});
+		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
+	});
+
+	test("subscription mode never hands claude another credential, API host or cloud provider from the environment", async () => {
 		const printed = await runSession(() =>
 			Effect.promise(async () => {
 				const spawnClaude = startedWith.at(-1)?.spawnClaudeCodeProcess;
 				if (spawnClaude === undefined) return "no spawn hook";
 				const child = spawnClaude({
 					command: "sh",
-					args: ["-c", 'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$KEEP"'],
+					args: [
+						"-c",
+						'printf "%s|%s|%s|%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_BASE_URL" "$CLAUDE_CODE_USE_BEDROCK" "$CLAUDE_CODE_USE_VERTEX" "$KEEP"',
+					],
 					cwd: "/",
-					env: { PATH: "/bin:/usr/bin", ANTHROPIC_API_KEY: "sk-shell", ANTHROPIC_AUTH_TOKEN: "tok", KEEP: "kept" },
+					env: {
+						PATH: "/bin:/usr/bin",
+						ANTHROPIC_API_KEY: "sk-shell",
+						ANTHROPIC_AUTH_TOKEN: "tok",
+						ANTHROPIC_BASE_URL: "https://proxy.example.com",
+						CLAUDE_CODE_USE_BEDROCK: "1",
+						CLAUDE_CODE_USE_VERTEX: "1",
+						KEEP: "kept",
+					},
 					signal: new AbortController().signal,
 				});
 				let text = "";
@@ -506,7 +525,30 @@ describe("ClaudeAdapter", () => {
 				return text;
 			}),
 		);
-		expect(printed).toBe("||kept");
+		expect(printed).toBe("|||||kept");
+	});
+
+	test("subscription mode empties the credentials claude's settings files could set, so it uses the claude.ai login", async () => {
+		await runSession(() => Effect.void);
+		expect(startedWith.at(-1)?.settings).toEqual({
+			apiKeyHelper: "",
+			env: expect.objectContaining({
+				ANTHROPIC_API_KEY: "",
+				ANTHROPIC_AUTH_TOKEN: "",
+				ANTHROPIC_BASE_URL: "",
+				CLAUDE_CODE_USE_BEDROCK: "",
+				CLAUDE_CODE_USE_VERTEX: "",
+			}),
+		});
+	});
+
+	test("API key mode empties every other credential claude's settings files could set, but not its own key", async () => {
+		await runSession(() => Effect.void, {
+			input: { ...newSession, auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } },
+		});
+		const settings = startedWith.at(-1)?.settings;
+		expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_BASE_URL: "" } });
+		expect(typeof settings === "object" && "ANTHROPIC_API_KEY" in (settings.env ?? {})).toBe(false);
 	});
 
 	describe("sign-in", () => {
