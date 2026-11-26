@@ -20,6 +20,8 @@ const threadId = "thread-new";
 let turns = 0;
 let turnId = "";
 let interrupted = false;
+// Codex can end a turn before its turn/completed reaches Octopus.
+let turnEnded = false;
 let experimentalApi = false;
 // The config overrides the thread was started or resumed with.
 let threadConfig: unknown = null;
@@ -487,6 +489,7 @@ const serve = async () => {
 			case "turn/start": {
 				turnId = `turn-${++turns}`;
 				interrupted = false;
+				turnEnded = false;
 				const text: string = message.params.input[0].text;
 				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
 				// Never answered, like a hung app-server.
@@ -499,6 +502,12 @@ const serve = async () => {
 					reply();
 					break;
 				}
+				if (text.includes("ends quietly")) {
+					reply();
+					turnEnded = true;
+					setTimeout(() => completeTurn("completed"), 300);
+					break;
+				}
 				if (text.includes("slow")) {
 					setTimeout(reply, 200);
 					setTimeout(() => interrupted || completeTurn("completed"), 400);
@@ -508,6 +517,11 @@ const serve = async () => {
 				void runTurn(text, message.params);
 				break;
 			}
+			// Answered only once the turn ended, like a steer that lost the race with it. Otherwise never answered,
+			// like a hung app-server.
+			case "turn/steer":
+				if (turnEnded) send({ id: message.id, error: { code: -32600, message: "no active turn to steer" } });
+				break;
 			case "turn/interrupt":
 				if (message.params.turnId !== turnId) {
 					send({ id: message.id, error: { code: -32602, message: `no running turn ${message.params.turnId}` } });

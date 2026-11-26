@@ -560,6 +560,9 @@ const skipUnreadable = Effect.fnUntraced(function* (
 	});
 });
 
+// What Codex answers a turn/steer once the turn it named has ended.
+const isEndedTurn = (error: AgentError) => /no active turn/i.test(error.message);
+
 // What Codex answers a thread/resume whose thread it has no record of.
 const isMissingThread = (error: AgentError) =>
 	error._tag === "AgentProtocolError" && /no rollout found|thread not found/i.test(error.message);
@@ -848,12 +851,26 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							const state = yield* Ref.get(currentTurn);
 							// Codex steers only a turn it has named, so earlier the message waits for its own turn.
 							if (state._tag !== "running") return false;
-							yield* client.request("turn/steer", {
-								threadId,
-								input: yield* toInput(message),
-								expectedTurnId: state.turnId,
-							} satisfies TurnSteerParams);
-							return true;
+							return yield* client
+								.request("turn/steer", {
+									threadId,
+									input: yield* toInput(message),
+									expectedTurnId: state.turnId,
+								} satisfies TurnSteerParams)
+								.pipe(
+									Effect.as(true),
+									// The turn can end while the steer is on its way, and Codex may say so before its
+									// turn/completed arrives. The message then waits for its own turn instead of failing.
+									Effect.catchTag("AgentProtocolError", (error) =>
+										Effect.gen(function* () {
+											const now = yield* Ref.get(currentTurn);
+											const sameTurn = now._tag === "running" && now.turnId === state.turnId;
+											if (sameTurn && !isEndedTurn(error)) return yield* error;
+											yield* Effect.logInfo("A steer missed the end of its turn, so it waits for the next one");
+											return false;
+										}),
+									),
+								);
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
 					listCommands: Effect.map(listSkills, (skills) =>
