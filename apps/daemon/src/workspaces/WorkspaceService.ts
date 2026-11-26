@@ -139,9 +139,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			const startSetupScript = (scriptRunId: string, script: string, cwd: string, delay = Duration.zero) =>
 				startScript(scriptRunId, (onLine) =>
 					Effect.sleep(delay).pipe(
-						Effect.andThen(
-							runSetupScript({ scriptRunId, script, cwd, onLine }).pipe(Semaphore.withPermit(setupPermits)),
-						),
+						Effect.andThen(runSetupScript({ scriptRunId, script, cwd, onLine, permits: setupPermits })),
 					),
 				);
 

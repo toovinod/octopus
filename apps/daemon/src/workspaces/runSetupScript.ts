@@ -1,5 +1,5 @@
+import { Duration, Effect, Fiber, PubSub, Random, Schedule, Schema, Semaphore, Stream } from "effect";
 import { IllegalJobTransitionError, type JobEvent, transitionJob } from "../jobs/transitionJob.ts";
-import { Duration, Effect, Fiber, PubSub, Random, Schedule, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
@@ -44,7 +44,8 @@ type ScriptError = ScriptExitError | ScriptTimeoutError | ScriptSpawnError;
 const isRetryable = (error: ScriptError) => error._tag !== "ScriptExitError";
 
 // The wait before retrying a setup script after its `attempts`th failed attempt: doubling from the base, with
-// jitter so runs that failed together do not all retry at once. Retries and a restart's recovery both use it.
+// jitter so runs that failed together do not all retry at once. The retry schedule below waits the same, and a
+// restart's recovery uses this to wait out a delay it cut short.
 export const setupRetryDelay = (base: Duration.Duration, attempts: number) =>
 	Random.next.pipe(Effect.map((random) => Duration.times(base, 2 ** (attempts - 1) * (0.8 + 0.4 * random))));
 
@@ -129,6 +130,8 @@ export const runSetupScript = Effect.fn("runSetupScript")(
 		readonly script: string;
 		readonly cwd: string;
 		readonly onLine: (line: string) => void;
+		// Held for each attempt only, so a run waiting out its retry delay leaves room for the others.
+		readonly permits: Semaphore.Semaphore;
 	}) {
 		const settings = yield* SetupScriptSettings;
 
@@ -172,10 +175,10 @@ export const runSetupScript = Effect.fn("runSetupScript")(
 		});
 
 		yield* attempt.pipe(
+			Semaphore.withPermit(run.permits),
+			// The job's attempts cap the retries: past them it is dead-lettered, which schedules no retry.
 			Effect.retry({
-				schedule: Schedule.forever.pipe(
-					Schedule.modifyDelay(({ attempt }) => setupRetryDelay(settings.retryBaseDelay, attempt)),
-				),
+				schedule: Schedule.exponential(settings.retryBaseDelay).pipe(Schedule.jittered),
 				while: (error) => error._tag === "ScriptRetryScheduled",
 			}),
 		);

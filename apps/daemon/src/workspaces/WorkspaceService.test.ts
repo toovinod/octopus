@@ -574,6 +574,31 @@ describe("WorkspaceService", () => {
 		]);
 	});
 
+	test("a setup script waiting out its retry delay lets the next one run", async () => {
+		const run = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				// Only the `fast` workspace's script finishes; the others time out and wait to retry.
+				const project = yield* addProject(
+					tempDir,
+					'if [ "$(git branch --show-current)" = fast ]; then echo ok; else sleep 5; fi',
+				);
+				const names = [...Array.from({ length: SETUP_SCRIPTS_AT_ONCE }, (_, index) => `slow-${index}`), "fast"];
+				const created = yield* Effect.forEach(names, (name) =>
+					workspaces.create({ kind: "worktree", projectId: project.id, name }),
+				);
+				return yield* waitForScriptRun(created.at(-1)?.id ?? "");
+			}).pipe(
+				Effect.provideService(SetupScriptSettings, {
+					timeout: Duration.millis(100),
+					maxAttempts: 3,
+					retryBaseDelay: Duration.minutes(1),
+				}),
+			),
+		);
+		expect(run?.status).toBe("completed");
+	});
+
 	test("a timed-out setup script is retried, then dead-lettered", async () => {
 		const run = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
