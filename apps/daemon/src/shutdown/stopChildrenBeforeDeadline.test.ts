@@ -31,4 +31,35 @@ describe("StopChildrenBeforeDeadline", () => {
 		}).pipe(Effect.scoped, Effect.runPromise);
 		expect(stopped._tag).toBe("Some");
 	});
+
+	test("a stop under way still finishes, SIGKILLs included, when the layers close", async () => {
+		const finished = await Effect.gen(function* () {
+			const started = yield* Deferred.make<void>();
+			let done = false;
+			const layer = StopChildrenBeforeDeadline.pipe(
+				Layer.provide([
+					Layer.succeed(Shutdown, Shutdown.of({ request: () => Effect.void, requested: Effect.succeed("rpc") })),
+					Layer.succeed(
+						ProcessRegistry,
+						ProcessRegistry.of({
+							add: () => Effect.void,
+							remove: () => Effect.void,
+							stopAll: Deferred.succeed(started, undefined).pipe(
+								Effect.andThen(Effect.sleep(Duration.millis(300))),
+								Effect.andThen(
+									Effect.sync(() => {
+										done = true;
+									}),
+								),
+							),
+						}),
+					),
+					Layer.succeed(ShutdownSettings, { deadline: Duration.sum(STOP_GRACE, STOP_CHILDREN_MARGIN) }),
+				]),
+			);
+			yield* Effect.scoped(Layer.build(layer).pipe(Effect.andThen(Deferred.await(started))));
+			return done;
+		}).pipe(Effect.runPromise);
+		expect(finished).toBe(true);
+	});
 });

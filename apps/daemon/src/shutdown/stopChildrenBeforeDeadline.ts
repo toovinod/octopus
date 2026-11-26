@@ -23,7 +23,9 @@ export const StopChildrenBeforeDeadline = Layer.effectDiscard(
 		yield* shutdown.requested.pipe(
 			Effect.andThen(Effect.sleep(wait)),
 			Effect.andThen(Effect.logWarning("Shutdown is taking long, stopping every child that is left")),
-			Effect.andThen(registry.stopAll),
+			// Once begun, a stop runs to its SIGKILLs even when this layer closes, since a child whose owner has
+			// already let go is only reachable from here.
+			Effect.andThen(Effect.uninterruptible(registry.stopAll)),
 			Effect.forkScoped,
 		);
 	}),
