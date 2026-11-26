@@ -230,7 +230,7 @@ describe("LocalDatabase", () => {
 		expect(sessions).toEqual([{ id: "s1" }]);
 	});
 
-	test("lists the images of messages sent before the attachment lookup existed", async () => {
+	test("lists the images of messages sent before the attachment lookup existed, past a corrupt one", async () => {
 		const migrations = embeddedMigrations();
 		const before = migrations.slice(
 			0,
@@ -256,6 +256,8 @@ describe("LocalDatabase", () => {
 					yield* client`INSERT INTO workspace (id, projectId, name, kind, path, branch, baseBranch, status, createdAt) VALUES ('w1', 'p1', 'repo', 'inPlace', '/repo', 'main', 'main', 'active', '')`;
 					yield* client`INSERT INTO agentSession (id, workspaceId, agent, model, authMode, status, createdAt, updatedAt) VALUES ('s1', 'w1', 'codex', 'gpt', 'subscription', 'idle', '', '')`;
 					yield* client`INSERT INTO sessionEvent (id, sessionId, sequence, type, payload, createdAt) VALUES ('e1', 's1', 0, 'user.message', ${message}, '')`;
+					// A row a crash cut short must not stop the upgrade.
+					yield* client`INSERT INTO sessionEvent (id, sessionId, sequence, type, payload, createdAt) VALUES ('e2', 's1', 1, 'user.message', '{"type":"user.mess', '')`;
 				}).pipe(Effect.provide(SqliteClient.layer({ filename: join(dataDir, DATABASE_FILE_NAME) })));
 				return yield* withDatabase(
 					LocalDatabase.use((database) =>

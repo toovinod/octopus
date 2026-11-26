@@ -1,4 +1,4 @@
-import sessionAttachmentBackfill from "./migrations/20261126183120_sessionAttachmentBackfill/migration.sql" with {
+import sessionAttachmentBackfill from "./migrations/20261126192017_sessionAttachmentBackfill/migration.sql" with {
 	type: "text",
 };
 import sessionAttachment from "./migrations/20261126183115_sessionAttachment/migration.sql" with { type: "text" };
@@ -19,7 +19,7 @@ const migrationFiles = [
 	{ name: "20261124194508_sessionMode", sql: sessionMode },
 	{ name: "20261124201152_workspaceFromFork", sql: workspaceFromFork },
 	{ name: "20261126183115_sessionAttachment", sql: sessionAttachment },
-	{ name: "20261126183120_sessionAttachmentBackfill", sql: sessionAttachmentBackfill },
+	{ name: "20261126192017_sessionAttachmentBackfill", sql: sessionAttachmentBackfill },
 ] as const;
 
 // Mirrors drizzle's readMigrationFiles so hashes match migrations applied from the folder.
