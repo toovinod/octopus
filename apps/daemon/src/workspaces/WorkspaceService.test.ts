@@ -685,7 +685,9 @@ describe("WorkspaceService", () => {
 				const projects = yield* ProjectService;
 				const workspaces = yield* WorkspaceService;
 				const project = yield* addProject(tempDir);
-				yield* projects.updateScripts(project.id, { setupScript: null, runScript: "echo serving; sleep 30" });
+				// exec keeps the shell from forking after the line is printed: a stop that lands while it forks would
+				// miss the new child, which then outlives SIGTERM until the stop grace runs out and SIGKILL reaches it.
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: "echo serving; exec sleep 30" });
 				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
 				const started = yield* workspaces.startRunScript(created.id);
 				const again = yield* workspaces.startRunScript(created.id);
