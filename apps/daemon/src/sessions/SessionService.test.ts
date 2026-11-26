@@ -1467,9 +1467,12 @@ describe("SessionService", () => {
 		});
 	});
 
-	test("a steer the agent rejects leaves no message in history and no image on disk", async () => {
+	test("a steer that reaches the agent after its turn ended runs as the next turn", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
-		// A turn that keeps running, so the next message steers, and an agent that rejects every steer.
+		const finish = Effect.runSync(Deferred.make<void>());
+		let turns = 0;
+		// The first turn is still running when the steer is sent, but the agent ends it before the steer lands, as
+		// Codex refuses a turn/steer for a turn that just completed.
 		const codex: AgentAdapter = {
 			...replay,
 			capabilities: { ...replay.capabilities, steerWhileRunning: true },
@@ -1478,8 +1481,15 @@ describe("SessionService", () => {
 					const session = yield* makeAgentSession({ ...replay.capabilities, steerWhileRunning: true });
 					yield* session.setNativeSessionId("thread-steer");
 					return yield* session.start({
-						startTurn: () => session.emit({ type: "message.completed", itemId: "working", text: "working" }),
-						steerTurn: () => Effect.fail(new AgentProtocolError({ message: "No active turn", cause: null })),
+						startTurn: () =>
+							Effect.gen(function* () {
+								turns++;
+								const turnId = `turn-${turns}`;
+								yield* session.emit({ type: "message.completed", itemId: turnId, text: "working" });
+								if (turns === 1) yield* Deferred.await(finish);
+								yield* session.emit({ type: "turn.completed", turnId, result: { status: "completed" } });
+							}),
+						steerTurn: () => Effect.fail(new AgentProtocolError({ message: "No active turn to steer", cause: null })),
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
 						listCommands: Effect.succeed([]),
@@ -1498,21 +1508,35 @@ describe("SessionService", () => {
 					const session = yield* addSession(tempDir);
 					yield* sessions.sendMessage(session.id, "first", [], false);
 					yield* waitForStored(session.id, 3);
-					const error = yield* Effect.flip(sessions.sendMessage(session.id, "steer", [image], true));
-					// Give a wrongly recorded message time to reach the database.
-					yield* Effect.sleep("100 millis");
-					const directory = join(tempDir, "data", "attachments", session.id);
+					yield* sessions.sendMessage(session.id, "steer", [image], true);
+					yield* Deferred.succeed(finish, undefined);
+					const stored = yield* waitForStored(session.id, 7);
+					yield* waitForStatus(session.id, "idle");
 					return {
-						error,
-						types: (yield* storedEvents(session.id)).map((row) => row.type),
-						files: (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [],
+						messages: stored.flatMap((row) => {
+							const event = Schema.decodeUnknownSync(AgentEvent)(row.payload);
+							return event.type === "user.message" ? [[event.text, event.attachments.length]] : [];
+						}),
+						types: stored.map((row) => row.type),
+						files: yield* fs.readDirectory(join(tempDir, "data", "attachments", session.id)),
 					};
 				}),
 			),
 		);
-		expect(result.error._tag).toBe("AgentUnavailableError");
-		expect(result.types).toEqual(["session.started", "user.message", "message.completed"]);
-		expect(result.files).toEqual([]);
+		expect(result.types).toEqual([
+			"session.started",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+		]);
+		expect(result.messages).toEqual([
+			["first", 0],
+			["steer", 1],
+		]);
+		expect(result.files.length).toBe(1);
 	});
 
 	test("a send cancelled before the agent takes it leaves the session idle and no image on disk", async () => {

@@ -718,7 +718,17 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
 				// A queued message dropped before its turn is never stored, so nothing will ask for its images.
 				const discard = Effect.forEach(message.images, ({ path }) => removeImage(path), { discard: true });
-				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn, discard }).pipe(
+				const queue = { beforeTurn, discard };
+				const sent = yield* runtime.handle.sendMessage(message, { ...queue, steer }).pipe(
+					// The turn can end between the agent saying it runs and the steer reaching it, and Codex then
+					// refuses the steer. The message waits for its own turn instead of failing.
+					Effect.catchTag("AgentProtocolError", (error) =>
+						steer
+							? Effect.logWarning("The agent refused a steer, so the message waits for its own turn", error).pipe(
+									Effect.andThen(runtime.handle.sendMessage(message, queue)),
+								)
+							: Effect.fail(error),
+					),
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>
