@@ -172,6 +172,7 @@ const loadProjects = async () => {
 		)
 	).flat();
 	const sessionIds = new Set(sessions.map((session) => session.id));
+	const before = state.sessions;
 	const kept = <A>(record: Readonly<Record<string, A>>) =>
 		Object.fromEntries(Object.entries(record).filter(([sessionId]) => sessionIds.has(sessionId)));
 	const selectionGone =
@@ -188,6 +189,11 @@ const loadProjects = async () => {
 		...(selectionGone ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionGone) closeChat();
+	// After an outage the watch missed what changed meanwhile, so the reload raises the attention it would have.
+	for (const session of sessions) {
+		const prior = before[session.id];
+		if (prior !== undefined) noticeChange(prior, session);
+	}
 };
 
 export const boot = async () => {

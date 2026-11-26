@@ -447,6 +447,21 @@ describe("reconnecting after deletions", () => {
 	});
 });
 
+describe("reconnecting after an outage", () => {
+	test("a turn that finished or asked for approval meanwhile gets the user's attention", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		const other = (id: string, status: string, updatedAt: string) => ({ ...session, id, status, updatedAt });
+		sessionLists.push([session, other("done", "running", "2"), other("asks", "running", "2")]);
+		await boot();
+		expect(getState().selectedSessionId).toBe("s");
+		sessionLists.push([session, other("done", "idle", "3"), other("asks", "awaitingApproval", "3")]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		expect(getState().attention.done).toBe("done");
+		expect(getState().attention.asks).toBe("approval");
+	});
+});
+
 describe("watching sign-ins", () => {
 	test("says so when the watch fails for another reason than a dropped socket", async () => {
 		const shown = spyOn(sonnerToast, "error");
