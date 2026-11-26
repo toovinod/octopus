@@ -111,6 +111,8 @@ mock.module("./daemonRuntime.ts", () => ({
 	errorTag,
 }));
 
+const desktop = await import("./desktop.ts");
+
 const {
 	boot,
 	closeTab,
@@ -459,6 +461,24 @@ describe("reconnecting after an outage", () => {
 		await sleep(300);
 		expect(getState().attention.done).toBe("done");
 		expect(getState().attention.asks).toBe("approval");
+	});
+
+	test("alerts once for everything that changed meanwhile, not once per chat", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		const chime = spyOn(desktop, "playChime").mockImplementation(() => {});
+		const notify = spyOn(desktop, "showNotification").mockResolvedValue(undefined);
+		const other = (id: string, status: string, updatedAt: string) => ({ ...session, id, status, updatedAt });
+		sessionLists.push([session, other("a", "running", "2"), other("b", "running", "2"), other("c", "running", "2")]);
+		await boot();
+		Object.assign(globalThis.document, { hasFocus: () => false });
+		sessionLists.push([session, other("a", "idle", "3"), other("b", "idle", "3"), other("c", "awaitingApproval", "3")]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		Object.assign(globalThis.document, { hasFocus: () => true });
+		expect(chime).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls).toEqual([["Octopus", "3 chats need your attention."]]);
+		chime.mockRestore();
+		notify.mockRestore();
 	});
 });
 

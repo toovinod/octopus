@@ -191,11 +191,17 @@ const loadProjects = async () => {
 		...(selectionGone ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionGone) closeChat();
-	// After an outage the watch missed what changed meanwhile, so the reload raises the attention it would have.
-	for (const session of sessions) {
+	// After an outage the watch missed what changed meanwhile, so the reload raises the attention it would have,
+	// with one alert for all of it rather than a chime per chat.
+	const noticed = sessions.flatMap((session) => {
 		const prior = before[session.id];
-		if (prior !== undefined) noticeChange(prior, session);
-	}
+		const attention = prior === undefined ? null : markAttention(prior, session);
+		return attention === null ? [] : [{ session, attention }];
+	});
+	const [first] = noticed;
+	if (first === undefined) return;
+	if (noticed.length === 1) alertUser(first.session.id, sessionTitle(first.session), ATTENTION_BODIES[first.attention]);
+	else alertUser(first.session.id, "Octopus", `${noticed.length} chats need your attention.`);
 };
 
 export const boot = async () => {
@@ -358,7 +364,14 @@ const reconnect = (attempt: number) => {
 	}, reconnectDelay(attempt));
 };
 
-const noticeChange = (before: AgentSession, after: AgentSession) => {
+const ATTENTION_BODIES = {
+	approval: "The agent needs your approval.",
+	done: "The turn finished.",
+	failed: "The turn failed.",
+} satisfies Record<Attention, string>;
+
+// Marks a chat whose change needs the user, unless they are looking at it. Returns what it needs, or null.
+const markAttention = (before: AgentSession, after: AgentSession): Attention | null => {
 	const attention: Attention | null =
 		after.status === "awaitingApproval" && before.status !== "awaitingApproval"
 			? "approval"
@@ -367,21 +380,24 @@ const noticeChange = (before: AgentSession, after: AgentSession) => {
 				: after.status === "failed" && before.status !== "failed"
 					? "failed"
 					: null;
-	if (attention === null) return;
+	if (attention === null) return null;
 	const visible = state.selectedSessionId === after.id && document.visibilityState === "visible";
 	if (!visible) setState((current) => ({ attention: { ...current.attention, [after.id]: attention } }));
+	return attention;
+};
+
+// A notification and a chime while the window is in the background. Coming back opens the chat named.
+const alertUser = (sessionId: string, title: string, body: string) => {
 	if (document.hasFocus()) return;
-	lastNotified = after.id;
+	lastNotified = sessionId;
 	const { settings } = state;
-	const title = sessionTitle(after);
-	const body =
-		attention === "approval"
-			? "The agent needs your approval."
-			: attention === "done"
-				? "The turn finished."
-				: "The turn failed.";
 	if (settings.desktopNotifications) void showNotification(title, body);
 	if (settings.sound) playChime();
+};
+
+const noticeChange = (before: AgentSession, after: AgentSession) => {
+	const attention = markAttention(before, after);
+	if (attention !== null) alertUser(after.id, sessionTitle(after), ATTENTION_BODIES[attention]);
 };
 
 // The desktop notification cannot report a click, so the chat that notified last opens when the window comes back.
