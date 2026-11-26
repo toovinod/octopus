@@ -2,10 +2,10 @@ import { bearer, deviceAuthorization, organization } from "better-auth/plugins";
 import { leaveOrganizationHook, membershipHooks } from "./membershipHooks.ts";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter/relations-v2";
 import type { InvitationEmailInput } from "@repo/email/invitationEmail";
+import { type Auth, type AuthContext, betterAuth } from "better-auth";
 import type { MembershipEvent } from "./MembershipEvents.ts";
 import { schemaConstraints } from "./schemaConstraints.ts";
 import * as authSchema from "@repo/db-cloud/authSchema";
-import { type Auth, betterAuth } from "better-auth";
 import type { AuthConfig } from "./AuthConfig.ts";
 import { Redacted } from "effect";
 
@@ -28,7 +28,9 @@ export const createAuth = ({
 	database,
 	sendInvitation,
 	publishMembershipEvent,
-}: CreateAuthInput): Pick<Auth, "handler" | "options"> =>
+}: CreateAuthInput): Pick<Auth, "handler" | "options"> & {
+	readonly $context: Promise<Pick<AuthContext, "authCookies">>;
+} =>
 	betterAuth({
 		baseURL: config.baseUrl,
 		secret: Redacted.value(config.secret),
@@ -50,11 +52,10 @@ export const createAuth = ({
 		// Better Auth turns rate limiting on only when NODE_ENV is production, and the API does not set it.
 		// Counts live in Postgres, so every API instance enforces one shared limit per client.
 		rateLimit: { enabled: true, storage: "database" },
-		advanced: {
-			ipAddress: { ipAddressHeaders: [CLIENT_ADDRESS_HEADER] },
-			// The web app is a static site on its own origin that calls the API with credentials.
-			defaultCookieAttributes: { sameSite: "none", secure: true },
-		},
+		// The web app and the API must share one site (app.example.com and api.example.com), so Better
+		// Auth's default SameSite=Lax cookies reach the API from the web app, also in Safari and with
+		// third-party cookies blocked. SameSite=None broke both. Cookies are Secure when the API is on https.
+		advanced: { ipAddress: { ipAddressHeaders: [CLIENT_ADDRESS_HEADER] } },
 		plugins: [
 			organization({
 				sendInvitationEmail: ({ id, email, organization, inviter, invitation }) =>

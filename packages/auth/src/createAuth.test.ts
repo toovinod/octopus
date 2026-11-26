@@ -10,18 +10,41 @@ const placeholder = Redacted.make("test-secret-that-is-at-least-32-characters");
 const oauthClient = { clientId: "test", clientSecret: placeholder };
 const serverUrl = Effect.runSync(testServerUrl);
 
+const configFor = (baseUrl: string) => ({
+	baseUrl,
+	webOrigin: "http://localhost:3000",
+	secret: placeholder,
+	databaseUrl: placeholder,
+	github: oauthClient,
+	google: oauthClient,
+});
+
+const sessionCookieFor = async (baseUrl: string) => {
+	const auth = createAuth({
+		config: configFor(baseUrl),
+		database: drizzle.mock({ relations: authRelations }),
+		sendInvitation: () => Promise.resolve(),
+		publishMembershipEvent: () => Promise.resolve(),
+	});
+	return (await auth.$context).authCookies.sessionToken.attributes;
+};
+
+describe("session cookie", () => {
+	// The web app and the API are deployed on one site, such as app.example.com and api.example.com.
+	test("is SameSite=Lax, which Safari and third-party cookie blocking still send within one site", async () => {
+		expect((await sessionCookieFor("https://api.octopus.test")).sameSite).toBe("lax");
+	});
+
+	test("is Secure when the API is served over https", async () => {
+		expect((await sessionCookieFor("https://api.octopus.test")).secure).toBe(true);
+	});
+});
+
 // One API instance: its own Better Auth and its own connection pool.
 const startInstance = (databaseUrl: Redacted.Redacted<string>) => {
 	const client = new SQL(Redacted.value(databaseUrl));
 	const auth = createAuth({
-		config: {
-			baseUrl: "http://localhost:3001",
-			webOrigin: "http://localhost:3000",
-			secret: placeholder,
-			databaseUrl,
-			github: oauthClient,
-			google: oauthClient,
-		},
+		config: { ...configFor("http://localhost:3001"), databaseUrl },
 		database: drizzle({ client, relations: authRelations }),
 		sendInvitation: () => Promise.resolve(),
 		publishMembershipEvent: () => Promise.resolve(),
