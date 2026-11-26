@@ -55,8 +55,14 @@ const MERGE_LABELS: Record<PullRequestMergeMethod, string> = {
 export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 	const { loaded, reload, replace } = useDaemonValue(
 		() => callDaemon((daemon) => daemon.getPullRequest({ workspaceId: workspace.id })),
-		workspace.id,
+		// A pull request opened from another window or the CLI shows up once the workspace learns its URL.
+		`${workspace.id}:${workspace.pullRequestUrl ?? ""}`,
 	);
+	// Merges, reviews and pushes also happen on GitHub, so coming back to the app asks again.
+	useEffect(() => {
+		window.addEventListener("focus", reload);
+		return () => window.removeEventListener("focus", reload);
+	}, [reload]);
 	const checksPending =
 		loaded.state === "ready" && loaded.value.status === "found" && loaded.value.pullRequest.checks.pending > 0;
 	// The daemon polls GitHub while checks run and ends the watch once they are done. A dropped connection attaches
