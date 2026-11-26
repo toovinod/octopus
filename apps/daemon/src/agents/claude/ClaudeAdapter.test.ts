@@ -38,14 +38,32 @@ const startedWith: Array<Options> = [];
 const settingsChanges: Array<unknown> = [];
 const prompts: Array<SDKUserMessage> = [];
 
+const settingsChanged = Promise.withResolvers<void>();
+
 const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 	ClaudeQuery.of({
 		start: ({ prompt, options }) => {
 			startedWith.push(options);
 			let resolveInterrupt = () => {};
 			let turn = 0;
+			// Recorded from claude 2.1.332 resuming a session whose transcript was deleted: it answers before reading
+			// any message, then exits.
+			const missingSession = `No conversation found with session ID: ${options.resume}`;
 			async function* messages() {
-				for await (const user of prompt) {
+				if (options.resume === "claude-gone" || options.resume === "claude-gone-later") {
+					// Holds its answer until the chat's settings change, so the change lands on this run.
+					if (options.resume === "claude-gone-later") await settingsChanged.promise;
+					yield {
+						type: "result",
+						subtype: "error_during_execution",
+						is_error: true,
+						uuid: "result-gone",
+						errors: [missingSession],
+					};
+					throw new Error(`Claude Code returned an error result: ${missingSession}`);
+				}
+				const input = prompt[Symbol.asyncIterator]();
+				for await (const user of { [Symbol.asyncIterator]: () => input }) {
 					prompts.push(user);
 					turn++;
 					const text = typeof user.message.content === "string" ? user.message.content : "";
@@ -55,6 +73,26 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							subtype: "init",
 							session_id: options.resume ?? "claude-new",
 						};
+					}
+					if (text.includes("steer me")) {
+						// Recorded from claude 2.1.332: a message sent while a turn streams, or just after its last
+						// assistant message, runs as its own turn with its own result after the running one's.
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s1", content: [{ type: "text", text: "1, 2, 3" }] },
+						};
+						const steer = await input.next();
+						if (steer.done) return;
+						prompts.push(steer.value);
+						yield { type: "result", subtype: "success", uuid: "result-s1", user_message_uuid: user.uuid };
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s2", content: [{ type: "text", text: "1, 2, 3, DONE" }] },
+						};
+						yield { type: "result", subtype: "success", uuid: "result-s2", user_message_uuid: steer.value.uuid };
+						continue;
 					}
 					if (text.includes("think")) {
 						// Recorded from claude 2.1.331 with summarized thinking: the thinking block and the
@@ -331,6 +369,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			}
 			return {
 				messages: messages(),
+				initializationResult: async () => {
+					if (options.resume?.startsWith("claude-gone"))
+						throw new Error(`Claude Code returned an error result: ${missingSession}`);
+				},
 				interrupt: async () => resolveInterrupt(),
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
@@ -338,6 +380,7 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 					// Like a claude that refuses to bypass permissions.
 					if (permissionMode === "bypassPermissions") throw new Error("refused");
 					settingsChanges.push({ permissionMode });
+					settingsChanged.resolve();
 				},
 				supportedCommands: async () => [
 					{ name: "review", description: "Review the branch", argumentHint: "" },
@@ -830,6 +873,57 @@ describe("ClaudeAdapter", () => {
 			{ input: { ...newSession, resumeId: "claude-old" } },
 		);
 		expect(id).toBe("claude-old");
+	});
+
+	test("a resume of a session claude no longer has goes on in a new session with a notice", async () => {
+		const [id, events] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					const id = yield* handle.nativeSessionId;
+					return [id, yield* takeUntil(handle, "turn.completed")] as const;
+				}),
+			{ input: { ...newSession, resumeId: "claude-gone" } },
+		);
+		expect(id).toBe("claude-new");
+		expect(startedWith.at(-1)?.resume).toBeUndefined();
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	test("the new session that replaces a lost one starts on the chat's current settings, not its first ones", async () => {
+		await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.updateSettings({ model: "claude-haiku-5-5", effort: "low", mode: "ask" });
+					yield* handle.sendMessage(userMessage("hi"));
+					yield* takeUntil(handle, "turn.completed");
+				}),
+			{ input: { ...newSession, mode: "fullAccess", trustProjectSettings: true, resumeId: "claude-gone-later" } },
+		);
+		expect(startedWith.at(-1)).toMatchObject({ model: "claude-haiku-5-5", effort: "low", permissionMode: "default" });
+		expect(startedWith.at(-1)?.resume).toBeUndefined();
+	});
+
+	test("a steer that claude runs as its own turn ends with the turn it was sent into", async () => {
+		const [steered, events, next] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer me"));
+				yield* takeUntil(handle, "message.completed");
+				const steered = yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				const events = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				return [steered, events, yield* takeUntil(handle, "turn.completed")] as const;
+			}),
+		);
+		expect(steered).toBe("steered");
+		expect(events.filter((event) => event.type === "message.completed").map((event) => event.text)).toEqual([
+			"1, 2, 3, DONE",
+		]);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", turnId: "result-s2" });
+		// The next message's turn ends with its own result, not the steer's.
+		expect(next.filter((event) => event.type === "message.completed").map((event) => event.text)).toEqual(["Hi"]);
 	});
 
 	test("loads only user settings and the default mode for an untrusted project", async () => {

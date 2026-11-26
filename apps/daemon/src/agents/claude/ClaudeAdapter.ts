@@ -53,6 +53,7 @@ import { BashInput, ClaudeAuthStatus, ClaudeMessage, FileInput } from "./claudeM
 import { type AgentSession, makeAgentSession } from "../makeAgentSession.ts";
 import { stopProcessGroup } from "../../processes/stopProcessGroup.ts";
 import { ProcessRegistry } from "../../processes/ProcessRegistry.ts";
+import { ClaudeQuery, type ClaudeQueryRun } from "./ClaudeQuery.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { spawnTerminal } from "../../terminals/spawnTerminal.ts";
 import { spawnInProcessGroup } from "./spawnInProcessGroup.ts";
@@ -60,7 +61,7 @@ import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
-import { ClaudeQuery } from "./ClaudeQuery.ts";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 
 // Octopus runs the user's own `claude`, found on PATH unless this names another one. Inside a
@@ -179,6 +180,11 @@ const toToolCall = (name: string, input: unknown): ToolCall => {
 	}
 	return { kind: "other", name };
 };
+
+// What claude answers, before it reads any message, to a resume of a session whose transcript is gone.
+const isMissingSession = (message: ClaudeMessage) =>
+	"errors" in message &&
+	(message.errors ?? []).some((error) => error.startsWith("No conversation found with session ID"));
 
 // Claude calls this tool to leave plan mode. Octopus shows the plan as its own card, not as a tool call.
 const EXIT_PLAN_MODE = "ExitPlanMode";
@@ -301,6 +307,8 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	// Tool calls shown as a plan or question card instead.
 	const cardTools = new Set<string>();
 	const interrupting = yield* Ref.make(false);
+	// The uuid of the last message Octopus sent claude.
+	const lastSent = yield* Ref.make("");
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
@@ -429,6 +437,11 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 						contextWindow: message.modelUsage?.[usage.value.model]?.contextWindow ?? null,
 					});
 				}
+				// claude may run a steer as a turn of its own, whose result follows the running turn's. The turn Octopus
+				// started ends only with the result for the last message it sent, so no result ends a later turn.
+				if (message.user_message_uuid !== undefined && message.user_message_uuid !== (yield* Ref.get(lastSent))) {
+					return yield* Effect.logDebug("Claude ended a turn a later message continues");
+				}
 				const interrupted = yield* Ref.getAndSet(interrupting, false);
 				return yield* session.emit({
 					type: "turn.completed",
@@ -460,7 +473,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 		}
 	});
 
-	return { handle, interrupting };
+	return { handle, interrupting, lastSent };
 });
 
 // claude runs its own claude.ai sign-in on a terminal. Octopus shows its link and passes it a
@@ -593,9 +606,10 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				}
 				const session = yield* makeAgentSession(capabilities);
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
-				const { handle, interrupting } = yield* makeMessageHandler(session);
+				const { handle, interrupting, lastSent } = yield* makeMessageHandler(session);
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
+				const sessionScope = yield* Effect.scope;
 				let claudePid: number | undefined;
 
 				const proposePlan = (toolInput: Record<string, unknown>, request: Parameters<CanUseTool>[2]) =>
@@ -688,19 +702,14 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 
 				const options: Options = {
 					cwd: input.cwd,
-					model: input.model,
 					includePartialMessages: true,
 					// Claude Code omits thinking text unless asked, and Octopus shows it.
 					thinking: { type: "adaptive", display: "summarized" },
 					canUseTool,
-					// Always set, so a settings file can never pick bypassPermissions on its own.
-					permissionMode: permissionModes[input.mode],
 					// Without it Claude refuses to switch a running session to bypassPermissions, as Full access
 					// and approving a plan in Full access do. Only a trusted project may offer that mode.
 					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
-					...Option.match(decodeEffort(input.effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
-					...(input.resumeId === undefined ? {} : { resume: input.resumeId }),
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
 						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
@@ -716,47 +725,93 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					},
 				};
 
-				const run = yield* Effect.acquireRelease(
-					Effect.sync(() =>
-						claudeQuery.start({
-							prompt: Stream.toAsyncIterable(Stream.fromQueue(prompts)),
-							options,
-						}),
-					),
-					(run) =>
-						Effect.gen(function* () {
-							// Closing ends claude's stdin. Its process group then gets the usual stop signal and grace.
-							run.close();
-							if (claudePid === undefined) return;
-							yield* stopProcessGroup(claudePid);
-							yield* registry.remove(claudePid);
-						}),
-				);
+				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
+				// A run that replaces one that could not resume starts on them, not on the settings the chat opened with.
+				const settings = yield* Ref.make({ model: input.model, effort: input.effort, mode: input.mode });
 
-				yield* Stream.fromAsyncIterable(run.messages, (cause) =>
-					isAuthFailureText(String(cause))
-						? new AgentAuthError({ agent: "claude", cause })
-						: new AgentProcessError({ message: "Claude Code stopped.", cause }),
-				).pipe(
-					Stream.mapEffect((message) =>
-						Schema.decodeUnknownEffect(ClaudeMessage)(message).pipe(
-							Effect.mapError(
-								(cause) =>
-									new AgentProtocolError({
-										message: "Claude Code sent a message Octopus could not read.",
-										cause,
-									}),
+				// Each run has its own scope, so a claude that could not resume is stopped before the next one starts.
+				const startRun = Effect.fnUntraced(function* (resume: string | undefined) {
+					const scope = yield* Scope.fork(sessionScope);
+					// claude gets no message before it has started, so one that cannot start leaves them queued for the next.
+					const started = yield* Deferred.make<void>();
+					const { model, effort, mode } = yield* Ref.get(settings);
+					const run = yield* Effect.acquireRelease(
+						Effect.sync(() =>
+							claudeQuery.start({
+								prompt: Stream.toAsyncIterable(
+									Stream.fromEffectDrain(Deferred.await(started)).pipe(Stream.concat(Stream.fromQueue(prompts))),
+								),
+								options: {
+									...options,
+									model,
+									// Always set, so a settings file can never pick bypassPermissions on its own.
+									permissionMode: permissionModes[mode],
+									...Option.match(decodeEffort(effort), { onNone: () => ({}), onSome: (effort) => ({ effort }) }),
+									...(resume === undefined ? {} : { resume }),
+								},
+							}),
+						),
+						(run) =>
+							Effect.gen(function* () {
+								// Closing ends claude's stdin. Its process group then gets the usual stop signal and grace.
+								run.close();
+								if (claudePid === undefined) return;
+								yield* stopProcessGroup(claudePid);
+								yield* registry.remove(claudePid);
+							}),
+					).pipe(Scope.provide(scope));
+					yield* Effect.tryPromise(() => run.initializationResult()).pipe(
+						Effect.andThen(Deferred.succeed(started, undefined)),
+						// A claude that cannot start says why in its messages, which end the session.
+						Effect.ignore,
+						Effect.forkIn(scope),
+					);
+					return { run, scope };
+				});
+
+				// Ends early, returning true, when claude has no transcript for the session it was asked to resume.
+				const readMessages = (run: ClaudeQueryRun) =>
+					Stream.fromAsyncIterable(run.messages, (cause) =>
+						isAuthFailureText(String(cause))
+							? new AgentAuthError({ agent: "claude", cause })
+							: new AgentProcessError({ message: "Claude Code stopped.", cause }),
+					).pipe(
+						Stream.mapEffect((message) =>
+							Schema.decodeUnknownEffect(ClaudeMessage)(message).pipe(
+								Effect.mapError(
+									(cause) =>
+										new AgentProtocolError({
+											message: "Claude Code sent a message Octopus could not read.",
+											cause,
+										}),
+								),
 							),
 						),
-					),
-					Stream.runForEach(handle),
-					Effect.andThen(session.end),
-					Effect.catch(session.fail),
-					Effect.forkScoped,
-				);
+						Stream.takeUntil(isMissingSession),
+						Stream.tap((message) => (isMissingSession(message) ? Effect.void : handle(message))),
+						Stream.runLast,
+						Effect.map(Option.exists(isMissingSession)),
+					);
 
-				// Only Octopus changes these, so a failed change goes back to them. Claude may change its mode by itself.
-				const modelAndEffort = yield* Ref.make({ model: input.model, effort: input.effort });
+				const first = yield* startRun(input.resumeId);
+				let run = first.run;
+
+				yield* Effect.gen(function* () {
+					if (!(yield* readMessages(run))) return;
+					// A session whose transcript is gone can never resume, so the chat goes on in a new one rather
+					// than failing every message.
+					yield* Effect.logWarning("Claude Code lost the chat's session, starting a new one");
+					yield* session.emit({
+						type: "error",
+						message:
+							"Claude Code could not find this chat's earlier conversation, so it continues in a new one without that context.",
+						willRetry: false,
+					});
+					yield* Scope.close(first.scope, Exit.void);
+					run = (yield* startRun(undefined)).run;
+					yield* readMessages(run);
+				}).pipe(Effect.andThen(session.end), Effect.catch(session.fail), Effect.forkScoped);
+
 				const settingsError = (cause: unknown) =>
 					new AgentProcessError({ message: "Could not change the chat's settings.", cause });
 				const setModelAndEffort = ({ model, effort }: { readonly model: string; readonly effort: string | null }) =>
@@ -769,8 +824,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					});
 
 				const sendMessage = ({ text, images }: UserMessage) =>
-					Effect.asVoid(
-						Queue.offer(prompts, {
+					Effect.gen(function* () {
+						const uuid = randomUUID();
+						yield* Ref.set(lastSent, uuid);
+						yield* Queue.offer(prompts, {
+							uuid,
 							type: "user",
 							message: {
 								role: "user",
@@ -786,8 +844,8 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 											],
 							},
 							parent_tool_use_id: null,
-						}),
-					);
+						});
+					});
 
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.
@@ -795,7 +853,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					steerTurn: (message) => Effect.as(sendMessage(message), true),
 					updateSettings: (next) =>
 						Effect.gen(function* () {
-							const previous = yield* Ref.get(modelAndEffort);
+							const previous = yield* Ref.get(settings);
 							yield* setModelAndEffort(next).pipe(
 								Effect.andThen(
 									Effect.tryPromise({
@@ -812,7 +870,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 									),
 								),
 							);
-							yield* Ref.set(modelAndEffort, { model: next.model, effort: next.effort });
+							yield* Ref.set(settings, { model: next.model, effort: next.effort, mode: next.mode });
 						}),
 					listCommands: Effect.tryPromise({
 						try: () => run.supportedCommands(),

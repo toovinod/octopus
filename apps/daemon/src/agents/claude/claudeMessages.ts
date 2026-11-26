@@ -109,6 +109,8 @@ export const ClaudeMessage = Schema.Union([
 		is_error: Schema.optionalKey(Schema.Boolean),
 		result: Schema.optionalKey(Schema.String),
 		errors: Schema.optionalKey(Schema.Array(Schema.String)),
+		// The uuid of the message whose turn this result ends.
+		user_message_uuid: Schema.optionalKey(Schema.String),
 		modelUsage: Schema.optionalKey(Schema.Record(Schema.String, Schema.Struct({ contextWindow: Schema.Int }))),
 	}),
 	Schema.Struct({
