@@ -68,8 +68,9 @@ interface ScriptOutput {
 
 const RUN_SCRIPT_PORT_POLL = "2 seconds";
 
-// A slow follower loses old lines rather than growing the daemon's memory.
-const LIVE_LINES = 1000;
+// A slow follower loses old lines rather than growing the daemon's memory: at most LIVE_LINES lines of at most
+// LINE_MAX_LENGTH characters, about a megabyte.
+export const LIVE_LINES = 1000;
 
 // Finished output stays so the UI can show why a run failed, but only for the latest runs: a
 // daemon that runs scripts for weeks would otherwise hold the output of every one.

@@ -27,9 +27,9 @@ interface RunningTerminal {
 
 // A slow client loses old output rather than growing the daemon's memory. One PTY read can be large, so
 // live output goes out in pieces of at most LIVE_CHUNK characters: the buffer then holds at most
-// LIVE_BUFFER * LIVE_CHUNK characters, whatever the reads were.
-const LIVE_BUFFER = 1024;
-export const LIVE_CHUNK = 4096;
+// LIVE_BUFFER * LIVE_CHUNK characters, about a megabyte, whatever the reads were.
+export const LIVE_BUFFER = 1000;
+export const LIVE_CHUNK = 1024;
 
 export const splitLiveOutput = (data: string): ReadonlyArray<string> => {
 	const pieces: Array<string> = [];

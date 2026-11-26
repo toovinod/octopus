@@ -1,5 +1,5 @@
+import { LIVE_LINES, MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
-import { MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
 import { Duration, Effect, Fiber, FileSystem, Schedule, Stream } from "effect";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
@@ -1024,6 +1024,11 @@ describe("WorkspaceService", () => {
 			}),
 		);
 		expect(result).toEqual({ failed: "WorktreeRemoveError", run: "run" });
+	});
+
+	// Architecture section 14 caps each subscriber's buffer at 1,000 events or 1 MB.
+	test("a slow follower's live buffer holds at most about a megabyte", () => {
+		expect(LIVE_LINES * LINE_MAX_LENGTH).toBeLessThanOrEqual(1024 * 1024);
 	});
 
 	test("a long line is cut to the line cap before it is kept or streamed", async () => {

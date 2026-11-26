@@ -1,5 +1,5 @@
+import { LIVE_BUFFER, LIVE_CHUNK, TerminalService, splitLiveOutput } from "./TerminalService.ts";
 import { ConfigProvider, Duration, Effect, FileSystem, Layer, Stream } from "effect";
-import { LIVE_CHUNK, TerminalService, splitLiveOutput } from "./TerminalService.ts";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { SCROLLBACK_MAX_LINES, Scrollback } from "./Scrollback.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
@@ -69,6 +69,11 @@ describe("TerminalService", () => {
 		);
 		expect(took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
 	}, 20_000);
+
+	// Architecture section 14 caps each subscriber's buffer at 1,000 events or 1 MB.
+	test("a slow client's live buffer holds at most about a megabyte", () => {
+		expect(LIVE_BUFFER * LIVE_CHUNK).toBeLessThanOrEqual(1024 * 1024);
+	});
 
 	test("a client that attaches later gets the scrollback first", async () => {
 		const text = await runTerminalTest((tempDir) =>
