@@ -14,17 +14,53 @@ export const markForkBranch = Effect.fn("markForkBranch")(function* (repositoryP
 // `gh pr checkout` sets up a fork's pull request, pulling from a URL rather than a configured remote, or pulling
 // the pull request's head (refs/pull/<n>/head) when the fork keeps maintainers out. A branch tracking a named
 // remote such as upstream is the user's own. A detached HEAD shows neither.
+// It reads the whole config in one call and filters it here, so a branch name needs no regex escaping and a
+// workspace listing spends two git calls per workspace rather than five.
 export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: string) {
 	const branch = yield* runGit(path, ["branch", "--show-current"]);
 	if (branch === "") return false;
-	if (yield* isForkBranch(path, branch)) return true;
-	const remote = yield* runGit(path, ["config", "--default", "", "--get", `branch.${branch}.remote`]);
+	const config = parseConfigList(yield* runGit(path, ["config", "--null", "--list"]));
+	// Git lowercases a key's section and name in the listing, but keeps the branch name's case.
+	const mark = readForkMark(config.get(`branch.${branch}.octopusfromfork`));
+	if (mark === "unknown" ? yield* isForkBranch(path, branch) : mark) return true;
+	const remote = config.get(`branch.${branch}.remote`) ?? "";
 	if (remote === "" || remote === ".") return false;
-	const merge = yield* runGit(path, ["config", "--default", "", "--get", `branch.${branch}.merge`]);
+	const merge = config.get(`branch.${branch}.merge`) ?? "";
 	if (merge.startsWith("refs/pull/")) return true;
-	const remotes = yield* runGit(path, ["remote"]);
-	return !remotes.split("\n").includes(remote);
+	return !remoteNames(config).has(remote);
 });
+
+// Splits `git config --null --list` output into key and value. A key set without a value (`[branch "x"] remote`)
+// lists as null. The last value of a key wins, as `git config --get` returns it.
+const parseConfigList = (output: string) =>
+	new Map(
+		output
+			.split("\0")
+			.filter((entry) => entry !== "")
+			.map((entry) => {
+				const newline = entry.indexOf("\n");
+				return newline === -1 ? [entry, null] : [entry.slice(0, newline), entry.slice(newline + 1)];
+			}),
+	);
+
+// Git's own boolean words and the bare key. Anything else (an integer such as 2, or a value git rejects) is left to
+// `git config --type=bool`, so the mark keeps exactly git's reading.
+const readForkMark = (value: string | null | undefined) => {
+	if (value === undefined) return false;
+	if (value === null) return true;
+	const word = value.toLowerCase();
+	if (["true", "yes", "on", "1"].includes(word)) return true;
+	if (["false", "no", "off", "0", ""].includes(word)) return false;
+	return "unknown";
+};
+
+// The remotes `git remote` lists: every name with a remote.<name>.<key> entry, where the name may hold dots.
+const remoteNames = (config: ReadonlyMap<string, string | null>) =>
+	new Set(
+		[...config.keys()]
+			.filter((key) => key.startsWith("remote.") && key.lastIndexOf(".") > "remote".length)
+			.map((key) => key.slice("remote.".length, key.lastIndexOf("."))),
+	);
 
 const countAsFork = (path: string) => (cause: unknown) =>
 	Effect.logWarning("Could not tell whether the branch is a fork's, so it counts as one", cause).pipe(
