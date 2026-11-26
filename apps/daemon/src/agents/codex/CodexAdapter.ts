@@ -41,7 +41,20 @@ import {
 	METHOD_NOT_FOUND,
 	makeCodexRpcClient,
 } from "./codexRpcClient.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Option, Predicate, PubSub, Ref, Scope, Stream } from "effect";
+import {
+	Context,
+	Effect,
+	Exit,
+	FiberHandle,
+	Layer,
+	Option,
+	Predicate,
+	PubSub,
+	type Redacted,
+	Ref,
+	Scope,
+	Stream,
+} from "effect";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
 import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
 import type { ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
@@ -201,10 +214,12 @@ const initialize = Effect.fn("CodexAdapter.initialize")(function* (client: Codex
 	yield* client.notify("initialized");
 });
 
-const appServer = (executable: string, cwd?: string, env?: ChildProcess.CommandOptions["env"]) =>
+// Codex bills OPENAI_API_KEY whenever it is set, so the app-server gets only the user's own key, never the one
+// the daemon may have inherited. An unset key removes the inherited one.
+const appServer = (executable: string, apiKey?: Redacted.Redacted<string>, cwd?: string) =>
 	ChildProcess.make(executable, ["app-server"], {
 		...(cwd === undefined ? {} : { cwd }),
-		...(env === undefined ? {} : { env }),
+		env: { OPENAI_API_KEY: apiKey },
 		extendEnv: true,
 	});
 
@@ -697,11 +712,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					mode: input.mode,
 				});
 				const client = yield* makeCodexRpcClient(
-					appServer(
-						executable,
-						input.cwd,
-						input.auth.mode === "apiKey" ? { OPENAI_API_KEY: input.auth.apiKey } : undefined,
-					),
+					appServer(executable, input.auth.mode === "apiKey" ? input.auth.apiKey : undefined, input.cwd),
 				);
 
 				yield* client.incoming.pipe(

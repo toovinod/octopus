@@ -157,6 +157,14 @@ const runTurn = async (
 		}
 		return completeTurn(text.includes("fails") ? "failed" : "completed");
 	}
+	if (text.includes("api key")) {
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(Bun.env.OPENAI_API_KEY ?? null) },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("policy")) {
 		notify("item/completed", {
 			item: {
@@ -374,7 +382,9 @@ const serve = async () => {
 				send({
 					id: message.id,
 					result: {
-						account: { type: "chatgpt", email: "dev@example.com" },
+						// Like Codex, an OPENAI_API_KEY in its environment wins over the ChatGPT sign-in.
+						account:
+							Bun.env.OPENAI_API_KEY === undefined ? { type: "chatgpt", email: "dev@example.com" } : { type: "apiKey" },
 						requiresOpenaiAuth: true,
 					},
 				});

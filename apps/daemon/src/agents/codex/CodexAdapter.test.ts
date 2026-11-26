@@ -1,13 +1,13 @@
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
+import { Duration, Effect, Fiber, Option, Redacted, Stream } from "effect";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
-import { Duration, Effect, Fiber, Option, Stream } from "effect";
 import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
-import { describe, expect, test } from "bun:test";
 
 const fakeCodex = `${import.meta.dir}/fixtures/fakeCodex.ts`;
 const newSession: StartSessionInput = {
@@ -215,6 +215,39 @@ describe("CodexAdapter", () => {
 		);
 		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	describe("with an OPENAI_API_KEY in the daemon's own environment", () => {
+		beforeAll(() => {
+			process.env.OPENAI_API_KEY = "sk-daemon";
+		});
+		afterAll(() => {
+			delete process.env.OPENAI_API_KEY;
+		});
+
+		const keyCodexSees = (auth: StartSessionInput["auth"]) =>
+			runSession(
+				(handle) =>
+					Effect.gen(function* () {
+						yield* handle.sendMessage(userMessage("api key"));
+						return (yield* takeUntil(handle, "turn.completed")).find((event) => event.type === "message.completed");
+					}),
+				{ ...newSession, auth },
+			);
+
+		test("a subscription session gets no API key, so Codex bills the ChatGPT plan", async () => {
+			expect(await keyCodexSees({ mode: "subscription" })).toMatchObject({ text: "null" });
+		});
+
+		test("an API key session gets the user's key", async () => {
+			expect(await keyCodexSees({ mode: "apiKey", apiKey: Redacted.make("sk-user") })).toMatchObject({
+				text: JSON.stringify("sk-user"),
+			});
+		});
+
+		test("the sign-in check reads the ChatGPT sign-in, not the daemon's key", async () => {
+			expect(await runWithCodex(checkAuth)).toEqual({ status: "loggedIn", account: "dev@example.com" });
+		});
 	});
 
 	test("stops paging models when Codex repeats a cursor", async () => {
