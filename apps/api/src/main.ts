@@ -47,7 +47,7 @@ const ApiServer = Layer.unwrap(
 		yield* exitIfShutdownHangs(Duration.sum(grace, Duration.seconds(5)));
 		yield* Effect.addFinalizer(() => Effect.logInfo("API stopped"));
 		const app = createApp({ webOrigin, authHandler: handler });
-		return HttpServer.serve(serveWithClientAddress(trustedProxies, async (request) => app.fetch(request))).pipe(
+		return HttpServer.serve(yield* serveWithClientAddress(trustedProxies, async (request) => app.fetch(request))).pipe(
 			HttpServer.withLogAddress,
 			Layer.provide(BunHttpServer.layer({ port, gracefulShutdownTimeout: grace })),
 		);
