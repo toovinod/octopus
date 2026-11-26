@@ -298,7 +298,8 @@ const toolResultText = (
 	return keepOutputTail(content.map((part) => ("text" in part ? part.text : "")).join("\n"));
 };
 
-const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
+// interruptAgain stops a turn claude runs by itself after a Stop, from a steer it still had queued.
+const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, interruptAgain: Effect.Effect<void>) {
 	// Stream deltas and finished blocks share an item id: the message id plus the block index.
 	const streamingMessageId = yield* Ref.make("");
 	const finishedBlocks = yield* Ref.make({ messageId: "", count: 0 });
@@ -440,7 +441,10 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 				// claude may run a steer as a turn of its own, whose result follows the running turn's. The turn Octopus
 				// started ends only with the result for the last message it sent, so no result ends a later turn.
 				if (message.user_message_uuid !== undefined && message.user_message_uuid !== (yield* Ref.get(lastSent))) {
-					return yield* Effect.logDebug("Claude ended a turn a later message continues");
+					yield* Effect.logDebug("Claude ended a turn a later message continues");
+					// A Stop ended the running turn, but claude keeps a queued steer and runs it next, so it is stopped too.
+					if (yield* Ref.get(interrupting)) yield* interruptAgain;
+					return;
 				}
 				const interrupted = yield* Ref.getAndSet(interrupting, false);
 				return yield* session.emit({
@@ -606,9 +610,21 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				}
 				const session = yield* makeAgentSession(capabilities);
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
-				const { handle, interrupting, lastSent } = yield* makeMessageHandler(session);
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
+				const { handle, interrupting, lastSent } = yield* makeMessageHandler(
+					session,
+					// Sent on its own fiber, so the reader goes on delivering claude's messages while claude answers it.
+					Effect.suspend(() =>
+						Effect.sync(() =>
+							Effect.runForkWith(context)(
+								Effect.tryPromise(() => run.interrupt()).pipe(
+									Effect.catch((error) => Effect.logWarning("Could not stop a steer claude still had queued", error)),
+								),
+							),
+						),
+					),
+				);
 				const sessionScope = yield* Effect.scope;
 				let claudePid: number | undefined;
 

@@ -45,6 +45,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 		start: ({ prompt, options }) => {
 			startedWith.push(options);
 			let resolveInterrupt = () => {};
+			let interrupts = 0;
+			const interruptCount = async (count: number) => {
+				while (interrupts < count) await new Promise((resolve) => setTimeout(resolve, 5));
+			};
 			let turn = 0;
 			// Recorded from claude 2.1.332 resuming a session whose transcript was deleted: it answers before reading
 			// any message, then exits.
@@ -73,6 +77,33 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							subtype: "init",
 							session_id: options.resume ?? "claude-new",
 						};
+					}
+					if (text.includes("steer, then stop")) {
+						// A Stop while the steer waits in claude's queue ends the running turn, and the queued steer still
+						// runs as a turn of its own unless it is stopped too.
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s1", content: [{ type: "text", text: "1, 2, 3" }] },
+						};
+						const steer = await input.next();
+						if (steer.done) return;
+						prompts.push(steer.value);
+						await interruptCount(1);
+						yield {
+							type: "result",
+							subtype: "error_during_execution",
+							uuid: "result-s1",
+							user_message_uuid: user.uuid,
+						};
+						await interruptCount(2);
+						yield {
+							type: "result",
+							subtype: "error_during_execution",
+							uuid: "result-s2",
+							user_message_uuid: steer.value.uuid,
+						};
+						continue;
 					}
 					if (text.includes("steer me")) {
 						// Recorded from claude 2.1.332: a message sent while a turn streams, or just after its last
@@ -373,7 +404,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 					if (options.resume?.startsWith("claude-gone"))
 						throw new Error(`Claude Code returned an error result: ${missingSession}`);
 				},
-				interrupt: async () => resolveInterrupt(),
+				interrupt: async () => {
+					interrupts++;
+					resolveInterrupt();
+				},
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
 				setPermissionMode: async (permissionMode) => {
@@ -904,6 +938,25 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(startedWith.at(-1)).toMatchObject({ model: "claude-haiku-5-5", effort: "low", permissionMode: "default" });
 		expect(startedWith.at(-1)?.resume).toBeUndefined();
+	});
+
+	test("Stop while a steer waits in claude's queue also stops the turn claude would run it as", async () => {
+		const [results, next] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer, then stop"));
+				yield* takeUntil(handle, "message.completed");
+				yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				yield* handle.interrupt;
+				const events = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				return [
+					events.filter((event) => event.type === "turn.completed"),
+					(yield* takeUntil(handle, "turn.completed")).at(-1),
+				] as const;
+			}),
+		);
+		expect(results).toEqual([{ type: "turn.completed", turnId: "result-s2", result: { status: "interrupted" } }]);
+		expect(next).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
 	test("a steer that claude runs as its own turn ends with the turn it was sent into", async () => {
