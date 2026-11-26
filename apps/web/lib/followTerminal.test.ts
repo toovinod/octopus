@@ -1,6 +1,6 @@
 import { TerminalNotFoundError, type TerminalOutput } from "@repo/contracts/Terminal";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
-import { followTerminal } from "./followTerminal.ts";
+import { followTerminal, terminalInput } from "./followTerminal.ts";
 import type { Follow } from "./daemonRuntime.ts";
 
 // A fake daemon: each attach is recorded, and the test drives its stream.
@@ -81,5 +81,26 @@ describe("followTerminal", () => {
 		jest.advanceTimersByTime(5000);
 		expect(daemon.attaches).toHaveLength(1);
 		expect(daemon.stops()).toBe(1);
+	});
+});
+
+describe("terminalInput", () => {
+	const drop = { _tag: "RpcClientError", message: "SocketCloseError: closed" };
+
+	test("says once per outage that keystrokes did not reach the shell", () => {
+		const view = fakeScreen();
+		const input = terminalInput(view.screen);
+		input.failed(drop);
+		input.failed(drop);
+		expect(view.text().match(/Not sent/g)).toHaveLength(1);
+		input.sent();
+		input.failed(drop);
+		expect(view.text().match(/Not sent/g)).toHaveLength(2);
+	});
+
+	test("stays quiet when the shell has exited, which the attach stream reports", () => {
+		const view = fakeScreen();
+		terminalInput(view.screen).failed(new TerminalNotFoundError({ terminalId: "t1" }));
+		expect(view.text()).toBe("");
 	});
 });

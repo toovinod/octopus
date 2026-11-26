@@ -1,6 +1,7 @@
 import { errorMessage, type Follow } from "./daemonRuntime.ts";
 import type { TerminalOutput } from "@repo/contracts/Terminal";
 import { followReattaching } from "./followReattaching.ts";
+import { isConnectionDrop } from "./errorMessage.ts";
 
 export interface TerminalScreen {
 	readonly reset: () => void;
@@ -37,4 +38,20 @@ export const followTerminal = (
 			replayed = false;
 		},
 	});
+};
+
+// Keystrokes typed while the connection is down cannot reach the shell. Replaying them later could run a half-typed
+// command, so they are dropped, and the screen says so once per outage.
+export const terminalInput = (screen: TerminalScreen) => {
+	let noted = false;
+	return {
+		failed: (error: unknown) => {
+			if (noted || !isConnectionDrop(error)) return;
+			noted = true;
+			screen.write(note("Not sent: the connection to the daemon dropped. Type it again once it reconnects"));
+		},
+		sent: () => {
+			noted = false;
+		},
+	};
 };

@@ -1,7 +1,7 @@
 "use client";
 
 import { callDaemon, errorMessage, followDaemon } from "../lib/daemonRuntime.ts";
-import { followTerminal } from "../lib/followTerminal.ts";
+import { followTerminal, terminalInput } from "../lib/followTerminal.ts";
 import type { TerminalInfo } from "@repo/contracts/Terminal";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useEffect, useRef, useState } from "react";
@@ -164,13 +164,15 @@ const TerminalView = ({ terminalId, visible }: { readonly terminalId: string; re
 			fitRef.current = resize;
 			const observer = new ResizeObserver(resize);
 			observer.observe(host);
+			const screen = { reset: () => terminal.reset(), write: (data: string) => terminal.write(data) };
+			const typed = terminalInput(screen);
 			const input = terminal.onData((data) => {
-				void callDaemon((daemon) => daemon.writeTerminal({ terminalId, data })).catch(() => undefined);
+				void callDaemon((daemon) => daemon.writeTerminal({ terminalId, data })).then(typed.sent, typed.failed);
 			});
-			const stop = followTerminal((follow) => followDaemon((daemon) => daemon.attachTerminal({ terminalId }), follow), {
-				reset: () => terminal.reset(),
-				write: (data) => terminal.write(data),
-			});
+			const stop = followTerminal(
+				(follow) => followDaemon((daemon) => daemon.attachTerminal({ terminalId }), follow),
+				screen,
+			);
 			cleanup = () => {
 				clearTimeout(resizeTimer);
 				stop();
