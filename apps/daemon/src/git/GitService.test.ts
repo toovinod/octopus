@@ -170,6 +170,39 @@ describe("GitService diff", () => {
 		expect(diff.files.map((file) => [file.path, file.status])).toEqual([["feature.txt", "added"]]);
 	});
 
+	test("diffs against a base branch that only origin has", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const repositoryPath = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* addOrigin(tempDir, repositoryPath);
+				yield* runGit(repositoryPath, ["checkout", "-b", "develop"]);
+				yield* runGit(repositoryPath, ["commit", "--allow-empty", "-m", "develop work"]);
+				yield* runGit(repositoryPath, ["push", "origin", "develop"]);
+				yield* runGit(repositoryPath, ["checkout", "main"]);
+				yield* runGit(repositoryPath, ["branch", "-D", "develop"]);
+				const project = yield* projects.add(repositoryPath);
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "develop",
+				});
+				yield* fs.writeFileString(join(created.path, "feature.txt"), "feature\n");
+				yield* runGit(created.path, ["add", "feature.txt"]);
+				yield* runGit(created.path, ["commit", "-m", "feature"]);
+				return {
+					diff: yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id)),
+					base: yield* runGit(repositoryPath, ["rev-parse", "origin/develop"]),
+				};
+			}),
+		);
+		expect(diff.diff.mergeBase).toBe(diff.base);
+		expect(diff.diff.files.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
 	test("leaves a huge file out of the summary and loads it on request", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

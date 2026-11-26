@@ -43,6 +43,7 @@ import { type Workspace, WorkspaceArchivedError } from "@repo/contracts/Workspac
 import { Context, Effect, type FileSystem, Layer, Schema } from "effect";
 import { type GhCommandError, requireGhLogin, runGh } from "./runGh.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
+import { resolveBranchRef } from "../workspaces/createWorktree.ts";
 import { readWorkspaceFile } from "../files/readWorkspaceFile.ts";
 import { holdsForkCode } from "../workspaces/forkBranch.ts";
 import type { ChildProcessSpawner } from "effect/process";
@@ -176,15 +177,20 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 
 		// The point where the workspace left its base branch. Without one (unrelated histories, a missing
 		// base branch) the diff falls back to HEAD and shows only uncommitted changes.
-		const findMergeBase = (current: Workspace) =>
-			runGit(current.path, ["merge-base", "HEAD", current.baseBranch]).pipe(
+		const findMergeBase = Effect.fnUntraced(function* (current: Workspace) {
+			const fallBack = (reason: string, cause?: unknown) =>
+				Effect.logWarning(reason, cause).pipe(Effect.annotateLogs({ workspaceId: current.id }), Effect.as("HEAD"));
+			// A bare name misses a base branch that only origin has, as when the workspace was made from it.
+			const base = yield* resolveBranchRef(current.path, current.baseBranch);
+			if (base === null) {
+				return yield* fallBack("The base branch is gone, diffing against HEAD");
+			}
+			return yield* runGit(current.path, ["merge-base", "HEAD", base]).pipe(
 				Effect.catchTag("GitCommandError", (cause) =>
-					Effect.logWarning("No merge base with the base branch, diffing against HEAD", cause).pipe(
-						Effect.annotateLogs({ workspaceId: current.id }),
-						Effect.as("HEAD"),
-					),
+					fallBack("No merge base with the base branch, diffing against HEAD", cause),
 				),
 			);
+		});
 
 		const untrackedFile = Effect.fn("GitService.untrackedFile")(function* (
 			cwd: string,
