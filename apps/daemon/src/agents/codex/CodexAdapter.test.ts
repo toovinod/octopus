@@ -489,10 +489,13 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
 	});
 
-	test("a steer that loses the race with the turn's end waits for its own turn", async () => {
+	test.each([
+		["ended", "ends quietly"],
+		["moved on", "moves on"],
+	])("a steer Codex refuses because its turn %s waits for its own turn", async (_kind, text) => {
 		const [sent, events] = await runSession((handle) =>
 			Effect.gen(function* () {
-				yield* handle.sendMessage(userMessage("ends quietly"));
+				yield* handle.sendMessage(userMessage(text));
 				yield* Effect.sleep("100 millis");
 				const sent = yield* handle.sendMessage(userMessage("hi"), { steer: true });
 				yield* takeUntil(handle, "turn.completed");
@@ -501,6 +504,20 @@ describe("CodexAdapter", () => {
 		);
 		expect(sent).toBe("queued");
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
+	});
+
+	test("a steer Codex refuses for another reason fails visibly, even once the turn has ended", async () => {
+		const error = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("refuses steer"));
+				yield* Effect.sleep("100 millis");
+				return yield* Effect.flip(handle.sendMessage(userMessage("hi"), { steer: true }));
+			}),
+		);
+		expect(error).toMatchObject({
+			_tag: "AgentProtocolError",
+			message: "Codex rejected a request: cannot steer a review turn",
+		});
 	});
 
 	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {

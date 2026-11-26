@@ -20,8 +20,8 @@ const threadId = "thread-new";
 let turns = 0;
 let turnId = "";
 let interrupted = false;
-// Codex can end a turn before its turn/completed reaches Octopus.
-let turnEnded = false;
+// How Codex refuses a steer once the turn ended or moved on, and whether it ends the turn before refusing.
+let steerRefusal: { readonly message: string; readonly endFirst: boolean } | null = null;
 let experimentalApi = false;
 // The config overrides the thread was started or resumed with.
 let threadConfig: unknown = null;
@@ -510,7 +510,7 @@ const serve = async () => {
 			case "turn/start": {
 				turnId = `turn-${++turns}`;
 				interrupted = false;
-				turnEnded = false;
+				steerRefusal = null;
 				const text: string = message.params.input[0].text;
 				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
 				// Never answered, like a hung app-server.
@@ -530,10 +530,22 @@ const serve = async () => {
 					reply();
 					break;
 				}
-				if (text.includes("ends quietly")) {
+				// Codex's turn has ended or moved on, but its turn/completed reaches Octopus late.
+				if (text.includes("ends quietly") || text.includes("moves on")) {
 					reply();
-					turnEnded = true;
+					steerRefusal = {
+						message: text.includes("moves on")
+							? `expected active turn id \`${turnId}\` but found \`turn-other\``
+							: "no active turn to steer",
+						endFirst: false,
+					};
 					setTimeout(() => completeTurn("completed"), 300);
+					break;
+				}
+				// The turn ends while a steer is on its way, and Codex refuses it for another reason.
+				if (text.includes("refuses steer")) {
+					reply();
+					steerRefusal = { message: "cannot steer a review turn", endFirst: true };
 					break;
 				}
 				if (text.includes("slow")) {
@@ -545,10 +557,19 @@ const serve = async () => {
 				void runTurn(text, message.params);
 				break;
 			}
-			// Answered only once the turn ended, like a steer that lost the race with it. Otherwise never answered,
-			// like a hung app-server.
+			// Refused once the turn ended or moved on. Otherwise never answered, like a hung app-server.
 			case "turn/steer":
-				if (turnEnded) send({ id: message.id, error: { code: -32600, message: "no active turn to steer" } });
+				if (steerRefusal === null) break;
+				{
+					const refuse = { id: message.id, error: { code: -32600, message: steerRefusal.message } };
+					if (!steerRefusal.endFirst) {
+						send(refuse);
+						break;
+					}
+					// Late enough that Octopus has seen the turn end before the refusal arrives.
+					completeTurn("completed");
+					setTimeout(() => send(refuse), 100);
+				}
 				break;
 			case "turn/interrupt":
 				if (message.params.turnId !== turnId) {
