@@ -1,0 +1,100 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "8d7b60ee-30a1-4ad1-9a91-fe9b04831eab",
+  "prevIds": [
+    "04f79058-a3e8-46f5-99d7-2063704571ee"
+  ],
+  "footprints": [
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_requested_state_check",
+        "n|con|public.cloud_workspace.cloud_workspace_requested_state_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.requested_state"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_observed_state_check",
+        "n|con|public.cloud_workspace.cloud_workspace_observed_state_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.observed_state"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "cloud_workspace"
+      ],
+      "writes": [
+        "s|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "n|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "e|ck|public.cloud_workspace.cloud_workspace_sandbox_provider_check",
+        "n|con|public.cloud_workspace.cloud_workspace_sandbox_provider_check"
+      ],
+      "reads": [
+        "n|tbl|public.cloud_workspace",
+        "n|sch|public",
+        "n|col|public.cloud_workspace.sandbox_provider"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_requested_state_check",
+        "value": "\"requested_state\" in ('running', 'stopped', 'archived')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_observed_state_check",
+        "value": "\"observed_state\" in ('provisioning', 'running', 'sleeping', 'stopped', 'failed', 'unknown')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "cloud_workspace",
+        "name": "cloud_workspace_sandbox_provider_check",
+        "value": "\"sandbox_provider\" in ('vercel')",
+        "entityType": "checks"
+      }
+    }
+  ]
+}
