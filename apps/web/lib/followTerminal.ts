@@ -1,5 +1,5 @@
+import { errorMessage, type Follow } from "./daemonRuntime.ts";
 import type { TerminalOutput } from "@repo/contracts/Terminal";
-import { errorTag, type Follow } from "./daemonRuntime.ts";
 import { followReattaching } from "./followReattaching.ts";
 
 export interface TerminalScreen {
@@ -28,14 +28,10 @@ export const followTerminal = (
 			}
 			screen.write(output.data);
 		},
-		onDrop: (error) => {
-			// The shell exited while we were away, or the daemon restarted without it.
-			if (errorTag(error) === "TerminalNotFoundError") {
-				screen.write(note("This terminal has closed. Open a new one."));
-				return false;
-			}
-			screen.write(note("Disconnected. Reconnecting"));
-			return true;
+		onDrop: () => screen.write(note("Disconnected. Reconnecting")),
+		// The shell exited while we were away, or the daemon restarted without it, or the attach cannot work.
+		onEnd: (error) => {
+			if (error !== null) screen.write(note(errorMessage(error)));
 		},
 		onReattach: () => {
 			replayed = false;

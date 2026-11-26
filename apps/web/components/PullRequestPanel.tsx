@@ -71,7 +71,13 @@ export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace 
 		if (!checksPending) return;
 		return followReattaching<PullRequestStatus>(
 			(handlers) => followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), handlers),
-			{ onItem: replace, onReattach: reload },
+			{
+				onItem: replace,
+				onReattach: reload,
+				onEnd: (error) => {
+					if (error !== null) toast(errorMessage(error));
+				},
+			},
 		);
 	}, [checksPending, workspace.id, replace, reload]);
 	return (

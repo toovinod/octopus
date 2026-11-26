@@ -17,6 +17,7 @@ import { playChime, showNotification } from "./desktop.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { releaseComments } from "./pendingComments.ts";
 import type { Project } from "@repo/contracts/Project";
+import { isConnectionDrop } from "./errorMessage.ts";
 import type { DraftImage } from "./images.ts";
 import { useSyncExternalStore } from "react";
 import { releaseDrafts } from "./drafts.ts";
@@ -214,8 +215,7 @@ export const boot = async () => {
 	if (start !== undefined) selectWorkspace(start.id);
 };
 
-// Only a dropped socket is worth retrying. A daemon error would fail the same way again.
-export const isConnectionDrop = (error: unknown) => errorTag(error) === "RpcClientError";
+export { isConnectionDrop };
 
 // Exponential from half a second, capped at 30 s. The jitter keeps windows from retrying in lockstep.
 export const reconnectDelay = (attempt: number, random: () => number = Math.random) =>

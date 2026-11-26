@@ -18,3 +18,6 @@ export const errorMessage = (error: unknown): string => {
 		? error.message
 		: "Something went wrong. Try again.";
 };
+
+// Only a dropped socket is worth retrying. A daemon error would fail the same way again.
+export const isConnectionDrop = (error: unknown) => errorTag(error) === "RpcClientError";

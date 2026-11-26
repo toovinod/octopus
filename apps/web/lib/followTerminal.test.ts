@@ -40,7 +40,7 @@ describe("followTerminal", () => {
 		const view = fakeScreen();
 		followTerminal(daemon.attach, view.screen);
 		daemon.attaches[0]?.onItem({ type: "data", data: "$ ls\r\n" });
-		daemon.attaches[0]?.onEnd?.(new Error("socket closed"));
+		daemon.attaches[0]?.onEnd?.({ _tag: "RpcClientError", message: "SocketCloseError: closed" });
 		expect(view.text()).toContain("Disconnected. Reconnecting");
 
 		jest.advanceTimersByTime(1000);
@@ -76,7 +76,7 @@ describe("followTerminal", () => {
 		const daemon = fakeDaemon();
 		const view = fakeScreen();
 		const stop = followTerminal(daemon.attach, view.screen);
-		daemon.attaches[0]?.onEnd?.(new Error("socket closed"));
+		daemon.attaches[0]?.onEnd?.({ _tag: "RpcClientError", message: "SocketCloseError: closed" });
 		stop();
 		jest.advanceTimersByTime(5000);
 		expect(daemon.attaches).toHaveLength(1);
