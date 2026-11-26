@@ -350,7 +350,7 @@ pub fn run() {
     .expect("error while building tauri application")
     .run(|app, event| match event {
       // Holding every exit back would also cancel a macOS logout or restart, so it is held only to ask first.
-      // Otherwise the app exits now and `RunEvent::Exit` closes octopusd's stdin, which shuts it down cleanly.
+      // Otherwise the app exits now, and `RunEvent::Exit` stops octopusd.
       // Our own `app.exit` in `quit` asks again, and that one goes through.
       RunEvent::ExitRequested { api, .. } => {
         let daemon = app.state::<Daemon>();
@@ -365,8 +365,9 @@ pub fn run() {
       // A click on the dock icon brings back the window that closing hid.
       #[cfg(target_os = "macos")]
       RunEvent::Reopen { has_visible_windows: false, .. } => show_windows(app),
-      // In case the app exits without asking first. A crash closes stdin too.
-      RunEvent::Exit => drop(take_daemon_child(app)),
+      // An exit nothing held back, such as a logout, still waits for octopusd and kills it if it hangs. After
+      // `quit` the daemon is already stopped and this returns at once. A crash closes stdin too.
+      RunEvent::Exit => tauri::async_runtime::block_on(stop_daemon(app)),
       _ => {}
     });
 }
@@ -437,33 +438,34 @@ fn take_daemon_child(app: &tauri::AppHandle) -> Option<(CommandChild, u32)> {
   app.state::<Daemon>().child.lock().ok().and_then(|mut child| child.take())
 }
 
-// Dropping the child closes the daemon's stdin, and it shuts down and stops everything it
-// started. `kill()` would SIGKILL it at once and orphan its children, so the app hides its
-// windows, waits off the UI thread for the daemon to exit, and kills it only when it hangs.
+// Dropping the child closes the daemon's stdin, and it shuts down and stops everything it started. `kill()`
+// would SIGKILL it at once and orphan its children, so this waits for the daemon to exit and kills it only
+// when it hangs.
+async fn stop_daemon(app: &tauri::AppHandle) {
+  let Some((child, pid)) = take_daemon_child(app) else { return };
+  let mut status = app.state::<Daemon>().status.subscribe();
+  drop(child);
+  let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
+  if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
+    log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
+    // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
+    // it leaves are stopped by the next octopusd from its process registry.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+  }
+}
+
+// Hides the windows, stops the daemon off the UI thread, then exits.
 fn quit(app: &tauri::AppHandle) {
-  let daemon = app.state::<Daemon>();
   // Two quit requests, say from two dialogs, stop the daemon once.
-  if daemon.quitting.swap(true, Ordering::SeqCst) {
+  if app.state::<Daemon>().quitting.swap(true, Ordering::SeqCst) {
     return;
   }
-  let Some((child, pid)) = take_daemon_child(app) else {
-    app.exit(0);
-    return;
-  };
   for window in app.webview_windows().values() {
     let _ = window.hide();
   }
-  drop(child);
-  let mut status = daemon.status.subscribe();
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
-    let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
-    if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
-      log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
-      // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
-      // it leaves are stopped by the next octopusd from its process registry.
-      unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
+    stop_daemon(&app).await;
     app.exit(0);
   });
 }
