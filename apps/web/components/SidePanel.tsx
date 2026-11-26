@@ -70,6 +70,6 @@ const PanelBody = ({ tab, workspaceKey }: { readonly tab: PanelTab; readonly wor
 		case "run":
 			return <RunPanel key={workspace.id} workspace={workspace} />;
 		case "pr":
-			return <PullRequestPanel key={workspace.id} workspace={workspace} />;
+			return <PullRequestPanel key={workspace.id} workspace={workspace} visible={active && panelOpen} />;
 	}
 };

@@ -52,17 +52,31 @@ const MERGE_LABELS: Record<PullRequestMergeMethod, string> = {
 	rebase: "Rebase and merge",
 };
 
-export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace }) => {
+export const PullRequestPanel = ({
+	workspace,
+	visible,
+}: {
+	readonly workspace: Workspace;
+	readonly visible: boolean;
+}) => {
 	const { loaded, reload, replace } = useDaemonValue(
 		() => callDaemon((daemon) => daemon.getPullRequest({ workspaceId: workspace.id })),
 		// A pull request opened from another window or the CLI shows up once the workspace learns its URL.
 		`${workspace.id}:${workspace.pullRequestUrl ?? ""}`,
 	);
-	// Merges, reviews and pushes also happen on GitHub, so coming back to the app asks again.
+	// Merges, reviews and pushes also happen on GitHub, so coming back to the app asks again. Each ask runs gh, so a
+	// hidden panel waits, and asks once when it is shown again.
+	const wasVisible = useRef(visible);
 	useEffect(() => {
+		if (!visible) {
+			wasVisible.current = false;
+			return;
+		}
+		if (!wasVisible.current) reload();
+		wasVisible.current = true;
 		window.addEventListener("focus", reload);
 		return () => window.removeEventListener("focus", reload);
-	}, [reload]);
+	}, [visible, reload]);
 	const checksPending =
 		loaded.state === "ready" && loaded.value.status === "found" && loaded.value.pullRequest.checks.pending > 0;
 	// The daemon polls GitHub while checks run and ends the watch once they are done. A dropped connection attaches
