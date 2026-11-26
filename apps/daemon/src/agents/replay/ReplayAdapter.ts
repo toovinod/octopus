@@ -26,21 +26,22 @@ export const makeReplayAdapter = (recording: Recording): AgentAdapter => ({
 	kind: recording.kind,
 	capabilities,
 	authModes: ["apiKey", "subscription"],
-	checkAuth: Effect.succeed({ status: "loggedIn", account: null }),
-	listModels: Effect.succeed({
-		models: [
-			{
-				id: "replay",
-				label: "Replay",
-				description: "",
-				efforts: ["low", "high"],
-				defaultEffort: "low",
-				contextWindow: null,
-				supportsImages: true,
-			},
-		],
-		defaultModel: "replay",
-	}),
+	checkAuth: () => Effect.succeed({ status: "loggedIn", account: null }),
+	listModels: () =>
+		Effect.succeed({
+			models: [
+				{
+					id: "replay",
+					label: "Replay",
+					description: "",
+					efforts: ["low", "high"],
+					defaultEffort: "low",
+					contextWindow: null,
+					supportsImages: true,
+				},
+			],
+			defaultModel: "replay",
+		}),
 	startSession: Effect.fn("ReplayAdapter.startSession")(function* () {
 		const session = yield* makeAgentSession(capabilities);
 		const nextTurn = yield* Ref.make(0);

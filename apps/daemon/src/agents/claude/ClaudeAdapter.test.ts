@@ -503,7 +503,7 @@ describe("ClaudeAdapter", () => {
 		const status = await runWithClaude(
 			Effect.gen(function* () {
 				const claude = yield* ClaudeAdapter;
-				return yield* claude.checkAuth;
+				return yield* claude.checkAuth({ mode: "subscription" });
 			}),
 		);
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
@@ -516,7 +516,9 @@ describe("ClaudeAdapter", () => {
 
 	test("checks the CLI's own login, not an API key in the daemon's environment", async () => {
 		process.env.ANTHROPIC_API_KEY = "sk-from-shell";
-		const status = await runWithClaude(Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth)).finally(() => {
+		const status = await runWithClaude(
+			Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth({ mode: "subscription" })),
+		).finally(() => {
 			delete process.env.ANTHROPIC_API_KEY;
 		});
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
@@ -524,7 +526,9 @@ describe("ClaudeAdapter", () => {
 
 	test("checks the claude.ai login, not an apiKeyHelper from claude's settings file", async () => {
 		process.env.FAKE_CLAUDE_API_KEY_HELPER = "1";
-		const status = await runWithClaude(Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth)).finally(() => {
+		const status = await runWithClaude(
+			Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth({ mode: "subscription" })),
+		).finally(() => {
 			delete process.env.FAKE_CLAUDE_API_KEY_HELPER;
 		});
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });

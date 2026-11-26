@@ -20,6 +20,8 @@ const threadId = "thread-new";
 let turns = 0;
 let turnId = "";
 let interrupted = false;
+// Every turn/interrupt received, so a test can tell a stop was sent only once.
+let interrupts = 0;
 // How Codex refuses a steer once the turn ended or moved on, and whether it ends the turn before refusing.
 let steerRefusal: { readonly message: string; readonly endFirst: boolean } | null = null;
 let experimentalApi = false;
@@ -77,6 +79,14 @@ const runTurn = async (
 ) => {
 	const failure = failures[text];
 	if (failure !== undefined) return completeTurn("failed", { additionalDetails: null, ...failure });
+	if (text.includes("interrupts")) {
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: `interrupts ${interrupts}` },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("images")) {
 		notify("item/completed", {
 			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(params.input.slice(1)) },
@@ -572,6 +582,7 @@ const serve = async () => {
 				}
 				break;
 			case "turn/interrupt":
+				interrupts++;
 				if (message.params.turnId !== turnId) {
 					send({ id: message.id, error: { code: -32602, message: `no running turn ${message.params.turnId}` } });
 					break;
