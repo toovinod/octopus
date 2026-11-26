@@ -114,6 +114,9 @@ struct Daemon {
   // can hold while octopusd is stopped, and quitting runs on the UI thread.
   child: Mutex<Option<(CommandChild, u32)>>,
   quitting: AtomicBool,
+  // Set when octopusd had to start with the app's own minimal environment, so the webview can say why agents,
+  // git or gh may not be found.
+  login_env_missing: AtomicBool,
 }
 
 // What closing the window does. On macOS the app stays in the dock and agents keep working, as macOS apps
@@ -146,6 +149,11 @@ async fn wait_for_connection(daemon: &Daemon) -> Result<DaemonConnection, String
 #[tauri::command]
 fn daemon_stopped(daemon: State<'_, Daemon>) -> Option<StoppedDaemon> {
   stopped_report(&daemon.status.borrow(), daemon.quitting.load(Ordering::SeqCst))
+}
+
+#[tauri::command]
+fn login_env_missing(daemon: State<'_, Daemon>) -> bool {
+  daemon.login_env_missing.load(Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -223,7 +231,9 @@ fn parse_login_env(output: &[u8]) -> Vec<(String, String)> {
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::error::Error>> {
   let token = generate_token()?;
   let mut sidecar = app.shell().sidecar("octopusd")?;
-  match login_shell_env() {
+  let login_env = login_shell_env();
+  app.state::<Daemon>().login_env_missing.store(login_env.is_none(), Ordering::SeqCst);
+  match login_env {
     Some(variables) => sidecar = sidecar.envs(variables),
     None => log::warn!("Could not read the login shell's environment, so octopusd keeps the app's own"),
   }
@@ -303,7 +313,12 @@ pub fn run() {
     })
     .setup(|app| {
       let (status, _) = watch::channel(DaemonStatus::Starting);
-      app.manage(Daemon { status, child: Mutex::new(None), quitting: AtomicBool::new(false) });
+      app.manage(Daemon {
+        status,
+        child: Mutex::new(None),
+        quitting: AtomicBool::new(false),
+        login_env_missing: AtomicBool::new(false),
+      });
       app.manage(QuitWarning(Mutex::new(None)));
       #[cfg(target_os = "macos")]
       app.set_menu(app_menu(app.handle())?)?;
@@ -324,7 +339,13 @@ pub fn run() {
         CloseAction::Quit => request_quit(window.app_handle()),
       }
     })
-    .invoke_handler(tauri::generate_handler![daemon_connection, daemon_stopped, restart_daemon, set_quit_warning])
+    .invoke_handler(tauri::generate_handler![
+      daemon_connection,
+      daemon_stopped,
+      login_env_missing,
+      restart_daemon,
+      set_quit_warning
+    ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app, event| match event {

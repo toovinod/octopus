@@ -11,14 +11,15 @@ import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession } from "@repo/co
 import type { ApprovalDecision, QuestionAnswers, PlanAnswer } from "@repo/contracts/AgentEvent";
 import { applyEvents, type ChatState, emptyChat, prependEvents } from "./chatReducer.ts";
 import { callDaemon, errorMessage, errorTag, followDaemon } from "./daemonRuntime.ts";
+import { loginEnvMissing, playChime, showNotification } from "./desktop.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
-import { playChime, showNotification } from "./desktop.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { releaseComments } from "./pendingComments.ts";
 import type { Project } from "@repo/contracts/Project";
 import { isConnectionDrop } from "./errorMessage.ts";
 import type { DraftImage } from "./images.ts";
+import { logWarning } from "./logWarning.ts";
 import { useSyncExternalStore } from "react";
 import { releaseDrafts } from "./drafts.ts";
 import { toast as showToast } from "sonner";
@@ -211,6 +212,7 @@ export const boot = async () => {
 		},
 	);
 	if (!loaded) return;
+	warnIfLoginEnvMissing();
 	// Checking the agents starts their CLIs and reads the keychain, so it never holds up files, terminals or history.
 	void refreshAgents();
 	watchSessions();
@@ -220,6 +222,19 @@ export const boot = async () => {
 	const start = active.find((workspace) => workspace.id === remembered) ?? active[0];
 	if (start !== undefined) selectWorkspace(start.id);
 };
+
+// Without the login shell's PATH, agents, git and gh can seem missing, and the reason would be invisible.
+const warnIfLoginEnvMissing = () =>
+	void loginEnvMissing().then(
+		(missing) => {
+			if (missing) {
+				toast(
+					"Octopus could not read your login shell's environment, so agents, git and gh may not be found. Check that your shell starts without errors, then restart Octopus.",
+				);
+			}
+		},
+		(error: unknown) => logWarning("Could not ask the desktop shell about the login environment", error),
+	);
 
 export { isConnectionDrop };
 

@@ -23,6 +23,10 @@ export const setQuitWarning = async (warning: string | null) => {
 	if (isDesktop()) await invoke("set_quit_warning", { warning });
 };
 
+// Whether the shell had to start the daemon without the login shell's environment, so without the user's PATH.
+// Must match the command in apps/desktop/src-tauri/src/lib.rs.
+export const loginEnvMissing = async () => isDesktop() && (await invoke<unknown>("login_env_missing")) === true;
+
 let permission: Promise<boolean> | null = null;
 
 const canNotify = () => {
