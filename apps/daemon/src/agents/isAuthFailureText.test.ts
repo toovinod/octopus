@@ -22,6 +22,7 @@ describe("isAuthFailureText", () => {
 		"Process exited after 401 seconds",
 		"Please log in to the staging dashboard to see the preview.",
 		"API Error: 500 Internal server error",
+		"You are not logged into any GitHub hosts. To log in, run: gh auth login",
 	])("does not read %p as a refused credential", (text) => {
 		expect(isAuthFailureText(text)).toBe(false);
 	});
