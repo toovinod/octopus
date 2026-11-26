@@ -81,10 +81,11 @@ const FOLDER_NAME_MAX_LENGTH = 63;
 
 // A branch name as a folder name: workspace folders keep to the characters a workspace name allows. A branch
 // that does not fit as it is gets a hash of its whole name, so `feat/x` and `feat-x`, or two long names that
-// start alike, never share a folder.
+// start alike, never share a folder. So does one with capitals: the file systems of macOS and Windows ignore
+// case, so `Feature` and `feature` would otherwise be one folder.
 export const worktreeFolderName = (branch: string) => {
 	const cleaned = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "");
-	if (cleaned === branch && branch.length <= FOLDER_NAME_MAX_LENGTH) {
+	if (cleaned === branch && branch === branch.toLowerCase() && branch.length <= FOLDER_NAME_MAX_LENGTH) {
 		return branch;
 	}
 	const suffix = `-${(Hash.string(branch) >>> 0).toString(16).padStart(8, "0")}`;
