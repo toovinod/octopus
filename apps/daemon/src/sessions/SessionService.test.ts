@@ -25,24 +25,26 @@ import {
 	TEST_LOGIN_URL,
 	testAgentServices,
 } from "../testing/testAgentServices.ts";
+import { agentSession, sessionAttachment, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
-import { agentSession, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
+import { type AgentSession, makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
 import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/AgentSession";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
-import { makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
+import { SessionService, STREAMED_TEXT_MAX_LENGTH } from "./SessionService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
+import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { AgentEvent } from "@repo/contracts/AgentEvent";
-import { SessionService } from "./SessionService.ts";
+import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
+import { asc, eq, sql } from "drizzle-orm";
 import { TestClock } from "effect/testing";
 import { runGit } from "../git/runGit.ts";
-import { asc, eq } from "drizzle-orm";
 import { join } from "node:path";
 
 const addWorkspace = Effect.fn("addWorkspace")(function* (tempDir: string) {
@@ -127,6 +129,48 @@ const runWithRecording = <A, E>(recording: Recording, program: (tempDir: string)
 			}),
 		)(program(tempDir)),
 	);
+
+// A Codex agent whose turn streams these deltas, then does what `then` says, as a model that pauses or dies
+// mid-reply. Interrupting the turn ends it, as a real agent does.
+const streamingAgent = (
+	deltas: ReadonlyArray<AgentEvent>,
+	then: (session: AgentSession) => Effect.Effect<void>,
+): AgentAdapter => {
+	const replay = makeReplayAdapter(commandWithApproval);
+	return {
+		...replay,
+		startSession: () =>
+			Effect.gen(function* () {
+				const session = yield* makeAgentSession(replay.capabilities);
+				yield* session.setNativeSessionId("thread-streaming");
+				return yield* session.start({
+					startTurn: () => Effect.forEach(deltas, session.emit, { discard: true }).pipe(Effect.andThen(then(session))),
+					steerTurn: () => Effect.succeed(true),
+					interruptTurn: session.emit({ type: "turn.completed", turnId: "t1", result: { status: "interrupted" } }),
+					updateSettings: () => Effect.void,
+					listCommands: Effect.succeed([]),
+				});
+			}),
+	};
+};
+
+const runWithCodex = <A, E>(codex: AgentAdapter, program: (tempDir: string) => Effect.Effect<A, E, Services>) =>
+	runInTempDir((tempDir) =>
+		withServices(
+			join(tempDir, "data"),
+			testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+		)(program(tempDir)),
+	);
+
+// What a subscriber that has every stored event gets within a moment: only the text streamed so far.
+const snapshotAfterStored = (sessionId: string) =>
+	Effect.gen(function* () {
+		const sessions = yield* SessionService;
+		const stored = yield* storedEvents(sessionId);
+		return yield* sessions
+			.subscribe(sessionId, stored.at(-1)?.sequence ?? -1)
+			.pipe(Stream.interruptWhen(Effect.sleep("200 millis")), Stream.runCollect);
+	});
 
 const sequences = (events: ReadonlyArray<SessionEvent>) => events.map((stored) => stored.sequence);
 
@@ -234,6 +278,133 @@ describe("SessionService", () => {
 			"reasoning.completed",
 			"turn.completed",
 		]);
+	});
+
+	test("a subscriber that joins mid-reply first gets the text streamed so far", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const more = Effect.runSync(Deferred.make<void>());
+		// A turn that streams part of a reply, then waits, as a model does between tokens.
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-partial");
+					return yield* session.start({
+						startTurn: () =>
+							Effect.gen(function* () {
+								const streamed: Array<AgentEvent> = [
+									{ type: "message.delta", itemId: "m0", text: "Done" },
+									{ type: "message.completed", itemId: "m0", text: "Done" },
+									{ type: "reasoning.delta", itemId: "r1", text: "Thi" },
+									{ type: "reasoning.delta", itemId: "r1", text: "nk" },
+									{ type: "message.delta", itemId: "m1", text: "Hel" },
+									{ type: "message.delta", itemId: "m1", text: "lo" },
+								];
+								yield* Effect.forEach(streamed, session.emit, { discard: true });
+								yield* Deferred.await(more);
+								yield* session.emit({ type: "message.delta", itemId: "m1", text: "!" });
+							}),
+						steerTurn: () => Effect.succeed(true),
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
+					});
+				}),
+		};
+		const received = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "go", [], false);
+					yield* waitForStored(session.id, 3);
+					// Let the deltas after the stored reply reach the service.
+					yield* Effect.sleep("100 millis");
+					const subscriber = yield* sessions
+						.subscribe(session.id, -1)
+						.pipe(Stream.take(6), Stream.runCollect, Effect.timeout("5 seconds"), Effect.forkChild);
+					yield* Effect.sleep("100 millis");
+					yield* Deferred.succeed(more, undefined);
+					return yield* Fiber.join(subscriber);
+				}),
+			),
+		);
+		expect(received.map((stored) => [stored.event.type, stored.sequence])).toEqual([
+			["session.started", 0],
+			["user.message", 1],
+			["message.completed", 2],
+			["reasoning.delta", null],
+			["message.delta", null],
+			["message.delta", null],
+		]);
+		expect(received.slice(3).map((stored) => stored.event)).toEqual([
+			{ type: "reasoning.delta", itemId: "r1", text: "Think", snapshot: true },
+			{ type: "message.delta", itemId: "m1", text: "Hello", snapshot: true },
+			{ type: "message.delta", itemId: "m1", text: "!" },
+		]);
+	});
+
+	test("keeps only the latest streamed text of a long reply, marked as cut", async () => {
+		const long = "a".repeat(STREAMED_TEXT_MAX_LENGTH);
+		const codex = streamingAgent(
+			[
+				{ type: "message.delta", itemId: "m1", text: `start${long}` },
+				{ type: "message.delta", itemId: "m1", text: "end" },
+			],
+			() => Effect.void,
+		);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStored(session.id, 2);
+				yield* Effect.sleep("100 millis");
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received.map((stored) => stored.event)).toEqual([
+			{ type: "message.delta", itemId: "m1", text: `…${long.slice(3)}end`, snapshot: true },
+		]);
+	});
+
+	test("an interrupted turn leaves no streamed text behind", async () => {
+		const codex = streamingAgent([{ type: "message.delta", itemId: "m1", text: "Hel" }], () => Effect.void);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStored(session.id, 2);
+				yield* Effect.sleep("100 millis");
+				yield* sessions.interrupt(session.id);
+				yield* waitForStored(session.id, 3);
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received).toEqual([]);
+	});
+
+	test("an agent that dies mid-reply leaves no streamed text behind", async () => {
+		const codex = streamingAgent([{ type: "message.delta", itemId: "m1", text: "Hel" }], (session) =>
+			Effect.sleep("50 millis").pipe(
+				Effect.andThen(session.fail(new AgentProtocolError({ message: "Codex exited.", cause: null }))),
+			),
+		);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStatus(session.id, "failed");
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received).toEqual([]);
 	});
 
 	test("a cursor subscription has no gap or duplicate while events arrive during paging", async () => {
@@ -716,6 +887,69 @@ describe("SessionService", () => {
 		]);
 	});
 
+	test("a restart that cannot close a cut-off turn leaves it to close on the next start", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const dataDir = join(tempDir, "data");
+				// Only the database, since every other service needs the startup that keeps failing.
+				const dropTrigger = LocalDatabase.use((database) =>
+					database.query((db) => db.run(sql`DROP TRIGGER refuseEvents`)),
+				).pipe(Effect.provide(LocalDatabase.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]))));
+				const sessionId = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const database = yield* LocalDatabase;
+						const session = yield* addSession(tempDir);
+						yield* database.query((db) =>
+							db.update(agentSession).set({ status: "running" }).where(eq(agentSession.id, session.id)),
+						);
+						// The disk fills up, say, just as the restart writes the closing events.
+						yield* database.query((db) =>
+							db.run(
+								sql`CREATE TRIGGER refuseEvents BEFORE INSERT ON sessionEvent BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+							),
+						);
+						return session.id;
+					}),
+				);
+				const failedStart = yield* Effect.exit(withServices(dataDir)(Effect.void));
+				yield* dropTrigger;
+				return yield* withServices(dataDir)(
+					Effect.all({
+						failedStart: Effect.succeed(failedStart._tag),
+						status: statusOf(sessionId),
+						stored: storedEvents(sessionId),
+					}),
+				);
+			}),
+		);
+		expect(result.failedStart).toBe("Failure");
+		expect(result.status).toBe("interrupted");
+		expect(result.stored.map((row) => row.payload)).toEqual([
+			{ type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } },
+		]);
+	});
+
+	test("a native session id the database refuses leaves no session.started in history", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				yield* database.query((db) =>
+					db.run(
+						sql`CREATE TRIGGER refuseNativeId BEFORE UPDATE OF nativeSessionId ON agentSession WHEN NEW.nativeSessionId IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+					),
+				);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "failed");
+				const [row] = yield* sessions.list(session.workspaceId);
+				return { types: (yield* storedEvents(session.id)).map((stored) => stored.type), row };
+			}),
+		);
+		expect(result.types).not.toContain("session.started");
+		expect(result.row?.nativeSessionId).toBeNull();
+	});
+
 	test("an agent process that dies mid-turn leaves its approval cancelled and its turn ended", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
 		const codex: AgentAdapter = {
@@ -1117,6 +1351,54 @@ describe("SessionService", () => {
 		);
 	});
 
+	test("a session created while its workspace is being archived is refused and never stored", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const stopping = yield* Deferred.make<void>();
+				const release = yield* Deferred.make<void>();
+				const replay = makeReplayAdapter(commandWithApproval);
+				// An agent that takes its time to stop, so the archive is under way while the create arrives.
+				const codex: AgentAdapter = {
+					...replay,
+					startSession: (input) =>
+						replay.startSession(input).pipe(
+							Effect.map((handle) => ({
+								...handle,
+								interrupt: Deferred.succeed(stopping, undefined).pipe(
+									Effect.andThen(Deferred.await(release)),
+									Effect.andThen(handle.interrupt),
+								),
+							})),
+						),
+				};
+				return yield* withServices(
+					join(tempDir, "data"),
+					testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+				)(
+					Effect.gen(function* () {
+						const sessions = yield* SessionService;
+						const workspaces = yield* WorkspaceService;
+						const busy = yield* addSession(tempDir);
+						yield* sessions.sendMessage(busy.id, "run the tests", [], false);
+						yield* waitForStatus(busy.id, "awaitingApproval");
+						const archiving = yield* workspaces.archive(busy.workspaceId, { force: false }).pipe(Effect.forkChild);
+						yield* Deferred.await(stopping);
+						const creating = yield* sessions
+							.create({ workspaceId: busy.workspaceId, agent: "codex", model: "replay", effort: null })
+							.pipe(Effect.flip, Effect.forkChild);
+						// Give the create every chance to run its check and insert before the archive ends.
+						yield* Effect.sleep("100 millis");
+						yield* Deferred.succeed(release, undefined);
+						yield* Fiber.join(archiving);
+						return { error: yield* Fiber.join(creating), sessions: yield* sessions.list(busy.workspaceId) };
+					}),
+				);
+			}),
+		);
+		expect(result.error._tag).toBe("WorkspaceNotFoundError");
+		expect(result.sessions.length).toBe(1);
+	});
+
 	test("archiving a workspace stops its agent processes", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -1213,6 +1495,35 @@ describe("SessionService", () => {
 		expect(result.removed).toBe(true);
 	});
 
+	test("stores a lookup row with each sent image, and serves it only to its own session", async () => {
+		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				const other = yield* sessions.create({
+					workspaceId: session.workspaceId,
+					agent: "codex",
+					model: "replay",
+					effort: null,
+				});
+				yield* sessions.sendMessage(session.id, "look", [image], false);
+				yield* waitForStored(session.id, 2);
+				const lookups = yield* database.query((db) => db.select().from(sessionAttachment));
+				const attachmentId = lookups[0]?.id ?? "";
+				return {
+					lookups,
+					served: yield* sessions.getAttachment(session.id, attachmentId),
+					elsewhere: yield* Effect.flip(sessions.getAttachment(other.id, attachmentId)),
+				};
+			}),
+		);
+		expect(result.lookups.map(({ mediaType }) => mediaType)).toEqual(["image/png"]);
+		expect(result.served).toEqual(image);
+		expect(result.elsewhere._tag).toBe("AttachmentNotFoundError");
+	});
+
 	test("keeps sent images when archiving the workspace fails", async () => {
 		const image = { mediaType: "image/png", base64: Buffer.from("png bytes").toString("base64") } as const;
 		const result = await runServiceTest((tempDir) =>
@@ -1286,9 +1597,12 @@ describe("SessionService", () => {
 		});
 	});
 
-	test("a steer the agent rejects leaves no message in history and no image on disk", async () => {
+	test("a steer that reaches the agent after its turn ended runs as the next turn", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
-		// A turn that keeps running, so the next message steers, and an agent that rejects every steer.
+		const finish = Effect.runSync(Deferred.make<void>());
+		let turns = 0;
+		// The first turn is still running when the steer is sent, but the agent ends it before the steer lands, as
+		// Codex refuses a turn/steer for a turn that just completed.
 		const codex: AgentAdapter = {
 			...replay,
 			capabilities: { ...replay.capabilities, steerWhileRunning: true },
@@ -1297,8 +1611,15 @@ describe("SessionService", () => {
 					const session = yield* makeAgentSession({ ...replay.capabilities, steerWhileRunning: true });
 					yield* session.setNativeSessionId("thread-steer");
 					return yield* session.start({
-						startTurn: () => session.emit({ type: "message.completed", itemId: "working", text: "working" }),
-						steerTurn: () => Effect.fail(new AgentProtocolError({ message: "No active turn", cause: null })),
+						startTurn: () =>
+							Effect.gen(function* () {
+								turns++;
+								const turnId = `turn-${turns}`;
+								yield* session.emit({ type: "message.completed", itemId: turnId, text: "working" });
+								if (turns === 1) yield* Deferred.await(finish);
+								yield* session.emit({ type: "turn.completed", turnId, result: { status: "completed" } });
+							}),
+						steerTurn: () => Effect.fail(new AgentProtocolError({ message: "No active turn to steer", cause: null })),
 						interruptTurn: Effect.void,
 						updateSettings: () => Effect.void,
 						listCommands: Effect.succeed([]),
@@ -1317,21 +1638,35 @@ describe("SessionService", () => {
 					const session = yield* addSession(tempDir);
 					yield* sessions.sendMessage(session.id, "first", [], false);
 					yield* waitForStored(session.id, 3);
-					const error = yield* Effect.flip(sessions.sendMessage(session.id, "steer", [image], true));
-					// Give a wrongly recorded message time to reach the database.
-					yield* Effect.sleep("100 millis");
-					const directory = join(tempDir, "data", "attachments", session.id);
+					yield* sessions.sendMessage(session.id, "steer", [image], true);
+					yield* Deferred.succeed(finish, undefined);
+					const stored = yield* waitForStored(session.id, 7);
+					yield* waitForStatus(session.id, "idle");
 					return {
-						error,
-						types: (yield* storedEvents(session.id)).map((row) => row.type),
-						files: (yield* fs.exists(directory)) ? yield* fs.readDirectory(directory) : [],
+						messages: stored.flatMap((row) => {
+							const event = Schema.decodeUnknownSync(AgentEvent)(row.payload);
+							return event.type === "user.message" ? [[event.text, event.attachments.length]] : [];
+						}),
+						types: stored.map((row) => row.type),
+						files: yield* fs.readDirectory(join(tempDir, "data", "attachments", session.id)),
 					};
 				}),
 			),
 		);
-		expect(result.error._tag).toBe("AgentUnavailableError");
-		expect(result.types).toEqual(["session.started", "user.message", "message.completed"]);
-		expect(result.files).toEqual([]);
+		expect(result.types).toEqual([
+			"session.started",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+			"user.message",
+			"message.completed",
+			"turn.completed",
+		]);
+		expect(result.messages).toEqual([
+			["first", 0],
+			["steer", 1],
+		]);
+		expect(result.files.length).toBe(1);
 	});
 
 	test("a send cancelled before the agent takes it leaves the session idle and no image on disk", async () => {

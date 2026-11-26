@@ -70,8 +70,8 @@ import {
 	isLiveOnly,
 	type PlanAnswer,
 } from "@repo/contracts/AgentEvent";
+import { agentSession, project, sessionAttachment, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../database/LocalDatabase.ts";
-import { agentSession, project, sessionEvent, setting, workspace } from "../database/schema.ts";
 import { CheckpointNotFoundError, WorkspaceAgentsBusyError } from "@repo/contracts/Checkpoint";
 import { WorkspaceArchivedError, WorkspaceNotFoundError } from "@repo/contracts/Workspace";
 import { and, asc, desc, eq, gt, inArray, lt, max } from "drizzle-orm";
@@ -101,6 +101,9 @@ const IDLE_TIMEOUT = Duration.toNanosUnsafe("5 minutes");
 const IDLE_SWEEP_INTERVAL = "30 seconds";
 
 type SessionRow = typeof agentSession.$inferSelect;
+type SessionPatch = Partial<
+	Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort" | "mode">
+>;
 type RestingStatus = Extract<AgentSessionStatus, "idle" | "interrupted" | "failed">;
 
 // The live agent process of one session and what the daemon tracks about its turns.
@@ -122,6 +125,9 @@ interface Runtime {
 	unsent: ReadonlyArray<UserMessage>;
 	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
 	readonly approvals: Map<string, Cancellation>;
+	// The text each reply and thinking item streamed so far, until it completes. Deltas are never stored, so
+	// a subscriber that joins mid-reply gets this first.
+	readonly streamed: Map<string, Streamed>;
 	// The status when no turn or approval is pending.
 	resting: RestingStatus;
 	status: AgentSessionStatus;
@@ -131,6 +137,42 @@ interface Published {
 	readonly event: SessionEvent;
 	readonly bytes: number;
 }
+
+// Characters of in-flight text kept per item. A reply this long is rare, and its completed event still
+// carries all of it, so a late subscriber sees only the latest part until then.
+export const STREAMED_TEXT_MAX_LENGTH = 64_000;
+
+interface Streamed {
+	readonly type: Extract<AgentEvent, { type: "message.delta" | "reasoning.delta" }>["type"];
+	readonly itemId: string;
+	readonly text: string;
+	// The start was dropped to stay within the cap.
+	readonly cut: boolean;
+}
+
+// Keeps what an item streamed so far, and drops it once the item or its turn completes.
+const keepStreamed = (streamed: Map<string, Streamed>, event: AgentEvent) => {
+	switch (event.type) {
+		case "message.delta":
+		case "reasoning.delta": {
+			const key = `${event.type}:${event.itemId}`;
+			const kept = streamed.get(key);
+			const text = (kept?.text ?? "") + event.text;
+			const cut = (kept?.cut ?? false) || text.length > STREAMED_TEXT_MAX_LENGTH;
+			streamed.set(key, { type: event.type, itemId: event.itemId, text: text.slice(-STREAMED_TEXT_MAX_LENGTH), cut });
+			break;
+		}
+		case "message.completed":
+			streamed.delete(`message.delta:${event.itemId}`);
+			break;
+		case "reasoning.completed":
+			streamed.delete(`reasoning.delta:${event.itemId}`);
+			break;
+		case "turn.completed":
+			streamed.clear();
+			break;
+	}
+};
 
 type Cancellation = Extract<AgentEvent, { type: "approval.resolved" | "plan.resolved" | "question.resolved" }>;
 
@@ -214,6 +256,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const attachmentsDir = (sessionId: string) => join(dataDir, "attachments", sessionId);
 		const clock = yield* Clock.Clock;
 		const events = yield* PubSub.unbounded<Published>();
+		// Held while a delta is kept and published, and while a subscriber registers and reads the snapshot,
+		// so each delta is either in the snapshot or reaches the subscriber, never both or neither.
+		const liveLock = yield* Semaphore.make(1);
 		const sessionChanges = yield* PubSub.unbounded<AgentSession>();
 		const runtimes = new Map<string, Runtime>();
 		const processLocks = yield* RcMap.make({ lookup: (_sessionId: string) => Semaphore.make(1) });
@@ -258,12 +303,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return row;
 		});
 
-		const updateSession = Effect.fnUntraced(function* (
-			sessionId: string,
-			patch: Partial<
-				Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort" | "mode">
-			>,
-		) {
+		const updateSession = Effect.fnUntraced(function* (sessionId: string, patch: SessionPatch) {
 			const updatedAt = yield* nowIso;
 			const [row] = yield* database.query((db) =>
 				db
@@ -302,12 +342,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return (stored?.last ?? -1) + 1;
 		});
 
-		// Stores events at consecutive sequences from first.
+		// Stores events at consecutive sequences from first. A patch to the session they change is written in the
+		// same transaction, so a crash keeps both or neither. Returns the patched row.
 		const insertEvents = Effect.fnUntraced(function* (
 			sessionId: string,
 			first: number,
 			events: ReadonlyArray<AgentEvent>,
 			createdAt: string,
+			patch?: SessionPatch,
 		) {
 			const values = yield* Effect.forEach(events, (event, index) =>
 				Effect.map(newId, (id) => ({
@@ -319,27 +361,59 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					createdAt,
 				})),
 			);
-			yield* database.query((db) => db.insert(sessionEvent).values(values));
+			const attachments = events.flatMap((event) =>
+				event.type === "user.message"
+					? event.attachments.map(({ id, mediaType }) => ({ id, sessionId, mediaType }))
+					: [],
+			);
+			return yield* database.query((db) =>
+				db.transaction((tx) =>
+					Effect.gen(function* () {
+						yield* tx.insert(sessionEvent).values(values);
+						if (attachments.length > 0) yield* tx.insert(sessionAttachment).values(attachments);
+						if (patch === undefined) return undefined;
+						const [row] = yield* tx
+							.update(agentSession)
+							.set({ ...patch, updatedAt: createdAt })
+							.where(eq(agentSession.id, sessionId))
+							.returning();
+						return row;
+					}),
+				),
+			);
 		}, Effect.provide(services));
+
+		// What a stored event changes on its session.
+		const patchOf = (event: AgentEvent): SessionPatch | undefined => {
+			switch (event.type) {
+				case "session.started":
+					return { nativeSessionId: event.nativeSessionId };
+				case "mode.changed":
+					return { mode: event.mode };
+				default:
+					return undefined;
+			}
+		};
 
 		// Stored events are written before they are published, so a subscriber never misses one.
 		const record = Effect.fnUntraced(function* (runtime: Runtime, event: AgentEvent) {
 			const { sessionId } = runtime;
 			const createdAt = yield* nowIso;
 			if (isLiveOnly(event)) {
-				return yield* publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
+				return yield* liveLock.withPermit(
+					Effect.suspend(() => {
+						keepStreamed(runtime.streamed, event);
+						return publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
+					}),
+				);
 			}
+			keepStreamed(runtime.streamed, event);
 			const sequence = runtime.nextSequence;
-			yield* insertEvents(sessionId, sequence, [event], createdAt);
+			const patched = yield* insertEvents(sessionId, sequence, [event], createdAt, patchOf(event));
 			runtime.nextSequence++;
 			yield* publish(new SessionEvent({ sessionId, sequence, event, createdAt }));
+			if (patched !== undefined) yield* PubSub.publish(sessionChanges, toSession(patched));
 			switch (event.type) {
-				case "session.started":
-					yield* updateSession(sessionId, { nativeSessionId: event.nativeSessionId });
-					break;
-				case "mode.changed":
-					yield* updateSession(sessionId, { mode: event.mode });
-					break;
 				// A plan or a question waits on the user like an approval does, so the chat shows it needs them.
 				case "approval.requested":
 				case "plan.proposed":
@@ -567,6 +641,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					outstanding: 0,
 					unsent: [],
 					approvals: new Map(),
+					streamed: new Map(),
 					resting: isBusy(row.status) ? "idle" : row.status,
 					status: row.status,
 				};
@@ -661,7 +736,17 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				const beforeTurn = saveTurnCheckpoint(sessionId, message.id);
 				// A queued message dropped before its turn is never stored, so nothing will ask for its images.
 				const discard = Effect.forEach(message.images, ({ path }) => removeImage(path), { discard: true });
-				const sent = yield* runtime.handle.sendMessage(message, { steer, beforeTurn, discard }).pipe(
+				const queue = { beforeTurn, discard };
+				const sent = yield* runtime.handle.sendMessage(message, { ...queue, steer }).pipe(
+					// The turn can end between the agent saying it runs and the steer reaching it, and Codex then
+					// refuses the steer. The message waits for its own turn instead of failing.
+					Effect.catchTag("AgentProtocolError", (error) =>
+						steer
+							? Effect.logWarning("The agent refused a steer, so the message waits for its own turn", error).pipe(
+									Effect.andThen(runtime.handle.sendMessage(message, queue)),
+								)
+							: Effect.fail(error),
+					),
 					Effect.mapError((error) => (error._tag === "SessionBusyError" ? error : toUnavailable(runtime.agent)(error))),
 					// Also on interruption, for example when the client disconnects mid-send.
 					Effect.onExit((exit) =>
@@ -837,17 +922,13 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			attachmentId: string,
 		) {
 			yield* getRow(sessionId);
-			const rows = yield* database.query((db) =>
+			// Looking the id up in the session's stored images also keeps it from naming any other file.
+			const [attachment] = yield* database.query((db) =>
 				db
-					.select({ payload: sessionEvent.payload })
-					.from(sessionEvent)
-					.where(and(eq(sessionEvent.sessionId, sessionId), eq(sessionEvent.type, "user.message"))),
+					.select()
+					.from(sessionAttachment)
+					.where(and(eq(sessionAttachment.id, attachmentId), eq(sessionAttachment.sessionId, sessionId))),
 			);
-			const messages = rows.flatMap((row) => Option.toArray(decodeEventOption(row.payload)));
-			// Looking the id up in stored messages also keeps it from naming any other file.
-			const attachment = messages
-				.flatMap((event) => (event.type === "user.message" ? event.attachments : []))
-				.find(({ id }) => id === attachmentId);
 			const mediaType = decodeMediaType(attachment?.mediaType);
 			if (attachment === undefined || Option.isNone(mediaType)) {
 				return yield* new AttachmentNotFoundError({ attachmentId });
@@ -1024,13 +1105,19 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					),
 				);
 
-		// Live events are buffered from the start, then stored history is paged, then the buffer
-		// drains with already-sent sequences skipped. That leaves no gap and no duplicate.
+		// Live events are buffered from the start, then stored history is paged, then the text streamed so far
+		// is sent, then the buffer drains with already-sent sequences skipped. That leaves no gap and no duplicate.
 		const subscribe = (sessionId: string, afterSequence: number) =>
 			Stream.unwrap(
 				Effect.gen(function* () {
 					yield* getRow(sessionId);
-					const subscription = yield* PubSub.subscribe(events);
+					const { subscription, streamed } = yield* liveLock.withPermit(
+						Effect.map(PubSub.subscribe(events), (subscription) => ({
+							subscription,
+							streamed: [...(runtimes.get(sessionId)?.streamed.values() ?? [])],
+						})),
+					);
+					const snapshotAt = yield* nowIso;
 					const buffer = yield* Queue.unbounded<Published, ResubscribeRequiredError | Cause.Done>();
 					let bufferedBytes = 0;
 					let lastSequence = afterSequence;
@@ -1059,7 +1146,19 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 							return published.event;
 						}),
 					);
-					return Stream.concat(history, live).pipe(
+					// After history, so a snapshot item takes its place below the stored events before it.
+					const snapshot = Stream.fromIterable(
+						streamed.map(
+							({ type, itemId, text, cut }) =>
+								new SessionEvent({
+									sessionId,
+									sequence: null,
+									event: { type, itemId, text: cut ? `…${text}` : text, snapshot: true },
+									createdAt: snapshotAt,
+								}),
+						),
+					);
+					return history.pipe(Stream.concat(snapshot), Stream.concat(live)).pipe(
 						Stream.filter((event) => {
 							if (event.sequence === null) return true;
 							if (event.sequence <= lastSequence) return false;
@@ -1211,25 +1310,26 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				...open.values(),
 				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
 			];
-			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso);
+			// With its status, so a crash before both are written leaves the session to close on the next start.
+			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso, {
+				status: "interrupted",
+			});
 		}, Effect.provide(services));
 
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
 		const recoverSessions = Effect.gen(function* () {
-			const updatedAt = yield* nowIso;
 			const cutOff = yield* database.query((db) =>
 				db
-					.update(agentSession)
-					.set({ status: "interrupted", updatedAt })
-					.where(inArray(agentSession.status, ["running", "awaitingApproval"]))
-					.returning({ id: agentSession.id }),
+					.select({ id: agentSession.id })
+					.from(agentSession)
+					.where(inArray(agentSession.status, ["running", "awaitingApproval"])),
 			);
+			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 			if (cutOff.length > 0) {
 				yield* Effect.logInfo("Marked sessions cut off by a restart as interrupted").pipe(
 					Effect.annotateLogs({ count: cutOff.length }),
 				);
 			}
-			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 		});
 		yield* recoverSessions;
 
