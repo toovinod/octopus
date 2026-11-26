@@ -12,6 +12,7 @@ import { Context, Layer } from "effect";
 // uses with Schema, so a fake in tests can send plain objects.
 export interface ClaudeQueryRun {
 	readonly messages: AsyncIterable<unknown>;
+	initializationResult(): Promise<unknown>;
 	interrupt(): Promise<unknown>;
 	setModel(model: string): Promise<void>;
 	setEffort(effort: EffortLevel | null): Promise<void>;
@@ -33,6 +34,7 @@ export class ClaudeQuery extends Context.Service<
 				const run = query(params);
 				return {
 					messages: run,
+					initializationResult: () => run.initializationResult(),
 					interrupt: () => run.interrupt(),
 					setModel: (model) => run.setModel(model),
 					setEffort: (effortLevel) => run.applyFlagSettings({ effortLevel }),

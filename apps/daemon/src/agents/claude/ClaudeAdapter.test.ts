@@ -44,7 +44,20 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			startedWith.push(options);
 			let resolveInterrupt = () => {};
 			let turn = 0;
+			// Recorded from claude 2.1.332 resuming a session whose transcript was deleted: it answers before reading
+			// any message, then exits.
+			const missingSession = `No conversation found with session ID: ${options.resume}`;
 			async function* messages() {
+				if (options.resume === "claude-gone") {
+					yield {
+						type: "result",
+						subtype: "error_during_execution",
+						is_error: true,
+						uuid: "result-gone",
+						errors: [missingSession],
+					};
+					throw new Error(`Claude Code returned an error result: ${missingSession}`);
+				}
 				for await (const user of prompt) {
 					prompts.push(user);
 					turn++;
@@ -331,6 +344,10 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 			}
 			return {
 				messages: messages(),
+				initializationResult: async () => {
+					if (options.resume === "claude-gone")
+						throw new Error(`Claude Code returned an error result: ${missingSession}`);
+				},
 				interrupt: async () => resolveInterrupt(),
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
@@ -830,6 +847,23 @@ describe("ClaudeAdapter", () => {
 			{ input: { ...newSession, resumeId: "claude-old" } },
 		);
 		expect(id).toBe("claude-old");
+	});
+
+	test("a resume of a session claude no longer has goes on in a new session with a notice", async () => {
+		const [id, events] = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("hi"));
+					const id = yield* handle.nativeSessionId;
+					return [id, yield* takeUntil(handle, "turn.completed")] as const;
+				}),
+			{ input: { ...newSession, resumeId: "claude-gone" } },
+		);
+		expect(id).toBe("claude-new");
+		expect(startedWith.at(-1)?.resume).toBeUndefined();
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
 	test("loads only user settings and the default mode for an untrusted project", async () => {
