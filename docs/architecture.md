@@ -265,7 +265,7 @@ It changed these decisions:
   - Subscriber buffers: 1,000 events or 1 MB.
   - Live terminal output: 1,000 chunks of at most 1,024 characters per subscriber.
   - Live script output: 64 lines of at most 16 KiB per subscriber. Kept script output keeps lines of up to 16 KiB whole.
-  - `git` and `gh` output: 32 MiB of stdout, past which the command fails, and the first 64 KiB of stderr.
+  - `git` and `gh` output: the first 64 KiB of stderr. A diff's patch is capped at 32 MiB, past which its files show as too large. Status, file listings and `gh` JSON are read whole, since a cut one would hide work from a safety check.
 - **Limits.** One file watcher per open workspace. Concurrent agent processes are not capped. An agent idle for 5 minutes is stopped, so only working agents hold a process.
 - **Measure the whole thing.** Report the combined memory of the shell, the webview processes, the daemon and the agent processes, measured by a script in the repo against the same task in other tools. We publish only claims we measured.
 - **Privacy statement.** Octopus keeps local workspace data on your machine. The agents you configure still send context to their model providers under those providers' terms. Native agent histories (Claude Code and Codex transcripts) may keep output that Octopus itself drops.
