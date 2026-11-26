@@ -20,6 +20,7 @@ type IndexedOutput = { readonly index: number; readonly output: TerminalOutput }
 interface RunningTerminal {
 	readonly info: TerminalInfo;
 	readonly pty: Bun.Terminal;
+	readonly pid: number;
 	readonly scrollback: Scrollback;
 	readonly output: PubSub.PubSub<IndexedOutput>;
 	readonly appended: { count: number };
@@ -67,7 +68,11 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 				const decoder = new TextDecoder();
 				const scrollback = new Scrollback();
 				const appended = { count: 0 };
-				const { terminal: pty, exited } = yield* spawnTerminal({
+				const {
+					terminal: pty,
+					pid,
+					exited,
+				} = yield* spawnTerminal({
 					command: [shell, "-l"],
 					cwd,
 					...size,
@@ -78,7 +83,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 						for (const piece of splitLiveOutput(data)) publish({ output, appended }, { type: "data", data: piece });
 					},
 				});
-				const terminal: RunningTerminal = { info, pty, scrollback, output, appended };
+				const terminal: RunningTerminal = { info, pty, pid, scrollback, output, appended };
 				return { terminal, exited };
 			});
 
@@ -118,6 +123,9 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		const list = (workspaceId: string) =>
 			[...terminals.values()].map((terminal) => terminal.info).filter((info) => info.workspaceId === workspaceId);
 
+		// The shell of every open terminal, so the daemon can tell which ones are busy.
+		const shellPids = () => [...terminals.values()].map((terminal) => terminal.pid);
+
 		const attach = (terminalId: string): Stream.Stream<TerminalOutput, TerminalNotFoundError> =>
 			Stream.unwrap(
 				Effect.gen(function* () {
@@ -153,7 +161,7 @@ export class TerminalService extends Context.Service<TerminalService>()("octopus
 		const closeWorkspace = (workspaceId: string) =>
 			Effect.forEach(list(workspaceId), (info) => close(info.id), { concurrency: "unbounded", discard: true });
 
-		return { open, list, attach, write, resize, close, closeWorkspace };
+		return { open, list, shellPids, attach, write, resize, close, closeWorkspace };
 	}),
 }) {
 	static readonly layer = Layer.effect(TerminalService, TerminalService.make);

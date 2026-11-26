@@ -8,6 +8,7 @@ import {
 	OpenPullRequest,
 	PullRequestCheckoutError,
 	Workspace,
+	WorkspaceActivity,
 	WorkspaceArchivedError,
 	WorkspaceHasUnsavedWorkError,
 	WorkspaceName,
@@ -131,6 +132,12 @@ export class WorkspaceRpcs extends RpcGroup.make(
 	Rpc.make("listScriptRuns", {
 		payload: { workspaceId: Schema.String },
 		success: Schema.Array(ScriptRun),
+		error: DaemonInternalError,
+	}),
+	// Terminals running a command and scripts still going, so quitting can ask first. Read-only and
+	// costs a process listing per terminal, so call it only while a quit is being considered or rarely.
+	Rpc.make("listActivity", {
+		success: WorkspaceActivity,
 		error: DaemonInternalError,
 	}),
 	Rpc.make("getScriptRunOutput", {

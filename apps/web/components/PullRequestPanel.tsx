@@ -17,6 +17,7 @@ import type {
 	PullRequestConversation,
 	PullRequestMergeMethod,
 	PullRequestReviewInput,
+	PullRequestStatus,
 } from "@repo/contracts/Git";
 import { newChat, sendMessage, toast, updateWorkspace, useAppState } from "../lib/store.ts";
 import {
@@ -29,6 +30,7 @@ import {
 import { Badge } from "@repo/ui/components/badge";
 import { Label } from "@repo/ui/components/label";
 import { callDaemon, errorMessage, followDaemon } from "../lib/daemonRuntime.ts";
+import { followReattaching } from "../lib/followReattaching.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { formatDateTime } from "../lib/format.ts";
@@ -38,6 +40,7 @@ import { Switch } from "@repo/ui/components/switch";
 import { Button } from "@repo/ui/components/button";
 import { Input } from "@repo/ui/components/input";
 import { feedbackMessage } from "../lib/feedbackMessage.ts";
+import { mergeReadiness } from "../lib/mergeReadiness.ts";
 import { ExternalLink } from "./ExternalLink.tsx";
 import { useEffect, useRef, useState } from "react";
 
@@ -49,19 +52,48 @@ const MERGE_LABELS: Record<PullRequestMergeMethod, string> = {
 	rebase: "Rebase and merge",
 };
 
-export const PullRequestPanel = ({ workspace }: { readonly workspace: Workspace }) => {
+export const PullRequestPanel = ({
+	workspace,
+	visible,
+}: {
+	readonly workspace: Workspace;
+	readonly visible: boolean;
+}) => {
 	const { loaded, reload, replace } = useDaemonValue(
 		() => callDaemon((daemon) => daemon.getPullRequest({ workspaceId: workspace.id })),
-		workspace.id,
+		// A pull request opened from another window or the CLI shows up once the workspace learns its URL.
+		`${workspace.id}:${workspace.pullRequestUrl ?? ""}`,
 	);
+	// Merges, reviews and pushes also happen on GitHub, so coming back to the app asks again. Each ask runs gh, so a
+	// hidden panel waits, and asks once when it is shown again.
+	const wasVisible = useRef(visible);
+	useEffect(() => {
+		if (!visible) {
+			wasVisible.current = false;
+			return;
+		}
+		if (!wasVisible.current) reload();
+		wasVisible.current = true;
+		window.addEventListener("focus", reload);
+		return () => window.removeEventListener("focus", reload);
+	}, [visible, reload]);
 	const checksPending =
 		loaded.state === "ready" && loaded.value.status === "found" && loaded.value.pullRequest.checks.pending > 0;
-	// The daemon polls GitHub while checks run and ends the watch once they are done. A failed poll only
-	// stops the updates; Reload still works.
+	// The daemon polls GitHub while checks run and ends the watch once they are done. A dropped connection attaches
+	// again, after a reload catches up on what changed meanwhile.
 	useEffect(() => {
 		if (!checksPending) return;
-		return followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), { onItem: replace });
-	}, [checksPending, workspace.id, replace]);
+		return followReattaching<PullRequestStatus>(
+			(handlers) => followDaemon((daemon) => daemon.watchPullRequestChecks({ workspaceId: workspace.id }), handlers),
+			{
+				onItem: replace,
+				onReattach: reload,
+				onEnd: (error) => {
+					if (error !== null) toast(errorMessage(error));
+				},
+			},
+		);
+	}, [checksPending, workspace.id, replace, reload]);
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
@@ -248,7 +280,7 @@ const PullRequestDetails = ({
 							onChanged();
 						}}
 					/>
-					<MergeForm workspace={workspace} onMerged={onChanged} />
+					<MergeForm workspace={workspace} pullRequest={pullRequest} onMerged={onChanged} />
 				</>
 			) : null}
 		</div>
@@ -417,11 +449,24 @@ const ReviewForm = ({ workspace, onReviewed }: { readonly workspace: Workspace; 
 	);
 };
 
-const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; readonly onMerged: () => void }) => {
+const MergeForm = ({
+	workspace,
+	pullRequest,
+	onMerged,
+}: {
+	readonly workspace: Workspace;
+	readonly pullRequest: PullRequest;
+	readonly onMerged: () => void;
+}) => {
+	const readiness = mergeReadiness(pullRequest);
 	const [method, setMethod] = useState<PullRequestMergeMethod>("squash");
 	const [deleteBranch, setDeleteBranch] = useState(true);
 	const [confirming, setConfirming] = useState(false);
 	const [busy, setBusy] = useState(false);
+	// A pull request that turns blocked, say back to a draft, must not come back already asking to merge.
+	useEffect(() => {
+		if (readiness.kind === "blocked") setConfirming(false);
+	}, [readiness.kind]);
 	const merge = async () => {
 		setBusy(true);
 		await callDaemon((daemon) => daemon.mergePullRequest({ workspaceId: workspace.id, method, deleteBranch })).then(
@@ -465,9 +510,12 @@ const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; rea
 					Delete the branch on GitHub
 				</Label>
 			</div>
-			{confirming ? (
+			{readiness.kind === "blocked" ? <p className="text-xs text-muted-foreground">{readiness.reason}</p> : null}
+			{confirming && readiness.kind !== "blocked" ? (
 				<div className="flex items-center gap-2">
-					<span className="flex-1 text-xs">Merge into {workspace.baseBranch}?</span>
+					<span className="flex-1 text-xs">
+						{readiness.kind === "warn" ? `${readiness.warning} ` : ""}Merge into {workspace.baseBranch}?
+					</span>
 					<Button size="sm" variant="ghost" onClick={() => setConfirming(false)}>
 						Cancel
 					</Button>
@@ -477,7 +525,13 @@ const MergeForm = ({ workspace, onMerged }: { readonly workspace: Workspace; rea
 					</Button>
 				</div>
 			) : (
-				<Button size="sm" variant="default" className="self-start" onClick={() => setConfirming(true)}>
+				<Button
+					size="sm"
+					variant="default"
+					className="self-start"
+					disabled={readiness.kind === "blocked"}
+					onClick={() => setConfirming(true)}
+				>
 					<GitMergeIcon />
 					Merge
 				</Button>

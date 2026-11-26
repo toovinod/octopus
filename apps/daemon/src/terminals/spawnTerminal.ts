@@ -22,7 +22,13 @@ export const spawnTerminal = Effect.fn("spawnTerminal")(function* (options: {
 					rows: options.rows,
 					data: (_terminal, data) => options.onData(data),
 				});
-				const shell = Bun.spawn([...options.command], { cwd: options.cwd, terminal, detached: true });
+				// Bun leaves taking the PTY as controlling terminal to the program, and zsh never does, which leaves it
+				// without job control. sh takes it, and exec keeps it for the command, under the same pid.
+				const shell = Bun.spawn(["/bin/sh", "-c", 'exec "$@"', "sh", ...options.command], {
+					cwd: options.cwd,
+					terminal,
+					detached: true,
+				});
 				return { terminal, shell };
 			},
 			catch: (cause) => new TerminalSpawnError({ shell: options.command[0], cause }),
@@ -35,5 +41,5 @@ export const spawnTerminal = Effect.fn("spawnTerminal")(function* (options: {
 			}),
 	);
 	yield* registry.add(shell.pid);
-	return { terminal, exited: Effect.promise(() => shell.exited) };
+	return { terminal, pid: shell.pid, exited: Effect.promise(() => shell.exited) };
 });

@@ -7,18 +7,22 @@ import {
 	saveSettings,
 	writeStored,
 } from "./settings.ts";
-import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession } from "@repo/contracts/AgentSession";
+import type { AgentAuthMode, AgentInfo, AgentKind, AgentSession, ImageData } from "@repo/contracts/AgentSession";
 import type { ApprovalDecision, QuestionAnswers, PlanAnswer } from "@repo/contracts/AgentEvent";
 import { applyEvents, type ChatState, emptyChat, prependEvents } from "./chatReducer.ts";
 import { callDaemon, errorMessage, errorTag, followDaemon } from "./daemonRuntime.ts";
+import { allComments, keepComments, releaseComments } from "./pendingComments.ts";
+import { loginEnvMissing, playChime, showNotification } from "./desktop.ts";
+import { saveForReload, takeSavedForReload } from "./keepAcrossReload.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
+import { bootErrorMessage, isConnectionDrop } from "./errorMessage.ts";
+import { allDrafts, keepDraft, releaseDrafts } from "./drafts.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
-import { playChime, showNotification } from "./desktop.ts";
+import { draftImageOf, type DraftImage } from "./images.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import type { Project } from "@repo/contracts/Project";
-import type { DraftImage } from "./images.ts";
+import { logWarning } from "./logWarning.ts";
 import { useSyncExternalStore } from "react";
-import { releaseDrafts } from "./drafts.ts";
 import { toast as showToast } from "sonner";
 import { Redacted } from "effect";
 
@@ -170,6 +174,7 @@ const loadProjects = async () => {
 		)
 	).flat();
 	const sessionIds = new Set(sessions.map((session) => session.id));
+	const before = state.sessions;
 	const kept = <A>(record: Readonly<Record<string, A>>) =>
 		Object.fromEntries(Object.entries(record).filter(([sessionId]) => sessionIds.has(sessionId)));
 	const selectionGone =
@@ -181,9 +186,22 @@ const loadProjects = async () => {
 		workspaces: byId(workspaces),
 		sessions: byId(sessions),
 		attention: kept(current.attention),
+		queued: kept(current.queued),
+		closedTabs: new Set([...current.closedTabs].filter((sessionId) => sessionIds.has(sessionId))),
 		...(selectionGone ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionGone) closeChat();
+	// After an outage the watch missed what changed meanwhile, so the reload raises the attention it would have,
+	// with one alert for all of it rather than a chime per chat.
+	const noticed = sessions.flatMap((session) => {
+		const prior = before[session.id];
+		const attention = prior === undefined ? null : markAttention(prior, session);
+		return attention === null ? [] : [{ session, attention }];
+	});
+	const [first] = noticed;
+	if (first === undefined) return;
+	if (noticed.length === 1) alertUser(first.session.id, sessionTitle(first.session), ATTENTION_BODIES[first.attention]);
+	else alertUser(first.session.id, "Octopus", `${noticed.length} chats need your attention.`);
 };
 
 export const boot = async () => {
@@ -196,11 +214,14 @@ export const boot = async () => {
 			return true;
 		},
 		(error: unknown) => {
-			setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
+			setState(() => ({ connection: { status: "failed", message: bootErrorMessage(error) } }));
 			return false;
 		},
 	);
 	if (!loaded) return;
+	restoreAfterReload();
+	addEventListener("pagehide", saveBeforeReload);
+	warnIfLoginEnvMissing();
 	// Checking the agents starts their CLIs and reads the keychain, so it never holds up files, terminals or history.
 	void refreshAgents();
 	watchSessions();
@@ -211,8 +232,60 @@ export const boot = async () => {
 	if (start !== undefined) selectWorkspace(start.id);
 };
 
-// Only a dropped socket is worth retrying. A daemon error would fail the same way again.
-export const isConnectionDrop = (error: unknown) => errorTag(error) === "RpcClientError";
+const imageDataOf = ({ mediaType, base64 }: ImageData) => ({ mediaType, base64 });
+
+// What lives only in memory and a reload would lose, as when restarting the daemon reloads the window.
+const saveBeforeReload = () =>
+	saveForReload({
+		drafts: Object.fromEntries(
+			[...allDrafts()].map(([sessionId, draft]) => [
+				sessionId,
+				{ text: draft.text, images: draft.images.map(imageDataOf) },
+			]),
+		),
+		comments: Object.fromEntries(allComments()),
+		failedSends: Object.fromEntries(
+			Object.entries(state.failedSends).map(([sessionId, sends]) => [
+				sessionId,
+				sends.map(({ text, images, error }) => ({ text, images: images.map(imageDataOf), error })),
+			]),
+		),
+	});
+
+// Only for chats and workspaces the daemon still lists.
+const restoreAfterReload = () => {
+	const saved = takeSavedForReload();
+	if (saved === null) return;
+	const live = (sessionId: string) => state.sessions[sessionId] !== undefined;
+	for (const [sessionId, draft] of Object.entries(saved.drafts)) {
+		if (live(sessionId)) keepDraft(sessionId, { text: draft.text, images: draft.images.map(draftImageOf) });
+	}
+	for (const [workspaceId, comments] of Object.entries(saved.comments)) {
+		if (state.workspaces[workspaceId]?.status === "active") keepComments(workspaceId, comments);
+	}
+	const failedSends = Object.entries(saved.failedSends)
+		.filter(([sessionId]) => live(sessionId))
+		.map(([sessionId, sends]) => [
+			sessionId,
+			sends.map((send) => ({ ...send, id: nextFailedSend++, images: send.images.map(draftImageOf) })),
+		]);
+	setState((current) => ({ failedSends: { ...current.failedSends, ...Object.fromEntries(failedSends) } }));
+};
+
+// Without the login shell's PATH, agents, git and gh can seem missing, and the reason would be invisible.
+const warnIfLoginEnvMissing = () =>
+	void loginEnvMissing().then(
+		(missing) => {
+			if (missing) {
+				toast(
+					"Octopus could not read your login shell's environment, so agents, git and gh may not be found. Check that your shell starts without errors, then restart Octopus.",
+				);
+			}
+		},
+		(error: unknown) => logWarning("Could not ask the desktop shell about the login environment", error),
+	);
+
+export { isConnectionDrop };
 
 // Exponential from half a second, capped at 30 s. The jitter keeps windows from retrying in lockstep.
 export const reconnectDelay = (attempt: number, random: () => number = Math.random) =>
@@ -284,14 +357,21 @@ const reconnect = (attempt: number) => {
 					reconnect(attempt + 1);
 					return;
 				}
-				setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
+				setState(() => ({ connection: { status: "failed", message: bootErrorMessage(error) } }));
 				showToast.dismiss(CONNECTION_TOAST);
 			},
 		);
 	}, reconnectDelay(attempt));
 };
 
-const noticeChange = (before: AgentSession, after: AgentSession) => {
+const ATTENTION_BODIES = {
+	approval: "The agent needs your approval.",
+	done: "The turn finished.",
+	failed: "The turn failed.",
+} satisfies Record<Attention, string>;
+
+// Marks a chat whose change needs the user, unless they are looking at it. Returns what it needs, or null.
+const markAttention = (before: AgentSession, after: AgentSession): Attention | null => {
 	const attention: Attention | null =
 		after.status === "awaitingApproval" && before.status !== "awaitingApproval"
 			? "approval"
@@ -300,21 +380,24 @@ const noticeChange = (before: AgentSession, after: AgentSession) => {
 				: after.status === "failed" && before.status !== "failed"
 					? "failed"
 					: null;
-	if (attention === null) return;
+	if (attention === null) return null;
 	const visible = state.selectedSessionId === after.id && document.visibilityState === "visible";
 	if (!visible) setState((current) => ({ attention: { ...current.attention, [after.id]: attention } }));
+	return attention;
+};
+
+// A notification and a chime while the window is in the background. Coming back opens the chat named.
+const alertUser = (sessionId: string, title: string, body: string) => {
 	if (document.hasFocus()) return;
-	lastNotified = after.id;
+	lastNotified = sessionId;
 	const { settings } = state;
-	const title = sessionTitle(after);
-	const body =
-		attention === "approval"
-			? "The agent needs your approval."
-			: attention === "done"
-				? "The turn finished."
-				: "The turn failed.";
 	if (settings.desktopNotifications) void showNotification(title, body);
 	if (settings.sound) playChime();
+};
+
+const noticeChange = (before: AgentSession, after: AgentSession) => {
+	const attention = markAttention(before, after);
+	if (attention !== null) alertUser(after.id, sessionTitle(after), ATTENTION_BODIES[attention]);
 };
 
 // The desktop notification cannot report a click, so the chat that notified last opens when the window comes back.
@@ -360,12 +443,15 @@ export const removeProject = async (projectId: string) => {
 		if (removed.has(sessionWorkspace(sessionId) ?? "")) releaseImages(sends.flatMap((send) => send.images));
 	}
 	releaseDrafts(Object.keys(state.sessions).filter((sessionId) => removed.has(sessionWorkspace(sessionId) ?? "")));
+	releaseComments(removed);
 	setState((current) => ({
 		projects: without(current.projects, projectId),
 		workspaces: kept(current.workspaces, (workspaceId) => workspaceId),
 		sessions: kept(current.sessions, sessionWorkspace),
 		attention: kept(current.attention, sessionWorkspace),
 		failedSends: kept(current.failedSends, sessionWorkspace),
+		queued: kept(current.queued, sessionWorkspace),
+		closedTabs: new Set([...current.closedTabs].filter((sessionId) => !removed.has(sessionWorkspace(sessionId) ?? ""))),
 		...(selectionRemoved ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),
 	}));
 	if (selectionRemoved) closeChat();
@@ -413,6 +499,7 @@ export const archiveWorkspace = async (workspaceId: string, force: boolean) => {
 			.filter((session) => session.workspaceId === workspaceId)
 			.map((session) => session.id),
 	);
+	releaseComments([workspaceId]);
 	setState((current) => ({
 		workspaces: { ...current.workspaces, [workspaceId]: archived },
 		...(current.selectedWorkspaceId === workspaceId ? { selectedWorkspaceId: null, selectedSessionId: null } : {}),

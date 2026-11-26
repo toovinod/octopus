@@ -18,7 +18,7 @@ use tauri_plugin_shell::{
   process::{CommandChild, CommandEvent},
   ShellExt,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 // Must match READY_LINE_PREFIX in apps/daemon/src/server/DaemonServer.ts.
 const READY_LINE_PREFIX: &str = "OCTOPUS_DAEMON_READY ";
@@ -32,6 +32,13 @@ const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 // Must match the event the webview listens for in apps/web/lib/daemonRuntime.ts.
 const DAEMON_STOPPED_EVENT: &str = "daemon-stopped";
+
+// Must match QUIT_CHECK_EVENT in apps/web/lib/desktop.ts.
+const QUIT_CHECK_EVENT: &str = "quit-check";
+
+// How long a quit that asks first waits for the webview to check what is running. A webview that cannot
+// answer, such as one showing that the daemon stopped, leaves the warning it last reported.
+const QUIT_CHECK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct DaemonConnection {
@@ -93,12 +100,30 @@ fn failure_reason(event: &CommandEvent) -> Option<String> {
   String::from_utf8_lossy(line).trim().strip_prefix(FAILED_LINE_PREFIX).map(str::to_string)
 }
 
+// What the webview reads when it may have missed the stop event: it fires once, and can fire before the
+// webview listens, such as when octopusd fails at launch.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct StoppedDaemon {
+  reason: Option<String>,
+}
+
+// Quitting stops octopusd on purpose, so only an unexpected stop is reported.
+fn stopped_report(status: &DaemonStatus, quitting: bool) -> Option<StoppedDaemon> {
+  match status {
+    DaemonStatus::Stopped(reason) if !quitting => Some(StoppedDaemon { reason: reason.clone() }),
+    _ => None,
+  }
+}
+
 struct Daemon {
   status: watch::Sender<DaemonStatus>,
   // With the pid read at spawn: `CommandChild::pid` waits on a lock the plugin's waiter thread
   // can hold while octopusd is stopped, and quitting runs on the UI thread.
   child: Mutex<Option<(CommandChild, u32)>>,
   quitting: AtomicBool,
+  // Set when octopusd had to start with the app's own minimal environment, so the webview can say why agents,
+  // git or gh may not be found.
+  login_env_missing: AtomicBool,
 }
 
 // What closing the window does. On macOS the app stays in the dock and agents keep working, as macOS apps
@@ -115,6 +140,17 @@ const CLOSE_ACTION: CloseAction = if cfg!(target_os = "macos") { CloseAction::Hi
 // does not track sessions itself. Starting empty means a webview that never reports cannot block a quit.
 struct QuitWarning(Mutex<Option<String>>);
 
+// The webview reports its warning as things change, but terminals and scripts only every few seconds. Before
+// asking, the shell has it check again, and this is how it says it is done.
+struct QuitCheck(Mutex<Option<oneshot::Sender<()>>>);
+
+#[tauri::command]
+fn quit_checked(quit_check: State<'_, QuitCheck>) {
+  if let Some(done) = quit_check.0.lock().ok().and_then(|mut slot| slot.take()) {
+    let _ = done.send(());
+  }
+}
+
 #[tauri::command]
 fn set_quit_warning(warning: Option<String>, quit_warning: State<'_, QuitWarning>) {
   if let Ok(mut slot) = quit_warning.0.lock() {
@@ -126,6 +162,16 @@ async fn wait_for_connection(daemon: &Daemon) -> Result<DaemonConnection, String
   let mut status = daemon.status.subscribe();
   let settled = status.wait_for(|status| status.connection().is_some()).await.map_err(|error| error.to_string())?;
   settled.connection().expect("checked by wait_for")
+}
+
+#[tauri::command]
+fn daemon_stopped(daemon: State<'_, Daemon>) -> Option<StoppedDaemon> {
+  stopped_report(&daemon.status.borrow(), daemon.quitting.load(Ordering::SeqCst))
+}
+
+#[tauri::command]
+fn login_env_missing(daemon: State<'_, Daemon>) -> bool {
+  daemon.login_env_missing.load(Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -203,7 +249,9 @@ fn parse_login_env(output: &[u8]) -> Vec<(String, String)> {
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::error::Error>> {
   let token = generate_token()?;
   let mut sidecar = app.shell().sidecar("octopusd")?;
-  match login_shell_env() {
+  let login_env = login_shell_env();
+  app.state::<Daemon>().login_env_missing.store(login_env.is_none(), Ordering::SeqCst);
+  match login_env {
     Some(variables) => sidecar = sidecar.envs(variables),
     None => log::warn!("Could not read the login shell's environment, so octopusd keeps the app's own"),
   }
@@ -233,11 +281,10 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, Box<dyn std::err
         _ => {}
       }
       let Some(status) = status else { continue };
-      let stopped = matches!(status, DaemonStatus::Stopped(_));
+      let report = stopped_report(&status, daemon.quitting.load(Ordering::SeqCst));
       daemon.status.send_replace(status);
-      // Quitting stops octopusd on purpose, so only an unexpected exit tells the webview.
-      if stopped && !daemon.quitting.load(Ordering::SeqCst) {
-        let _ = app.emit(DAEMON_STOPPED_EVENT, failure.clone());
+      if let Some(report) = report {
+        let _ = app.emit(DAEMON_STOPPED_EVENT, report.reason);
       }
     }
   });
@@ -284,8 +331,14 @@ pub fn run() {
     })
     .setup(|app| {
       let (status, _) = watch::channel(DaemonStatus::Starting);
-      app.manage(Daemon { status, child: Mutex::new(None), quitting: AtomicBool::new(false) });
+      app.manage(Daemon {
+        status,
+        child: Mutex::new(None),
+        quitting: AtomicBool::new(false),
+        login_env_missing: AtomicBool::new(false),
+      });
       app.manage(QuitWarning(Mutex::new(None)));
+      app.manage(QuitCheck(Mutex::new(None)));
       #[cfg(target_os = "macos")]
       app.set_menu(app_menu(app.handle())?)?;
       start_daemon(app.handle().clone());
@@ -305,20 +358,36 @@ pub fn run() {
         CloseAction::Quit => request_quit(window.app_handle()),
       }
     })
-    .invoke_handler(tauri::generate_handler![daemon_connection, restart_daemon, set_quit_warning])
+    .invoke_handler(tauri::generate_handler![
+      daemon_connection,
+      daemon_stopped,
+      login_env_missing,
+      quit_checked,
+      restart_daemon,
+      set_quit_warning
+    ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app, event| match event {
+      // Holding every exit back would also cancel a macOS logout or restart, so it is held only to ask first.
+      // Otherwise the app exits now, and `RunEvent::Exit` stops octopusd.
       // Our own `app.exit` in `quit` asks again, and that one goes through.
-      RunEvent::ExitRequested { api, .. } if !app.state::<Daemon>().quitting.load(Ordering::SeqCst) => {
-        api.prevent_exit();
-        request_quit(app);
+      RunEvent::ExitRequested { api, .. } => {
+        let daemon = app.state::<Daemon>();
+        if holds_exit(daemon.quitting.load(Ordering::SeqCst), quit_warning(app).as_deref()) {
+          api.prevent_exit();
+          request_quit(app);
+        } else {
+          // So octopusd stopping is not reported to the webview as a crash.
+          daemon.quitting.store(true, Ordering::SeqCst);
+        }
       }
       // A click on the dock icon brings back the window that closing hid.
       #[cfg(target_os = "macos")]
       RunEvent::Reopen { has_visible_windows: false, .. } => show_windows(app),
-      // In case the app exits without asking first. A crash closes stdin too.
-      RunEvent::Exit => drop(take_daemon_child(app)),
+      // An exit nothing held back, such as a logout, still waits for octopusd and kills it if it hangs. After
+      // `quit` the daemon is already stopped and this returns at once. A crash closes stdin too.
+      RunEvent::Exit => tauri::async_runtime::block_on(stop_daemon(app)),
       _ => {}
     });
 }
@@ -356,10 +425,32 @@ fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
   Ok(menu)
 }
 
-// Asks first when the webview reported running turns or pending approvals.
+fn quit_warning(app: &tauri::AppHandle) -> Option<String> {
+  app.state::<QuitWarning>().0.lock().ok().and_then(|warning| warning.clone())
+}
+
+// An exit is held back only while it is not already quitting and there is something to ask about.
+fn holds_exit(quitting: bool, warning: Option<&str>) -> bool {
+  !quitting && warning.is_some()
+}
+
+// Has the webview check what is running, then asks first if anything would be lost.
 fn request_quit(app: &tauri::AppHandle) {
-  let warning = app.state::<QuitWarning>().0.lock().ok().and_then(|warning| warning.clone());
-  let Some(warning) = warning else {
+  let (done, checked) = oneshot::channel();
+  if let Ok(mut slot) = app.state::<QuitCheck>().0.lock() {
+    *slot = Some(done);
+  }
+  let _ = app.emit(QUIT_CHECK_EVENT, ());
+  let app = app.clone();
+  tauri::async_runtime::spawn(async move {
+    let _ = tokio::time::timeout(QUIT_CHECK_WAIT, checked).await;
+    ask_before_quit(&app);
+  });
+}
+
+// Asks first when the webview reported running turns, pending approvals, or busy terminals and scripts.
+fn ask_before_quit(app: &tauri::AppHandle) {
+  let Some(warning) = quit_warning(app) else {
     quit(app);
     return;
   };
@@ -381,33 +472,34 @@ fn take_daemon_child(app: &tauri::AppHandle) -> Option<(CommandChild, u32)> {
   app.state::<Daemon>().child.lock().ok().and_then(|mut child| child.take())
 }
 
-// Dropping the child closes the daemon's stdin, and it shuts down and stops everything it
-// started. `kill()` would SIGKILL it at once and orphan its children, so the app hides its
-// windows, waits off the UI thread for the daemon to exit, and kills it only when it hangs.
+// Dropping the child closes the daemon's stdin, and it shuts down and stops everything it started. `kill()`
+// would SIGKILL it at once and orphan its children, so this waits for the daemon to exit and kills it only
+// when it hangs.
+async fn stop_daemon(app: &tauri::AppHandle) {
+  let Some((child, pid)) = take_daemon_child(app) else { return };
+  let mut status = app.state::<Daemon>().status.subscribe();
+  drop(child);
+  let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
+  if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
+    log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
+    // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
+    // it leaves are stopped by the next octopusd from its process registry.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+  }
+}
+
+// Hides the windows, stops the daemon off the UI thread, then exits.
 fn quit(app: &tauri::AppHandle) {
-  let daemon = app.state::<Daemon>();
   // Two quit requests, say from two dialogs, stop the daemon once.
-  if daemon.quitting.swap(true, Ordering::SeqCst) {
+  if app.state::<Daemon>().quitting.swap(true, Ordering::SeqCst) {
     return;
   }
-  let Some((child, pid)) = take_daemon_child(app) else {
-    app.exit(0);
-    return;
-  };
   for window in app.webview_windows().values() {
     let _ = window.hide();
   }
-  drop(child);
-  let mut status = daemon.status.subscribe();
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
-    let stopped = status.wait_for(|status| matches!(status, DaemonStatus::Stopped(_)));
-    if tokio::time::timeout(DAEMON_EXIT_WAIT, stopped).await.is_err() {
-      log::error!("octopusd did not exit within {DAEMON_EXIT_WAIT:?}, killing it");
-      // Still octopusd's pid: it has not exited, so the pid cannot have been reused. The children
-      // it leaves are stopped by the next octopusd from its process registry.
-      unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
+    stop_daemon(&app).await;
     app.exit(0);
   });
 }
@@ -491,6 +583,25 @@ mod tests {
   fn closing_the_window_hides_it_only_on_macos() {
     let expected = if cfg!(target_os = "macos") { CloseAction::Hide } else { CloseAction::Quit };
     assert_eq!(CLOSE_ACTION, expected);
+  }
+
+  #[test]
+  fn a_stop_is_reported_until_the_daemon_starts_again_unless_the_app_is_quitting() {
+    let stopped = DaemonStatus::Stopped(Some("Another Octopus is already running.".to_string()));
+    assert_eq!(
+      stopped_report(&stopped, false),
+      Some(StoppedDaemon { reason: Some("Another Octopus is already running.".to_string()) })
+    );
+    assert_eq!(stopped_report(&stopped, true), None);
+    assert_eq!(stopped_report(&DaemonStatus::Starting, false), None);
+    assert_eq!(stopped_report(&DaemonStatus::Ready(connection()), false), None);
+  }
+
+  #[test]
+  fn an_exit_is_held_back_only_to_ask_first() {
+    assert!(holds_exit(false, Some("1 chat is working. Quitting stops it.")));
+    assert!(!holds_exit(false, None));
+    assert!(!holds_exit(true, Some("1 chat is working. Quitting stops it.")));
   }
 
   #[test]

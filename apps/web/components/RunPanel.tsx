@@ -4,6 +4,7 @@ import { callDaemon, errorMessage, followDaemon } from "../lib/daemonRuntime.ts"
 import type { ScriptRun, ScriptRunKind } from "@repo/contracts/ScriptRun";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { followReattaching } from "../lib/followReattaching.ts";
+import { logWarning } from "../lib/logWarning.ts";
 import { useDaemonValue } from "../lib/useDaemonValue.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { openDialog, toast, useAppState } from "../lib/store.ts";
@@ -46,7 +47,13 @@ export const RunPanel = ({ workspace }: { readonly workspace: Workspace }) => {
 		() =>
 			followReattaching<ScriptRun>(
 				(handlers) => followDaemon((daemon) => daemon.watchScriptRuns({ workspaceId: workspace.id }), handlers),
-				{ onItem: reload, onReattach: reload },
+				{
+					onItem: reload,
+					onReattach: reload,
+					onEnd: (error) => {
+						if (error !== null) toast(errorMessage(error));
+					},
+				},
 			),
 		[workspace.id, reload],
 	);
@@ -178,7 +185,13 @@ const RunScriptPorts = ({ workspaceId }: { readonly workspaceId: string }) => {
 		return followReattaching<ReadonlyArray<number>>(
 			(handlers) => followDaemon((daemon) => daemon.watchRunScriptPorts({ workspaceId }), handlers),
 			// A new watch sends the current ports first, so there is nothing to catch up on.
-			{ onItem: setPorts, onReattach: () => undefined },
+			{
+				onItem: setPorts,
+				onReattach: () => undefined,
+				onEnd: (error) => {
+					if (error !== null) logWarning("The run script's ports stopped updating", error);
+				},
+			},
 		);
 	}, [workspaceId]);
 	if (ports.length === 0) return null;

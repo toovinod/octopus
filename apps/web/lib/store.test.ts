@@ -111,8 +111,11 @@ mock.module("./daemonRuntime.ts", () => ({
 	errorTag,
 }));
 
+const desktop = await import("./desktop.ts");
+
 const {
 	boot,
+	closeTab,
 	discardFailedSend,
 	failedSendsOf,
 	getState,
@@ -237,6 +240,19 @@ describe("removing a project", () => {
 		expect(state.selectedWorkspaceId).toBeNull();
 		expect(state.selectedSessionId).toBeNull();
 		expect(state.chat).toBeNull();
+	});
+
+	test("forgets the queued messages and closed tabs of its chats", async () => {
+		await boot();
+		await sleep(0);
+		lastWatch()?.onItem({ ...session, status: "running", updatedAt: "7" });
+		await sendMessage("s", "later", [], false);
+		closeTab("s");
+		expect(queuedOf(getState(), "s")).toHaveLength(1);
+		expect(getState().closedTabs.has("s")).toBe(true);
+		expect(await removeProject("p")).toBe(true);
+		expect(getState().queued).toEqual({});
+		expect(getState().closedTabs.size).toBe(0);
 	});
 });
 
@@ -430,6 +446,65 @@ describe("reconnecting after deletions", () => {
 		expect(getState().sessions).toEqual({});
 		expect(getState().selectedSessionId).toBeNull();
 		expect(getState().chat).toBeNull();
+	});
+});
+
+describe("reconnecting after an outage", () => {
+	test("a turn that finished or asked for approval meanwhile gets the user's attention", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		const other = (id: string, status: string, updatedAt: string) => ({ ...session, id, status, updatedAt });
+		sessionLists.push([session, other("done", "running", "2"), other("asks", "running", "2")]);
+		await boot();
+		expect(getState().selectedSessionId).toBe("s");
+		sessionLists.push([session, other("done", "idle", "3"), other("asks", "awaitingApproval", "3")]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		expect(getState().attention.done).toBe("done");
+		expect(getState().attention.asks).toBe("approval");
+	});
+
+	test("alerts once for everything that changed meanwhile, not once per chat", async () => {
+		spyOn(Math, "random").mockReturnValue(0);
+		const chime = spyOn(desktop, "playChime").mockImplementation(() => {});
+		const notify = spyOn(desktop, "showNotification").mockResolvedValue(undefined);
+		const other = (id: string, status: string, updatedAt: string) => ({ ...session, id, status, updatedAt });
+		sessionLists.push([session, other("a", "running", "2"), other("b", "running", "2"), other("c", "running", "2")]);
+		await boot();
+		Object.assign(globalThis.document, { hasFocus: () => false });
+		sessionLists.push([session, other("a", "idle", "3"), other("b", "idle", "3"), other("c", "awaitingApproval", "3")]);
+		lastWatch()?.onEnd?.(drop);
+		await sleep(300);
+		Object.assign(globalThis.document, { hasFocus: () => true });
+		expect(chime).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls).toEqual([["Octopus", "3 chats need your attention."]]);
+		chime.mockRestore();
+		notify.mockRestore();
+	});
+});
+
+describe("reloading the window", () => {
+	test("keeps drafts and refused messages across a reload, as a daemon restart does", async () => {
+		const items = new Map<string, string>();
+		Object.assign(globalThis, {
+			sessionStorage: {
+				getItem: (key: string) => items.get(key) ?? null,
+				setItem: (key: string, value: string) => items.set(key, value),
+				removeItem: (key: string) => items.delete(key),
+			},
+		});
+		await boot();
+		keepDraft("s", { text: "half a thought", images: [] });
+		outcomes.push("busy");
+		await sendMessage("s", "refused", [], false);
+		dispatchEvent(new Event("pagehide"));
+		keepDraft("s", { text: "", images: [] });
+		discardFailedSend("s", failedSendsOf(getState(), "s")[0]?.id ?? -1);
+
+		await boot();
+		expect(draftOf("s").text).toBe("half a thought");
+		expect(failedSendsOf(getState(), "s").map(({ text }) => text)).toEqual(["refused"]);
+		discardFailedSend("s", failedSendsOf(getState(), "s")[0]?.id ?? -1);
+		keepDraft("s", { text: "", images: [] });
 	});
 });
 

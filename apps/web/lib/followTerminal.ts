@@ -1,6 +1,7 @@
+import { errorMessage, type Follow } from "./daemonRuntime.ts";
 import type { TerminalOutput } from "@repo/contracts/Terminal";
-import { errorTag, type Follow } from "./daemonRuntime.ts";
 import { followReattaching } from "./followReattaching.ts";
+import { isConnectionDrop } from "./errorMessage.ts";
 
 export interface TerminalScreen {
 	readonly reset: () => void;
@@ -16,8 +17,11 @@ export const followTerminal = (
 	screen: TerminalScreen,
 ): (() => void) => {
 	let replayed = false;
+	// Retries run every second while the daemon is away, so the screen says it once until output flows again.
+	let reconnecting = false;
 	return followReattaching(attach, {
 		onItem: (output) => {
+			reconnecting = false;
 			if (output.type === "exit") {
 				screen.write(note(`The shell exited${output.exitCode === null ? "" : ` with code ${output.exitCode}`}`));
 				return;
@@ -28,17 +32,33 @@ export const followTerminal = (
 			}
 			screen.write(output.data);
 		},
-		onDrop: (error) => {
-			// The shell exited while we were away, or the daemon restarted without it.
-			if (errorTag(error) === "TerminalNotFoundError") {
-				screen.write(note("This terminal has closed. Open a new one."));
-				return false;
-			}
+		onDrop: () => {
+			if (reconnecting) return;
+			reconnecting = true;
 			screen.write(note("Disconnected. Reconnecting"));
-			return true;
+		},
+		// The shell exited while we were away, or the daemon restarted without it, or the attach cannot work.
+		onEnd: (error) => {
+			if (error !== null) screen.write(note(errorMessage(error)));
 		},
 		onReattach: () => {
 			replayed = false;
 		},
 	});
+};
+
+// Keystrokes typed while the connection is down cannot reach the shell. Replaying them later could run a half-typed
+// command, so they are dropped, and the screen says so once per outage.
+export const terminalInput = (screen: TerminalScreen) => {
+	let noted = false;
+	return {
+		failed: (error: unknown) => {
+			if (noted || !isConnectionDrop(error)) return;
+			noted = true;
+			screen.write(note("Not sent: the connection to the daemon dropped. Type it again once it reconnects"));
+		},
+		sent: () => {
+			noted = false;
+		},
+	};
 };

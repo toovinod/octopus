@@ -1,4 +1,5 @@
-import type { DraftImage } from "./images.ts";
+import type { ImageData } from "@repo/contracts/AgentSession";
+import { type DraftImage, draftImageOf } from "./images.ts";
 
 export interface Draft {
 	readonly text: string;
@@ -24,3 +25,33 @@ export const releaseDrafts = (sessionIds: Iterable<string>) => {
 		drafts.delete(sessionId);
 	}
 };
+
+// Adds images up to the limit, revoking the previews of those left out. Two pastes read at the same time each see
+// room for themselves, so the limit is applied here, to the draft they land in.
+export const addImages = (draft: Draft, images: ReadonlyArray<DraftImage>, max: number) => {
+	const room = Math.max(0, max - draft.images.length);
+	for (const image of images.slice(room)) URL.revokeObjectURL(image.previewUrl);
+	return {
+		draft: { ...draft, images: [...draft.images, ...images.slice(0, room)] },
+		leftOut: Math.max(0, images.length - room),
+	};
+};
+
+// Queued messages a stop handed back never ran, so they go ahead of what is being typed, to be edited or sent again.
+export const withReturned = (
+	draft: Draft,
+	returned: ReadonlyArray<{ readonly text: string; readonly images: ReadonlyArray<ImageData> }>,
+	max: number,
+) => {
+	const images = returned.flatMap((message) => message.images);
+	const room = Math.max(0, max - draft.images.length);
+	return {
+		draft: {
+			text: [...returned.map(({ text }) => text), draft.text].filter((text) => text !== "").join("\n\n"),
+			images: [...images.slice(0, room).map(draftImageOf), ...draft.images],
+		},
+		leftOut: Math.max(0, images.length - room),
+	};
+};
+
+export const allDrafts = () => drafts.entries();

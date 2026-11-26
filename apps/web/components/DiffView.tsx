@@ -21,6 +21,9 @@ import { newChat, sendMessage, toast, updateSettings, useAppState, workingChats 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Workspace } from "@repo/contracts/Workspace";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { keepFullFiles } from "../lib/keepFullFiles.ts";
+import { logWarning } from "../lib/logWarning.ts";
+import { commentsOf, keepComments } from "../lib/pendingComments.ts";
 import { commitPaths } from "../lib/commitPaths.ts";
 import { Hint } from "./Hint.tsx";
 import { Button } from "@repo/ui/components/button";
@@ -41,9 +44,6 @@ const STATUS_LETTERS = {
 // Agents change files while they work, so the diff reloads every few seconds while a chat here works.
 const WORKING_RELOAD_MS = 5000;
 
-// Comments outlive the panel, so switching tabs and back keeps them until they are sent.
-const commentsByWorkspace = new Map<string, ReadonlyArray<DiffComment>>();
-
 // Which files the commit takes. Every file starts ticked.
 interface FileSelection {
 	readonly included: (path: string) => boolean;
@@ -56,8 +56,16 @@ interface LinePicking {
 	readonly marked: (path: string, side: DiffSide, line: number | null) => boolean;
 }
 
-export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
+export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace; readonly visible: boolean }) => {
 	const [diff, setDiff] = useState<WorkspaceDiff | null>(null);
+	// Read by loads, which must merge into what is shown now, not into the diff of the render that started them.
+	const shown = useRef<WorkspaceDiff | null>(null);
+	const show = useCallback((next: WorkspaceDiff) => {
+		shown.current = next;
+		setDiff(next);
+	}, []);
+	// Files the user asked to see in full, which a reload must not summarize again.
+	const loadedInFull = useRef(new Set<string>());
 	const [error, setError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	// Files the user opened or closed, overriding startsOpen.
@@ -65,7 +73,7 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	const mode = useAppState((current) => current.settings.diffMode);
 	const working = useAppState((current) => workingChats(Object.values(current.sessions), workspace.id));
 	const reverts = useAppState((current) => current.reverts[workspace.id] ?? 0);
-	const [comments, setComments] = useState(() => commentsByWorkspace.get(workspace.id) ?? []);
+	const [comments, setComments] = useState(() => commentsOf(workspace.id));
 	const [picked, setPicked] = useState<LineRange | null>(null);
 	const [excluded, setExcluded] = useState<ReadonlySet<string>>(new Set());
 	const selection = useMemo<FileSelection>(
@@ -83,7 +91,7 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	);
 
 	useEffect(() => {
-		commentsByWorkspace.set(workspace.id, comments);
+		keepComments(workspace.id, comments);
 	}, [workspace.id, comments]);
 
 	const picking = useMemo<LinePicking>(
@@ -103,6 +111,24 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		setPicked(null);
 	};
 
+	const loadFullFile = useCallback(
+		// A reload loads files again in the background, where a toast on every poll would be noise.
+		async (path: string, background = false) => {
+			loadedInFull.current.add(path);
+			const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
+				(failure: unknown) => {
+					if (background) logWarning("Could not load a file's full diff again", failure);
+					else toast(errorMessage(failure));
+					return null;
+				},
+			);
+			const current = shown.current;
+			if (file === null || current === null) return;
+			show({ ...current, files: current.files.map((item) => (item.path === path ? file : item)) });
+		},
+		[workspace.id, show],
+	);
+
 	// Loads can overlap, and an older one can answer last. Only the latest request may show its result.
 	const latestLoad = useRef(0);
 	const load = useCallback(async () => {
@@ -112,42 +138,30 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 		await callDaemon((daemon) => daemon.getWorkspaceDiff({ workspaceId: workspace.id })).then(
 			(loaded) => {
 				if (!isLatest()) return;
-				setDiff(loaded);
+				const { files, stale } = keepFullFiles(shown.current?.files ?? [], loaded.files, loadedInFull.current);
+				show({ ...loaded, files });
 				setError(null);
+				for (const path of stale) void loadFullFile(path, true);
 			},
 			(failure: unknown) => {
 				if (isLatest()) setError(errorMessage(failure));
 			},
 		);
 		if (isLatest()) setLoading(false);
-	}, [workspace.id]);
+	}, [workspace.id, show, loadFullFile]);
 
 	// A chat starting or stopping work and a revert are when files change. Renames and model changes are not.
+	// Each load reads the whole diff, so a hidden panel loads nothing and catches up once it shows again.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: working and reverts are the reload signals.
 	useEffect(() => {
-		void load();
-	}, [load, working, reverts]);
+		if (visible) void load();
+	}, [load, working, reverts, visible]);
 
 	useEffect(() => {
-		if (working === "") return;
+		if (working === "" || !visible) return;
 		const timer = setInterval(() => void load(), WORKING_RELOAD_MS);
 		return () => clearInterval(timer);
-	}, [load, working]);
-
-	const loadFullFile = async (path: string) => {
-		const file = await callDaemon((daemon) => daemon.getFileDiff({ workspaceId: workspace.id, path })).catch(
-			(failure: unknown) => {
-				toast(errorMessage(failure));
-				return null;
-			},
-		);
-		if (file === null) return;
-		setDiff((current) =>
-			current === null
-				? current
-				: { ...current, files: current.files.map((item) => (item.path === path ? file : item)) },
-		);
-	};
+	}, [load, working, visible]);
 
 	const isOpen = useCallback((file: DiffFile) => toggled.get(file.path) ?? startsOpen(file), [toggled]);
 	const rows = useMemo(() => (diff === null ? [] : diffRows(diff.files, mode, isOpen)), [diff, mode, isOpen]);

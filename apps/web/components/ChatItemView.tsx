@@ -38,6 +38,8 @@ import { Input } from "@repo/ui/components/input";
 import { modeLabels } from "../lib/agentModes.ts";
 import type { ChatItem } from "../lib/chatReducer.ts";
 import { callDaemon } from "../lib/daemonRuntime.ts";
+import { logWarning } from "../lib/logWarning.ts";
+import { rememberToggle, toggledRow } from "../lib/rowToggles.ts";
 import { memo, useEffect, useRef, useState } from "react";
 import { ExternalLink } from "./ExternalLink.tsx";
 import { Predicate } from "effect";
@@ -176,7 +178,7 @@ const CodeBlock = ({ code, language }: { readonly code: string; readonly languag
 					if (live) setHtml(highlighted);
 				},
 				// Plain code is the fallback, and it is already on screen.
-				() => undefined,
+				(error: unknown) => logWarning("Code highlighting failed, showing plain code", error),
 			);
 		return () => {
 			live = false;
@@ -231,15 +233,12 @@ const AssistantMessage = ({ text, streaming }: { readonly text: string; readonly
 	);
 };
 
-// Rows unmount when they scroll out of view, so a row the user opened or closed keeps that choice here. Until then it
-// follows its default, which can change, as when a running tool fails. Only toggled rows are kept, so it stays small.
-const toggledRows = new Map<string, boolean>();
-
+// Until the user toggles it, a row follows its default, which can change, as when a running tool fails.
 const useRowOpen = (rowKey: string, byDefault: boolean) => {
-	const [toggled, setToggled] = useState(() => toggledRows.get(rowKey));
+	const [toggled, setToggled] = useState(() => toggledRow(rowKey));
 	const open = toggled ?? byDefault;
 	const toggle = () => {
-		toggledRows.set(rowKey, !open);
+		rememberToggle(rowKey, !open);
 		setToggled(!open);
 	};
 	return [open, toggle] as const;
