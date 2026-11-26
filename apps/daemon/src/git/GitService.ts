@@ -303,6 +303,20 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const untrackedPaths = untrackedOutput.split("\0").filter((path) => path !== "");
 			const untracked: Array<DiffFile> = [];
 			for (const path of untrackedPaths) {
+				// With the budget spent no file could be shown, so reading one, up to a megabyte, only counts its lines.
+				if (budget <= 0) {
+					untracked.push(
+						new DiffFile({
+							path,
+							oldPath: null,
+							status: "untracked",
+							additions: 0,
+							deletions: 0,
+							content: { kind: "tooLarge" },
+						}),
+					);
+					continue;
+				}
 				const file = yield* untrackedFile(cwd, path, Math.min(options.fileLimit, budget));
 				if (file === null) {
 					continue;

@@ -1,6 +1,6 @@
+import { DIFF_FILE_LINE_LIMIT, DIFF_TOTAL_LINE_LIMIT, GitService } from "./GitService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
-import { DIFF_FILE_LINE_LIMIT, GitService } from "./GitService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { runServiceTest } from "../testing/runServiceTest.ts";
 import { describe, expect, test } from "bun:test";
@@ -201,6 +201,24 @@ describe("GitService diff", () => {
 		);
 		expect(diff.diff.mergeBase).toBe(diff.base);
 		expect(diff.diff.files.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
+	test("once the line budget is spent, lists untracked files without reading them", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const created = yield* createWorkspace(tempDir);
+				const lines = `${Array.from({ length: DIFF_FILE_LINE_LIMIT }, (_, line) => `line ${line}`).join("\n")}\n`;
+				const fitting = DIFF_TOTAL_LINE_LIMIT / DIFF_FILE_LINE_LIMIT;
+				for (let index = 0; index <= fitting; index++) {
+					yield* fs.writeFileString(join(created.path, `file-${String(index).padStart(2, "0")}.txt`), lines);
+				}
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		const last = diff.files.at(-1);
+		expect(diff.files.slice(0, -1).every((file) => file.content.kind === "text")).toBe(true);
+		expect(last).toMatchObject({ status: "untracked", additions: 0, content: { kind: "tooLarge" } });
 	});
 
 	test("leaves a huge file out of the summary and loads it on request", async () => {
