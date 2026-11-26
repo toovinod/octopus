@@ -19,6 +19,23 @@ const run = <A, E>(program: (dataDir: string) => Effect.Effect<A, E, FileSystem.
 		return yield* program(yield* fs.makeTempDirectoryScoped());
 	}).pipe(Effect.scoped, Effect.provide(BunServices.layer), Effect.runPromise);
 
+// A migration after every real one, as a future drizzle-kit migration would be.
+const extraMigration = (name: string, statement: string): MigrationMeta => ({
+	sql: [statement],
+	bps: true,
+	folderMillis: Number.MAX_SAFE_INTEGER,
+	hash: name,
+	name,
+});
+
+// Straight on the file, without the layer's own migrations.
+const onFile = <A, E>(dataDir: string, program: Effect.Effect<A, E, SqliteClient.SqliteClient>) =>
+	Effect.gen(function* () {
+		const fs = yield* FileSystem.FileSystem;
+		yield* fs.makeDirectory(dataDir, { recursive: true });
+		return yield* program.pipe(Effect.provide(SqliteClient.layer({ filename: join(dataDir, DATABASE_FILE_NAME) })));
+	});
+
 describe("LocalDatabase", () => {
 	test("migrates a new file with WAL, NORMAL sync, foreign keys and a 5 second busy timeout", async () => {
 		const pragmas = await run((dataDir) =>
@@ -168,28 +185,49 @@ describe("LocalDatabase", () => {
 		expect(counts).toEqual([[{ rows: 1 }], [{ rows: 1 }]]);
 	});
 
-	test("fails startup when a migration leaves a row pointing at a missing parent", async () => {
-		const orphaning: MigrationMeta = {
-			sql: [
-				"INSERT INTO `agentSession` (`id`, `workspaceId`, `agent`, `model`, `authMode`, `status`, `createdAt`, `updatedAt`) VALUES ('s1', 'missing', 'codex', 'gpt', 'subscription', 'idle', '', '');",
-			],
-			bps: true,
-			folderMillis: Number.MAX_SAFE_INTEGER,
-			hash: "orphaning",
-			name: "orphaning",
-		};
-		const error = await run((dataDir) =>
-			Effect.gen(function* () {
-				const fs = yield* FileSystem.FileSystem;
-				yield* fs.makeDirectory(dataDir, { recursive: true });
-				return yield* runMigrations([...embeddedMigrations(), orphaning]).pipe(
-					Effect.provide(SqliteClient.layer({ filename: join(dataDir, DATABASE_FILE_NAME) })),
-					Effect.flip,
-				);
-			}),
+	test("rolls back a migration that leaves a row pointing at a missing parent, and fails startup", async () => {
+		const orphaning = extraMigration(
+			"orphaning",
+			"INSERT INTO `agentSession` (`id`, `workspaceId`, `agent`, `model`, `authMode`, `status`, `createdAt`, `updatedAt`) VALUES ('s1', 'missing', 'codex', 'gpt', 'subscription', 'idle', '', '');",
 		);
-		expect(error._tag).toBe("DatabaseIntegrityError");
-		expect(error.message).toContain("agentSession");
+		const result = await run((dataDir) =>
+			onFile(
+				dataDir,
+				Effect.gen(function* () {
+					yield* runMigrations(embeddedMigrations());
+					const error = yield* Effect.flip(runMigrations([...embeddedMigrations(), orphaning]));
+					const client = yield* SqliteClient.SqliteClient;
+					return {
+						error,
+						sessions: yield* client`SELECT id FROM agentSession`,
+						recorded: yield* client`SELECT name FROM __drizzle_migrations WHERE name = 'orphaning'`,
+					};
+				}),
+			),
+		);
+		expect(result.error._tag).toBe("DatabaseIntegrityError");
+		expect(result.error.message).toContain("agentSession");
+		expect(result.sessions).toEqual([]);
+		expect(result.recorded).toEqual([]);
+	});
+
+	test("starts with orphan rows that were there before the migration, and keeps them", async () => {
+		const harmless = extraMigration("harmless", "CREATE TABLE `harmless` (`id` text PRIMARY KEY);");
+		const sessions = await run((dataDir) =>
+			onFile(
+				dataDir,
+				Effect.gen(function* () {
+					yield* runMigrations(embeddedMigrations());
+					const client = yield* SqliteClient.SqliteClient;
+					// As written by a version that ran without foreign keys.
+					yield* client`PRAGMA foreign_keys = OFF`;
+					yield* client`INSERT INTO agentSession (id, workspaceId, agent, model, authMode, status, createdAt, updatedAt) VALUES ('s1', 'missing', 'codex', 'gpt', 'subscription', 'idle', '', '')`;
+					yield* runMigrations([...embeddedMigrations(), harmless]);
+					return yield* client`SELECT id FROM agentSession`;
+				}),
+			),
+		);
+		expect(sessions).toEqual([{ id: "s1" }]);
 	});
 
 	test("lists the images of messages sent before the attachment lookup existed", async () => {

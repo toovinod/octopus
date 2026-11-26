@@ -25,11 +25,11 @@ export class LocalDatabaseError extends Schema.TaggedError<LocalDatabaseError>()
 }) {}
 
 export class DatabaseIntegrityError extends Schema.TaggedError<DatabaseIntegrityError>()("DatabaseIntegrityError", {
-	// The tables holding rows whose parent row is missing.
+	// The tables a migration would have left with rows whose parent row is missing.
 	tables: Schema.Array(Schema.String),
 }) {
 	override get message() {
-		return `A database migration left rows in ${this.tables.join(", ")} pointing at rows that do not exist. Octopus did not start, so nothing more changed. Restore the database from a backup or report this.`;
+		return `A database update would have left rows in ${this.tables.join(", ")} pointing at rows that do not exist, so Octopus undid it and did not start. Your data is as it was before the update. Go back to the previous version of Octopus and report this.`;
 	}
 }
 
@@ -52,15 +52,43 @@ const restrictDatabaseFiles = Effect.gen(function* () {
 
 // SQLite ignores the foreign_keys pragma inside a transaction, and drizzle runs the migrations in one. With
 // keys on, a migration that rebuilds a table would DROP it and cascade the delete into every child row.
-// Keys stay off until the migrations ran and every row still has its parent.
+// So keys stay off while migrations run, and pending ones run in a transaction that is undone if they
+// leave a row without its parent. Rows that had lost their parent before, while keys were off in an older
+// version, are only logged: refusing to start over them would lock the user out for good.
 export const runMigrations = Effect.fn("runMigrations")(function* (migrations: Array<MigrationMeta>) {
 	const client = yield* SqliteClient.SqliteClient;
 	const db = yield* SQLiteBunDrizzle.makeWithDefaults();
+	const orphansByTable = Effect.map(client<{ readonly table: string }>`PRAGMA foreign_key_check`, (rows) => {
+		const counts = new Map<string, number>();
+		for (const { table } of rows) counts.set(table, (counts.get(table) ?? 0) + 1);
+		return counts;
+	});
+	const [journal] =
+		yield* client`SELECT name FROM sqlite_master WHERE type = 'table' AND name = '__drizzle_migrations'`;
+	const [applied] =
+		journal === undefined
+			? []
+			: yield* client<{ readonly count: number }>`SELECT count(*) AS count FROM __drizzle_migrations`;
+	const pending = (applied?.count ?? 0) < migrations.length;
 	yield* client`PRAGMA foreign_keys = OFF`;
-	yield* migrate(migrations, db._.session);
-	const violations = yield* client<{ readonly table: string }>`PRAGMA foreign_key_check`;
-	if (violations.length > 0) {
-		return yield* new DatabaseIntegrityError({ tables: [...new Set(violations.map(({ table }) => table))] });
+	if (pending) {
+		// drizzle's own transaction nests inside this one as a savepoint.
+		yield* client.withTransaction(
+			Effect.gen(function* () {
+				const before = yield* orphansByTable;
+				yield* migrate(migrations, db._.session);
+				const after = yield* orphansByTable;
+				const added = [...after].filter(([table, count]) => count > (before.get(table) ?? 0)).map(([table]) => table);
+				if (added.length > 0) return yield* new DatabaseIntegrityError({ tables: added });
+				if (before.size > 0) {
+					yield* Effect.logWarning("The database holds rows whose parent row is missing, kept as they are").pipe(
+						Effect.annotateLogs({ tables: [...before.keys()] }),
+					);
+				}
+			}),
+		);
+	} else {
+		yield* migrate(migrations, db._.session);
 	}
 	// The client keeps one connection, so this pragma holds for every query.
 	yield* client`PRAGMA foreign_keys = ON`;
