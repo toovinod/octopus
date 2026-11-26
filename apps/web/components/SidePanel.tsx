@@ -58,10 +58,11 @@ export const SidePanel = () => {
 const PanelBody = ({ tab, workspaceKey }: { readonly tab: PanelTab; readonly workspaceKey: string }) => {
 	const workspace = useAppState((current) => current.workspaces[workspaceKey]);
 	const active = useAppState((current) => current.panel.tab === tab);
+	const panelOpen = useAppState((current) => current.panel.open);
 	if (workspace === undefined) return null;
 	switch (tab) {
 		case "diff":
-			return <DiffView key={workspace.id} workspace={workspace} />;
+			return <DiffView key={workspace.id} workspace={workspace} visible={active && panelOpen} />;
 		case "files":
 			return <FileBrowser key={workspace.id} workspace={workspace} />;
 		case "terminal":

@@ -57,7 +57,7 @@ interface LinePicking {
 	readonly marked: (path: string, side: DiffSide, line: number | null) => boolean;
 }
 
-export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
+export const DiffView = ({ workspace, visible }: { readonly workspace: Workspace; readonly visible: boolean }) => {
 	const [diff, setDiff] = useState<WorkspaceDiff | null>(null);
 	// Read by loads, which must merge into what is shown now, not into the diff of the render that started them.
 	const shown = useRef<WorkspaceDiff | null>(null);
@@ -150,16 +150,17 @@ export const DiffView = ({ workspace }: { readonly workspace: Workspace }) => {
 	}, [workspace.id, show, loadFullFile]);
 
 	// A chat starting or stopping work and a revert are when files change. Renames and model changes are not.
+	// Each load reads the whole diff, so a hidden panel loads nothing and catches up once it shows again.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: working and reverts are the reload signals.
 	useEffect(() => {
-		void load();
-	}, [load, working, reverts]);
+		if (visible) void load();
+	}, [load, working, reverts, visible]);
 
 	useEffect(() => {
-		if (working === "") return;
+		if (working === "" || !visible) return;
 		const timer = setInterval(() => void load(), WORKING_RELOAD_MS);
 		return () => clearInterval(timer);
-	}, [load, working]);
+	}, [load, working, visible]);
 
 	const isOpen = useCallback((file: DiffFile) => toggled.get(file.path) ?? startsOpen(file), [toggled]);
 	const rows = useMemo(() => (diff === null ? [] : diffRows(diff.files, mode, isOpen)), [diff, mode, isOpen]);
