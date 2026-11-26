@@ -1,7 +1,8 @@
 import { GhNotAuthenticatedError, GhNotInstalledError } from "@repo/contracts/Git";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { collectText, STDERR_MAX_LENGTH } from "./runGit.ts";
 import { withGitDeadline } from "./GitTimeoutSettings.ts";
-import { Context, Effect, Schema, Stream } from "effect";
+import { Context, Effect, Schema } from "effect";
 
 export const GhSettings = Context.Reference<{ readonly executable: string }>("octopus/daemon/git/GhSettings", {
 	defaultValue: () => ({ executable: "gh" }),
@@ -28,17 +29,19 @@ export const runGh = Effect.fn("runGh")(
 			}),
 		);
 		const [stdout, stderr, exitCode] = yield* Effect.all(
+			// stdout is uncapped: gh prints JSON for queries the daemon limits itself, and a cut would read as a failed
+			// command, such as a sign-in that is not there.
 			[
-				Stream.mkString(Stream.decodeText(handle.stdout)),
-				Stream.mkString(Stream.decodeText(handle.stderr)),
+				collectText(handle.stdout, Number.POSITIVE_INFINITY),
+				collectText(handle.stderr, STDERR_MAX_LENGTH),
 				handle.exitCode,
 			],
 			{ concurrency: "unbounded" },
 		);
 		if (exitCode !== 0) {
-			return yield* new GhCommandError({ args: [...args], exitCode, stderr: stderr.trim() });
+			return yield* new GhCommandError({ args: [...args], exitCode, stderr: stderr.text.trim() });
 		}
-		return stdout.trim();
+		return stdout.text.trim();
 	},
 	Effect.scoped,
 	(effect, _cwd, args) =>

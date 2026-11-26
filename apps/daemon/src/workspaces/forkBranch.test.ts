@@ -35,6 +35,54 @@ describe("isForkCheckout", () => {
 		);
 		expect(fork).toBe(false);
 	});
+
+	// What `gh pr checkout` leaves when the user already has a remote for the fork, whatever its name.
+	test("counts a branch that tracks a fork through a named remote as a fork's", async () => {
+		const fork = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["remote", "add", "origin", "https://example.com/owner/app.git"]);
+				yield* runGit(path, ["remote", "add", "contributor", "https://example.com/contributor/app.git"]);
+				yield* runGit(path, ["checkout", "-b", "feature"]);
+				yield* runGit(path, ["config", "branch.feature.remote", "contributor"]);
+				yield* runGit(path, ["config", "branch.feature.merge", "refs/heads/feature"]);
+				return yield* isForkCheckout(path);
+			}),
+		);
+		expect(fork).toBe(true);
+	});
+
+	// The usual name for the repository a clone of a fork was forked from.
+	test("does not count a branch that tracks upstream, even where gh never chose a base", async () => {
+		const fork = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["remote", "add", "origin", "https://example.com/me/app.git"]);
+				yield* runGit(path, ["remote", "add", "upstream", "https://example.com/owner/app.git"]);
+				yield* runGit(path, ["checkout", "-b", "feature"]);
+				yield* runGit(path, ["config", "branch.feature.remote", "upstream"]);
+				yield* runGit(path, ["config", "branch.feature.merge", "refs/heads/main"]);
+				return yield* isForkCheckout(path);
+			}),
+		);
+		expect(fork).toBe(false);
+	});
+
+	test("does not count a branch that tracks the repository gh uses as the base", async () => {
+		const fork = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const path = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(path, ["remote", "add", "origin", "https://example.com/me/app.git"]);
+				yield* runGit(path, ["remote", "add", "upstream", "https://example.com/owner/app.git"]);
+				yield* runGit(path, ["config", "remote.upstream.gh-resolved", "base"]);
+				yield* runGit(path, ["checkout", "-b", "feature"]);
+				yield* runGit(path, ["config", "branch.feature.remote", "upstream"]);
+				yield* runGit(path, ["config", "branch.feature.merge", "refs/heads/main"]);
+				return yield* isForkCheckout(path);
+			}),
+		);
+		expect(fork).toBe(false);
+	});
 });
 
 describe("isForkCheckout with branch names and marks git reads its own way", () => {
@@ -95,9 +143,10 @@ describe("isForkCheckout with branch names and marks git reads its own way", () 
 		expect(fork).toBe(true);
 	});
 
-	test("tells a named remote from a URL for a branch whose name holds regex characters", async () => {
+	test("tells the base remote from a URL for a branch whose name holds regex characters", async () => {
 		const tracking = (remote: string) => [
 			["remote.up.stream.url", "https://example.com/upstream/app.git"] as const,
+			["remote.up.stream.gh-resolved", "base"] as const,
 			["branch.feat/a.b+c.remote", remote] as const,
 			["branch.feat/a.b+c.merge", "refs/heads/feat/a.b+c"] as const,
 		];

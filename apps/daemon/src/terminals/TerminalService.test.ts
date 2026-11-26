@@ -1,8 +1,9 @@
-import { LIVE_CHUNK, TerminalService, splitLiveOutput } from "./TerminalService.ts";
-import { ConfigProvider, Effect, FileSystem, Layer, Stream } from "effect";
+import { LIVE_BUFFER, LIVE_CHUNK, TerminalService, splitLiveOutput } from "./TerminalService.ts";
+import { ConfigProvider, Duration, Effect, FileSystem, Layer, Stream } from "effect";
 import { testProcessRegistry } from "../testing/testProcessRegistry.ts";
 import { SCROLLBACK_MAX_LINES, Scrollback } from "./Scrollback.ts";
 import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
+import { STOP_GRACE } from "../processes/stopProcessGroup.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { SecureRandom } from "effect/crypto";
@@ -47,6 +48,31 @@ describe("TerminalService", () => {
 		expect(outputText(result.outputs)).toContain("done-2");
 		expect(result.outputs.at(-1)).toEqual({ type: "exit", exitCode: 7 });
 		expect(result.afterExit).toEqual([]);
+	});
+
+	test("closing a workspace stops its terminals at once, not one after another", async () => {
+		const took = await runTerminalTest((tempDir) =>
+			Effect.gen(function* () {
+				const terminals = yield* TerminalService;
+				// Shells that ignore SIGHUP, so each needs the whole stop grace and then SIGKILL.
+				for (let index = 0; index < 2; index++) {
+					const info = yield* terminals.open("workspace-1", tempDir, size);
+					yield* terminals.write(info.id, "trap '' HUP; echo trap-$((1 + 1))\n");
+					yield* terminals.attach(info.id).pipe(
+						Stream.takeUntil((output) => output.type === "data" && output.data.includes("trap-2")),
+						Stream.runDrain,
+					);
+				}
+				const [elapsed] = yield* Effect.timed(terminals.closeWorkspace("workspace-1"));
+				return Duration.toMillis(elapsed);
+			}),
+		);
+		expect(took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
+	}, 20_000);
+
+	// Architecture section 14 caps each subscriber's buffer at 1,000 events or 1 MB.
+	test("a slow client's live buffer holds at most about a megabyte", () => {
+		expect(LIVE_BUFFER * LIVE_CHUNK).toBeLessThanOrEqual(1024 * 1024);
 	});
 
 	test("a client that attaches later gets the scrollback first", async () => {
@@ -98,7 +124,7 @@ describe("TerminalService", () => {
 			// Recording the group writes a file, so a shell can print before it finishes.
 			const slowRegistry = Layer.succeed(
 				ProcessRegistry,
-				ProcessRegistry.of({ add: () => Effect.sleep("300 millis"), remove: () => Effect.void }),
+				ProcessRegistry.of({ add: () => Effect.sleep("300 millis"), remove: () => Effect.void, stopAll: Effect.void }),
 			);
 			return yield* Effect.gen(function* () {
 				const terminals = yield* TerminalService;

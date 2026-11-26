@@ -71,7 +71,8 @@ It never authenticates Claude or Codex, and Octopus never sends agent credential
 
 ### 3.1 Start-up
 
-1. Tauri generates a 32-byte token, spawns `octopusd` and writes the token as the first line on its stdin. It never goes in the environment, which every agent, script and git process inherits.
+1. Tauri generates a 32-byte token, spawns `octopusd` and writes the token as the first line on its stdin, as 64 lowercase hex characters. It never goes in the environment, which every agent, script and git process inherits.
+   The daemon refuses to start on any other line.
 2. `octopusd` opens SQLite (WAL, foreign keys, 5 s busy timeout), runs embedded migrations, then recovers interrupted work (section 6).
 3. It binds `127.0.0.1` on a random port and prints `OCTOPUS_DAEMON_READY <url>`.
 4. Tauri hands `{ url, token }` to the UI through the `daemon_connection` command.
@@ -82,22 +83,26 @@ It never authenticates Claude or Codex, and Octopus never sends agent credential
   The daemon logs the reason and closes its layers in reverse order: the HTTP server, then workspace runtimes and their children, then the process registry, then SQLite after a WAL checkpoint.
 - A clean shutdown exits 0.
   If a finalizer hangs past 8 s, or a second signal arrives, the daemon exits 1 at once.
+  So that no child outlives that exit, every recorded process group is sent its stop signal early enough for its 5 s SIGKILL grace to end before the 8 s deadline.
+  The archive's git commands are the exception: they are left to finish, since one cut short can leave a worktree half cleaned.
 
 ### 3.2 Ownership
 
 - Agent processes, terminals, setup scripts and watchers belong to a **workspace runtime** in the daemon, never to an RPC call or a UI subscription.
 - A UI subscription only reads. Closing it never stops work.
-- Each workspace runtime owns one Effect `Scope`. Stopping the workspace closes that scope, and every process in it is released with `Effect.acquireRelease`.
+- There is no per-workspace `Scope`.
+  Each service (agent sessions, terminals, scripts) keeps its own processes in a `FiberMap` keyed by id, and stopping a workspace asks each service to stop that workspace's entries.
+  Every process is still released with `Effect.acquireRelease`, and closing a service's layer stops all of its processes.
 
 ### 3.3 Lifecycles
 
-| Action              | What happens                                                                                                                                                                                                                                                                                                                                            |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Close a tab         | The UI unsubscribes. Nothing stops.                                                                                                                                                                                                                                                                                                                     |
-| Close the window    | macOS: the app keeps running in the dock and agents keep working. Linux: same as quit.                                                                                                                                                                                                                                                                  |
-| Quit Octopus        | The UI warns if turns are running or approvals are pending. Then the shell closes the daemon's stdin (later the `shutdown` RPC), hides its windows and waits up to 10 s, off the UI thread, before killing it. The daemon stops every workspace runtime (below).                                                                                        |
-| Stop a workspace    | Pending approvals resolve as `cancelled`. Running turns are interrupted and their sessions become `interrupted`. Terminals get SIGHUP. Setup scripts get SIGTERM, and their jobs return to `pending` so they can be retried. Files are untouched.                                                                                                       |
-| Archive a workspace | Stop it first. If the worktree has uncommitted changes or unpushed commits, archive fails with `WorkspaceHasUnsavedWork` unless the user forces it. A forced archive saves changes with `git stash push --include-untracked -m octopus-archive/<workspaceId>`, then removes the worktree and keeps the branch. An in-place archive never deletes files. |
+| Action              | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Close a tab         | The UI unsubscribes. Nothing stops.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Close the window    | macOS: the app keeps running in the dock and agents keep working. Linux: same as quit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Quit Octopus        | The UI warns if turns are running or approvals are pending. Then the shell closes the daemon's stdin (later the `shutdown` RPC), hides its windows and waits up to 10 s, off the UI thread, before killing it. The daemon stops every workspace runtime (below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Stop a workspace    | Pending approvals resolve as `cancelled`. Running turns are interrupted and their sessions become `interrupted`. Terminals get SIGHUP. Setup and run scripts get SIGTERM. On quit, setup jobs return to `pending` so they can be retried, and run scripts end `cancelled`, since the user starts them. Files are untouched.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Archive a workspace | If the worktree has uncommitted changes, unpushed commits or ignored files that an install or build does not make again (such as `.env`), archive fails with `WorkspaceHasUnsavedWork` unless the user forces it. Then it stops the workspace, and its setup and run jobs end `cancelled` rather than return to `pending`. A forced archive saves changes with `git stash push --include-untracked -m octopus-archive/<workspaceId>`, keeps commits of a detached HEAD on `octopus-archive/<workspaceId>-head`, then removes the worktree and keeps the branch. An interrupted call does not stop a removal under way, and shutdown leaves its git commands to finish. If the stash push fails after saving, the saved changes go back into the folder. An in-place archive never deletes files. |
 
 - Every child (setup and run scripts, agents, terminals) runs in its own process group, so a stop reaches its grandchildren too.
   A stop sends SIGTERM to the group (SIGHUP for terminals), then SIGKILL after a 5 s grace.
@@ -142,6 +147,8 @@ The rules are in `AGENTS.md`, under "States, retries and fallbacks". In short:
 - Jobs use `pending`, `processing`, `completed`, `failed`, `deadLetter`, plus `attempts` and `lastError`. One `transition` function per machine allows only legal moves.
 - Retryable failures return to `pending` with exponential, jittered backoff. When attempts run out the job goes to `deadLetter`, and only the user retries it from there.
 - On start-up, rows still in `processing` count as retryable failures. Agent sessions left `running` or `awaitingApproval` become `interrupted`.
+- Run scripts are the exception: the user starts them, so a restart moves one cut off in `processing` to `cancelled` instead of running it again.
+- Archiving a workspace cancels its setup and run jobs, so none is retried for a folder that is gone.
 
 ## 7. Agent adapters
 
@@ -216,6 +223,7 @@ Rules:
 - **Sessions per workspace** are unlimited. Agent processes have no fixed cap either: an idle process stops after 5 minutes and resumes through its native id on the next message (section 14).
 - **Event order** is `sequence` per session, never time.
 - **No raw output** is stored. Script output keeps the last 64 KB or 2,000 lines in memory, whichever is smaller.
+- **Restore and project removal** cannot both win: a workspace whose project was removed while it was being restored is not restored, and its new worktree is removed again.
 
 ## 12. Web app and deployment
 
@@ -255,6 +263,9 @@ It changed these decisions:
   - Terminal scrollback: 5,000 lines or 2 MB.
   - Script output: 64 KB or 2,000 lines.
   - Subscriber buffers: 1,000 events or 1 MB.
+  - Live terminal output: 1,000 chunks of at most 1,024 characters per subscriber.
+  - Live script output: 64 lines of at most 16 KiB per subscriber. Kept script output keeps lines of up to 16 KiB whole.
+  - `git` and `gh` output: the first 64 KiB of stderr. A diff's patch is capped at 32 MiB, past which its files show as too large. Status, file listings and `gh` JSON are read whole, since a cut one would hide work from a safety check.
 - **Limits.** One file watcher per open workspace. Concurrent agent processes are not capped. An agent idle for 5 minutes is stopped, so only working agents hold a process.
 - **Measure the whole thing.** Report the combined memory of the shell, the webview processes, the daemon and the agent processes, measured by a script in the repo against the same task in other tools. We publish only claims we measured.
 - **Privacy statement.** Octopus keeps local workspace data on your machine. The agents you configure still send context to their model providers under those providers' terms. Native agent histories (Claude Code and Codex transcripts) may keep output that Octopus itself drops.

@@ -1,10 +1,10 @@
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
+import { runGit, runGitCapped, STDERR_MAX_LENGTH } from "./runGit.ts";
 import { GitTimeoutSettings } from "./GitTimeoutSettings.ts";
 import { runInTempDir } from "../testing/runServiceTest.ts";
 import { Duration, Effect, FileSystem } from "effect";
 import { describe, expect, test } from "bun:test";
 import { GhSettings, runGh } from "./runGh.ts";
-import { runGit } from "./runGit.ts";
 import { join } from "node:path";
 
 const deadlines = (local: number, network: number) => ({
@@ -70,5 +70,34 @@ describe("git and gh deadlines", () => {
 			}),
 		);
 		expect(error).toMatchObject({ _tag: "GitTimeoutError", command: "gh pr", kind: "network" });
+	});
+});
+
+describe("git output caps", () => {
+	test("keeps only the start of a huge stderr", async () => {
+		const error = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(repo, ["config", "alias.noisy", "!yes noise | head -c 1000000 >&2; false"]);
+				return yield* Effect.flip(runGit(repo, ["noisy"]));
+			}),
+		);
+		expect(error._tag).toBe("GitCommandError");
+		expect(error._tag === "GitCommandError" && error.stderr.length).toBeLessThanOrEqual(STDERR_MAX_LENGTH);
+	});
+
+	test("fails a capped command whose stdout passes the cap with an error of its own, and caps no other", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const repo = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* runGit(repo, ["config", "alias.flood", "!yes line | head -c 4096"]);
+				return {
+					capped: yield* Effect.flip(runGitCapped(repo, ["flood"], 1024)),
+					whole: yield* runGit(repo, ["flood"]),
+				};
+			}),
+		);
+		expect(result.capped).toMatchObject({ _tag: "GitOutputTooLargeError", args: ["flood"], maxLength: 1024 });
+		expect(result.whole.length).toBe(4096);
 	});
 });

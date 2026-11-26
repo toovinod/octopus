@@ -4,11 +4,14 @@ import {
 	WorkspaceHasUnsavedWorkError,
 	WorkspaceNotFoundError,
 	WorkspacePathInUseError,
+	type WorktreeRemoveError,
 } from "@repo/contracts/Workspace";
 import {
-	archiveStashMessage,
+	addArchivedWorktree,
 	discardWorktree,
+	dropArchiveHeadBranch,
 	findUnsavedWork,
+	isWorktreeOf,
 	removeWorktree,
 	restoreArchiveStash,
 } from "./removeWorktree.ts";
@@ -19,6 +22,7 @@ import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createW
 import { applyScriptRunEvent, runSetupScript, setupRetryDelay } from "./runSetupScript.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
+import { type GitCommandError, type GitSpawnError, runGit } from "../git/runGit.ts";
 import { holdsForkCode, isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
@@ -29,6 +33,7 @@ import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import type { ScriptRunKind } from "@repo/contracts/ScriptRun";
 import { listListeningPorts } from "./listListeningPorts.ts";
+import type { GitTimeoutError } from "@repo/contracts/Git";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
@@ -41,7 +46,6 @@ import { CappedOutput } from "./CappedOutput.ts";
 import { runRunScript } from "./runRunScript.ts";
 import { nowIso } from "../database/nowIso.ts";
 import { newId } from "../database/newId.ts";
-import { runGit } from "../git/runGit.ts";
 
 type WorkspaceRow = typeof workspace.$inferSelect;
 type ScriptRunRow = typeof scriptRun.$inferInsert;
@@ -66,8 +70,9 @@ interface ScriptOutput {
 
 const RUN_SCRIPT_PORT_POLL = "2 seconds";
 
-// A slow follower loses old lines rather than growing the daemon's memory.
-const LIVE_LINES = 1000;
+// A slow follower loses old lines rather than growing the daemon's memory: at most LIVE_LINES lines of at most
+// LINE_MAX_LENGTH characters, about a megabyte. Kept output is not bound by this, so its lines stay whole.
+export const LIVE_LINES = 64;
 
 // Finished output stays so the UI can show why a run failed, but only for the latest runs: a
 // daemon that runs scripts for weeks would otherwise hold the output of every one.
@@ -143,9 +148,7 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 			const startSetupScript = (scriptRunId: string, script: string, cwd: string, delay = Duration.zero) =>
 				startScript(scriptRunId, (onLine) =>
 					Effect.sleep(delay).pipe(
-						Effect.andThen(
-							runSetupScript({ scriptRunId, script, cwd, onLine }).pipe(Semaphore.withPermit(setupPermits)),
-						),
+						Effect.andThen(runSetupScript({ scriptRunId, script, cwd, onLine, permits: setupPermits })),
 					),
 				);
 
@@ -387,25 +390,32 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							),
 						),
 				);
-				for (const run of unfinished) {
-					yield* FiberMap.remove(runningScripts, run.id);
-					yield* applyScriptRunEvent(run.id, { _tag: "Cancelled", reason }).pipe(
-						// The script finished on its own between the query and the interrupt.
-						Effect.catchTag("IllegalJobTransitionError", (error) =>
-							Effect.logDebug("Script run ended before it was cancelled", error),
+				// At once: a script that ignores its stop signal takes the whole stop grace.
+				yield* Effect.forEach(
+					unfinished,
+					(run) =>
+						FiberMap.remove(runningScripts, run.id).pipe(
+							Effect.andThen(applyScriptRunEvent(run.id, { _tag: "Cancelled", reason })),
+							// The script finished on its own between the query and the interrupt.
+							Effect.catchTag("IllegalJobTransitionError", (error) =>
+								Effect.logDebug("Script run ended before it was cancelled", error),
+							),
 						),
-					);
-				}
+					{ concurrency: "unbounded", discard: true },
+				);
 			}, Effect.provide(services));
 
 			// Agents, terminals and scripts all run in the workspace folder, so they stop before it can be
 			// removed. Only once archiving goes ahead: a refused archive leaves them running.
 			const stopWorkspaceProcesses = (workspaceId: string) =>
-				Effect.gen(function* () {
-					yield* sessions.stopWorkspace(workspaceId);
-					yield* terminals.closeWorkspace(workspaceId);
-					yield* cancelScripts(workspaceId, "The workspace was archived.");
-				});
+				Effect.all(
+					[
+						sessions.stopWorkspace(workspaceId),
+						terminals.closeWorkspace(workspaceId),
+						cancelScripts(workspaceId, "The workspace was archived."),
+					],
+					{ concurrency: "unbounded", discard: true },
+				);
 
 			const archive = Effect.fn("WorkspaceService.archive")(
 				function* (workspaceId: string, options: { readonly force: boolean }) {
@@ -413,12 +423,21 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (current.status === "archived") {
 						return current;
 					}
+					// What takes the workspace's folder away. It runs with the rest of the archive, below.
+					let remove: Effect.Effect<
+						void,
+						WorktreeRemoveError | GitCommandError | GitSpawnError | GitTimeoutError,
+						ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
+					> = Effect.void;
 					if (current.kind === "worktree") {
 						// The foreign key keeps the project while it has workspaces.
 						const owner = yield* projects
 							.get(current.projectId)
 							.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
-						if (yield* fs.exists(current.path).pipe(Effect.orDie)) {
+						const isWorktree =
+							(yield* fs.exists(current.path).pipe(Effect.orDie)) &&
+							(yield* isWorktreeOf(owner.path, yield* fs.realPath(current.path).pipe(Effect.orDie)));
+						if (isWorktree) {
 							const refuseUnsaved = Effect.fnUntraced(function* () {
 								const unsaved = yield* findUnsavedWork(current.path, current.baseBranch);
 								const hasUnsaved =
@@ -436,40 +455,48 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							yield* stopWorkspaceProcesses(workspaceId);
 							// And again after: agents and scripts can write files until they stop.
 							const unsaved = yield* refuseUnsaved();
-							yield* removeWorktree({
+							remove = removeWorktree({
 								repositoryPath: owner.path,
 								worktreePath: current.path,
-								stashMessage: unsaved.changedFiles.length > 0 ? archiveStashMessage(workspaceId) : null,
+								workspaceId,
+								stashChanges: unsaved.changedFiles.length > 0,
 							});
 						} else {
-							// Someone deleted the folder already. Forget it in git and carry on.
-							yield* Effect.logWarning("Worktree folder is missing, pruning it").pipe(
+							// Someone deleted the folder, or what links it to the repository, already. Forget it in git and
+							// carry on. A folder that is left holds files git no longer knows, so it stays for the user.
+							yield* Effect.logWarning("Worktree folder is missing or no longer a worktree, pruning it").pipe(
 								Effect.annotateLogs({ workspaceId, path: current.path }),
 							);
 							yield* stopWorkspaceProcesses(workspaceId);
-							yield* runGit(owner.path, ["worktree", "prune"]);
+							remove = runGit(owner.path, ["worktree", "prune"]).pipe(Effect.asVoid);
 						}
 					} else {
 						// In place: the folder is the project itself, so nothing is removed.
 						yield* stopWorkspaceProcesses(workspaceId);
 					}
 
-					const archivedAt = yield* nowIso;
-					yield* database.query((db) =>
-						db.update(workspace).set({ status: "archived", archivedAt }).where(eq(workspace.id, workspaceId)),
-					);
-					yield* sessions.deleteWorkspaceAttachments(workspaceId);
-					// Checkpoints keep old copies of files alive in git, so they go with the workspace.
-					const { path: repository } = yield* projects
-						.get(current.projectId)
-						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
-					yield* deleteCheckpoints(repository, workspaceId).pipe(
-						Effect.catch((cause) => Effect.logWarning("Could not delete the workspace's checkpoints", cause)),
-					);
-					const runs = yield* listScriptRuns(workspaceId);
-					for (const run of runs) {
-						outputs.delete(run.id);
-					}
+					const markArchived = Effect.gen(function* () {
+						const archivedAt = yield* nowIso;
+						yield* database.query((db) =>
+							db.update(workspace).set({ status: "archived", archivedAt }).where(eq(workspace.id, workspaceId)),
+						);
+						yield* sessions.deleteWorkspaceAttachments(workspaceId);
+						// Checkpoints keep old copies of files alive in git, so they go with the workspace.
+						const { path: repository } = yield* projects
+							.get(current.projectId)
+							.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
+						yield* deleteCheckpoints(repository, workspaceId).pipe(
+							Effect.catch((cause) => Effect.logWarning("Could not delete the workspace's checkpoints", cause)),
+						);
+						const runs = yield* listScriptRuns(workspaceId);
+						for (const run of runs) {
+							outputs.delete(run.id);
+						}
+					});
+					// Not cut short by a quit or a dropped connection: stopped between stashing and saving the row, the
+					// workspace would stay active with its changes only in a stash. Each git command keeps its deadline,
+					// and a failed removal puts the stash back.
+					yield* Effect.uninterruptible(remove.pipe(Effect.andThen(markArchived)));
 					yield* Effect.logInfo("Archived workspace").pipe(Effect.annotateLogs({ workspaceId }));
 					return yield* get(workspaceId);
 				},
@@ -495,11 +522,13 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						.get(current.projectId)
 						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
 					let setupRun: ScriptRunRow | null = null;
+					let detached = false;
 					if (current.kind === "worktree") {
 						yield* makeWorktreesDir;
-						yield* addBranchWorktree({
+						detached = yield* addArchivedWorktree({
 							repositoryPath: owner.path,
 							worktreePath: current.path,
+							workspaceId,
 							branch: current.branch,
 						});
 						// Ignored files such as installed dependencies were not kept, so setup runs again. Only where it ran
@@ -509,15 +538,23 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						);
 						setupRun = setupBefore > 0 && owner.setupScript !== null ? yield* newSetupRun(workspaceId) : null;
 					}
-					const restored = yield* database.query((db) =>
+					// The project can be removed meanwhile, with this workspace still archived, which deletes its row.
+					const outcome = yield* database.query((db) =>
 						db.transaction((tx) =>
 							Effect.gen(function* () {
+								const archived = yield* tx.$count(
+									workspace,
+									and(eq(workspace.id, workspaceId), eq(workspace.status, "archived")),
+								);
+								if (archived === 0) {
+									return "gone" as const;
+								}
 								const taken = yield* tx.$count(
 									workspace,
 									and(eq(workspace.path, current.path), eq(workspace.status, "active")),
 								);
 								if (taken > 0) {
-									return false;
+									return "pathInUse" as const;
 								}
 								yield* tx
 									.update(workspace)
@@ -526,18 +563,23 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 								if (setupRun !== null) {
 									yield* tx.insert(scriptRun).values(setupRun);
 								}
-								return true;
+								return "restored" as const;
 							}),
 						),
 					);
-					if (!restored) {
+					if (outcome !== "restored") {
 						if (current.kind === "worktree") {
 							yield* discardWorktree({ repositoryPath: owner.path, worktreePath: current.path, branch: null });
 						}
-						return yield* new WorkspacePathInUseError({ path: current.path });
+						return yield* outcome === "gone"
+							? new WorkspaceNotFoundError({ workspaceId })
+							: new WorkspacePathInUseError({ path: current.path });
 					}
 					if (current.kind === "worktree") {
-						yield* restoreArchiveStash(current.path, workspaceId);
+						const clean = yield* restoreArchiveStash(current.path, workspaceId);
+						if (clean && detached) {
+							yield* dropArchiveHeadBranch(owner.path, workspaceId);
+						}
 					}
 					yield* Effect.logInfo("Restored workspace").pipe(Effect.annotateLogs({ workspaceId }));
 					if (setupRun !== null && owner.setupScript !== null) {
@@ -641,7 +683,14 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							cwd: current.path,
 							onLine,
 							onSpawn: (pid) => runScriptGroups.set(scriptRunId, pid),
-						}).pipe(Effect.ensuring(Effect.sync(() => runScriptGroups.delete(scriptRunId)))),
+						}).pipe(
+							Effect.ensuring(
+								Effect.sync(() => {
+									runScriptGroups.delete(scriptRunId);
+									portLooks.delete(scriptRunId);
+								}),
+							),
+						),
 					);
 					yield* Effect.logInfo("Started run script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
 					return new ScriptRun({
@@ -697,10 +746,23 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				Effect.provide(services),
 			);
 
+			// Each look spawns pgrep and lsof, so every watcher of a run, one per open window, shares the latest one.
+			const portLooks = new Map<string, Effect.Effect<ReadonlyArray<number>>>();
 			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
 				const running = yield* findRunningRunScript(workspaceId);
 				const group = running === null ? undefined : runScriptGroups.get(running.id);
-				return group === undefined ? [] : yield* listListeningPorts(group);
+				if (running === null || group === undefined) {
+					return [];
+				}
+				let look = portLooks.get(running.id);
+				if (look === undefined) {
+					look = yield* Effect.cachedWithTTL(
+						listListeningPorts(group).pipe(Effect.provide(services)),
+						RUN_SCRIPT_PORT_POLL,
+					);
+					portLooks.set(running.id, look);
+				}
+				return yield* look;
 			}, Effect.provide(services));
 
 			// The ports the workspace's run script listens on, sent again each time they change. A dev server

@@ -1,9 +1,9 @@
 import { isGoneWithin, killGroupOnExit, spawnDetachedShell, WITH_GRANDCHILD } from "../testing/processTesting.ts";
 import { Clock, Context, Duration, Effect, Exit, FileSystem, Layer, Option, Schema, Stream } from "effect";
-import { ProcessRegistry, REGISTRY_FILE_NAME, RegistryEntries } from "./ProcessRegistry.ts";
+import { ProcessRegistry, REGISTRY_FILE_NAME, RegistryEntries, WRITE_SPACING } from "./ProcessRegistry.ts";
+import { processExists, STOP_GRACE } from "./stopProcessGroup.ts";
 import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { runInTempDir } from "../testing/runServiceTest.ts";
-import { processExists } from "./stopProcessGroup.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { ChildProcess } from "effect/process";
@@ -128,5 +128,96 @@ describe("ProcessRegistry", () => {
 			}),
 		);
 		expect(result).toBe(0);
+	});
+
+	test("stops every recorded group at once, each with its own stop grace", async () => {
+		const result = await runInTempDir((dataDir) =>
+			Effect.gen(function* () {
+				// Both ignore SIGTERM, so each needs the whole grace and then SIGKILL.
+				const shells = yield* Effect.all([
+					spawnDetachedShell(`trap '' TERM; ${WITH_GRANDCHILD}`),
+					spawnDetachedShell(`trap '' TERM; ${WITH_GRANDCHILD}`),
+				]);
+				for (const { shell } of shells) yield* killGroupOnExit(shell.pid);
+				const layer = ProcessRegistry.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]));
+				const registry = Context.get(yield* Layer.build(layer), ProcessRegistry);
+				for (const { shell } of shells) yield* registry.add(shell.pid);
+				const [took] = yield* Effect.timed(registry.stopAll);
+				const gone = yield* Effect.forEach(shells, ({ grandchild }) => isGoneWithin(grandchild));
+				return { took: Duration.toMillis(took), gone };
+			}),
+		);
+		expect(result.gone).toEqual([true, true]);
+		expect(result.took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
+	}, 20_000);
+
+	test("leaves a group kept through shutdown out of stopAll", async () => {
+		const result = await runInTempDir((dataDir) =>
+			Effect.gen(function* () {
+				const [stopped, kept] = yield* Effect.all([
+					spawnDetachedShell("echo $$; exec sleep 30"),
+					spawnDetachedShell("echo $$; exec sleep 30"),
+				]);
+				for (const { shell } of [stopped, kept]) yield* killGroupOnExit(shell.pid);
+				const layer = ProcessRegistry.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]));
+				const registry = Context.get(yield* Layer.build(layer), ProcessRegistry);
+				yield* registry.add(stopped.shell.pid);
+				yield* registry.add(kept.shell.pid, { keepThroughShutdown: true });
+				yield* registry.stopAll;
+				return {
+					stoppedGone: yield* isGoneWithin(stopped.shell.pid),
+					keptAlive: yield* processExists(kept.shell.pid),
+				};
+			}),
+		);
+		expect(result).toEqual({ stoppedGone: true, keptAlive: true });
+	});
+
+	test("writes a child to the file at once, and many short children in a burst cost only a few writes", async () => {
+		const result = await runInTempDir((dataDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				let writes = 0;
+				const countingFs = Layer.succeed(
+					FileSystem.FileSystem,
+					FileSystem.FileSystem.of({
+						...fs,
+						writeFileString: (...args) =>
+							fs.writeFileString(...args).pipe(
+								Effect.tap(() =>
+									Effect.sync(() => {
+										writes++;
+									}),
+								),
+							),
+					}),
+				);
+				const file = join(dataDir, REGISTRY_FILE_NAME);
+				const layer = ProcessRegistry.layer.pipe(
+					Layer.provide(countingFs),
+					Layer.provide([testDaemonConfig(dataDir), BunServices.layer]),
+				);
+				const registry = Context.get(yield* Layer.build(layer), ProcessRegistry);
+				// A terminal or an agent, which a crash in its first second must not orphan.
+				yield* registry.add(222222);
+				yield* Effect.sleep(Duration.millis(50));
+				const soon = yield* fs.readFileString(file);
+				yield* Effect.sleep(Duration.sum(WRITE_SPACING, Duration.millis(50)));
+				// Short git calls, added and removed again at once.
+				const before = writes;
+				for (let pgid = 300000; pgid < 300100; pgid++) {
+					yield* registry.add(pgid);
+					yield* registry.remove(pgid);
+				}
+				yield* Effect.sleep(Duration.times(WRITE_SPACING, 3));
+				const burstWrites = writes - before;
+				yield* registry.remove(222222);
+				yield* Effect.sleep(Duration.times(WRITE_SPACING, 2));
+				return { soon, burstWrites, removed: yield* fs.readFileString(file) };
+			}),
+		);
+		expect(result.soon).toContain('"pgid":222222');
+		expect(result.burstWrites).toBeLessThanOrEqual(2);
+		expect(result.removed).toBe("[]");
 	});
 });

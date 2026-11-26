@@ -1,7 +1,8 @@
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { Effect, Layer, Redacted } from "effect";
 
-export const TEST_TOKEN = "test-token";
+// 32 bytes as hex, the shape of the token the desktop shell sends.
+export const TEST_TOKEN = "0123456789abcdef".repeat(4);
 export const TEST_ORIGIN = "tauri://localhost";
 
 export const testDaemonConfig = (dataDir: string) =>

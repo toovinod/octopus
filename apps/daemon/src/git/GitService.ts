@@ -43,17 +43,20 @@ import { type Workspace, WorkspaceArchivedError } from "@repo/contracts/Workspac
 import { Context, Effect, type FileSystem, Layer, Schema } from "effect";
 import { type GhCommandError, requireGhLogin, runGh } from "./runGh.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
+import { resolveBranchRef } from "../workspaces/createWorktree.ts";
 import { readWorkspaceFile } from "../files/readWorkspaceFile.ts";
 import { holdsForkCode } from "../workspaces/forkBranch.ts";
 import type { ChildProcessSpawner } from "effect/process";
 import { leavesRoot } from "../files/leavesRoot.ts";
+import { runGit, runGitCapped } from "./runGit.ts";
 import { normalize } from "node:path";
-import { runGit } from "./runGit.ts";
 
 // The workspace diff sends at most this many changed lines per file and in total.
 // Anything past that is listed as too large and loaded one file at a time.
 export const DIFF_FILE_LINE_LIMIT = 2000;
 export const DIFF_TOTAL_LINE_LIMIT = 20_000;
+// The line limits leave a patch's size to how long its lines are, which in a minified or generated file is huge.
+export const PATCH_MAX_LENGTH = 32 * 1024 * 1024;
 // Loading one file on request still stops here, to keep the webview responsive.
 export const SINGLE_FILE_LINE_LIMIT = 50_000;
 const UNTRACKED_BYTE_LIMIT = 1024 * 1024;
@@ -176,15 +179,20 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 
 		// The point where the workspace left its base branch. Without one (unrelated histories, a missing
 		// base branch) the diff falls back to HEAD and shows only uncommitted changes.
-		const findMergeBase = (current: Workspace) =>
-			runGit(current.path, ["merge-base", "HEAD", current.baseBranch]).pipe(
+		const findMergeBase = Effect.fnUntraced(function* (current: Workspace) {
+			const fallBack = (reason: string, cause?: unknown) =>
+				Effect.logWarning(reason, cause).pipe(Effect.annotateLogs({ workspaceId: current.id }), Effect.as("HEAD"));
+			// A bare name misses a base branch that only origin has, as when the workspace was made from it.
+			const base = yield* resolveBranchRef(current.path, current.baseBranch);
+			if (base === null) {
+				return yield* fallBack("The base branch is gone, diffing against HEAD");
+			}
+			return yield* runGit(current.path, ["merge-base", "HEAD", base]).pipe(
 				Effect.catchTag("GitCommandError", (cause) =>
-					Effect.logWarning("No merge base with the base branch, diffing against HEAD", cause).pipe(
-						Effect.annotateLogs({ workspaceId: current.id }),
-						Effect.as("HEAD"),
-					),
+					fallBack("No merge base with the base branch, diffing against HEAD", cause),
 				),
 			);
+		});
 
 		const untrackedFile = Effect.fn("GitService.untrackedFile")(function* (
 			cwd: string,
@@ -248,21 +256,33 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const patch =
 				fitting.length === 0
 					? ""
-					: yield* runGit(cwd, [
-							"diff",
-							"-M",
-							"--no-color",
-							"--no-ext-diff",
-							mergeBase,
-							...pathspecs(
-								fitting.flatMap(({ changed }) =>
-									changed.oldPath === null ? [changed.path] : [changed.path, changed.oldPath],
+					: yield* runGitCapped(
+							cwd,
+							[
+								"diff",
+								"-M",
+								"--no-color",
+								"--no-ext-diff",
+								mergeBase,
+								...pathspecs(
+									fitting.flatMap(({ changed }) =>
+										changed.oldPath === null ? [changed.path] : [changed.path, changed.oldPath],
+									),
+								),
+							],
+							PATCH_MAX_LENGTH,
+						).pipe(
+							// No sections, so every fitting file shows as too large, with its line counts.
+							Effect.catchTag("GitOutputTooLargeError", (error) =>
+								Effect.logWarning("The patch passed the output cap, so its files show as too large", error).pipe(
+									Effect.annotateLogs({ workspaceId: current.id }),
+									Effect.as(""),
 								),
 							),
-						]);
+						);
 			const sections = parsePatch(patch);
 			const expected = fitting.length + fitting.filter(({ changed }) => changed.typeChanged).length;
-			if (sections.length !== expected) {
+			if (patch !== "" && sections.length !== expected) {
 				yield* Effect.logWarning("The patch did not match the changed files, so hunks are left out").pipe(
 					Effect.annotateLogs({ workspaceId: current.id, sections: sections.length, files: fitting.length }),
 				);
@@ -297,7 +317,9 @@ export class GitService extends Context.Service<GitService>()("octopus/daemon/gi
 			const untrackedPaths = untrackedOutput.split("\0").filter((path) => path !== "");
 			const untracked: Array<DiffFile> = [];
 			for (const path of untrackedPaths) {
-				const file = yield* untrackedFile(cwd, path, Math.min(options.fileLimit, budget));
+				// With the budget spent each file is still read, a megabyte at most and one at a time, so it shows as
+				// binary or too large with its line count, and one deleted since git listed it is left out.
+				const file = yield* untrackedFile(cwd, path, Math.max(0, Math.min(options.fileLimit, budget)));
 				if (file === null) {
 					continue;
 				}

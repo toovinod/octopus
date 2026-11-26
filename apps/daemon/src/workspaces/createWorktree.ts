@@ -5,7 +5,7 @@ import {
 	WorktreeCreateError,
 } from "@repo/contracts/Workspace";
 import { runGit } from "../git/runGit.ts";
-import { Effect } from "effect";
+import { Effect, Hash } from "effect";
 
 // show-ref exits 1 when the ref does not exist.
 export const refExists = (repositoryPath: string, ref: string) =>
@@ -77,9 +77,17 @@ export const addBranchWorktree = Effect.fn("addBranchWorktree")(function* (optio
 	);
 });
 
-// A branch name as a folder name: workspace folders keep to the characters a workspace name allows.
-export const worktreeFolderName = (branch: string) =>
-	branch
-		.replace(/[^A-Za-z0-9._-]+/g, "-")
-		.replace(/^[^A-Za-z0-9]+/, "")
-		.slice(0, 63) || "branch";
+const FOLDER_NAME_MAX_LENGTH = 63;
+
+// A branch name as a folder name: workspace folders keep to the characters a workspace name allows. A branch
+// that does not fit as it is gets a hash of its whole name, so `feat/x` and `feat-x`, or two long names that
+// start alike, never share a folder. So does one with capitals: the file systems of macOS and Windows ignore
+// case, so `Feature` and `feature` would otherwise be one folder.
+export const worktreeFolderName = (branch: string) => {
+	const cleaned = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "");
+	if (cleaned === branch && branch === branch.toLowerCase() && branch.length <= FOLDER_NAME_MAX_LENGTH) {
+		return branch;
+	}
+	const suffix = `-${(Hash.string(branch) >>> 0).toString(16).padStart(8, "0")}`;
+	return `${(cleaned || "branch").slice(0, FOLDER_NAME_MAX_LENGTH - suffix.length)}${suffix}`;
+};

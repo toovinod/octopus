@@ -11,9 +11,11 @@ export const markForkBranch = Effect.fn("markForkBranch")(function* (repositoryP
 });
 
 // Whether a folder's checked-out branch holds a fork's code: Octopus marked it, or it is set up the way
-// `gh pr checkout` sets up a fork's pull request, pulling from a URL rather than a configured remote, or pulling
-// the pull request's head (refs/pull/<n>/head) when the fork keeps maintainers out. A branch tracking a named
-// remote such as upstream is the user's own. A detached HEAD shows neither.
+// `gh pr checkout` sets up a fork's pull request, pulling from a URL or from a remote the user added for the fork,
+// or pulling the pull request's head (refs/pull/<n>/head) when the fork keeps maintainers out. git config cannot
+// tell a fork's remote from the project's own by its name, so only origin, upstream (by convention the repository a
+// fork was made from) and the remote gh uses as the base repository count as the project's: a branch on any other
+// remote counts as a fork's. A detached HEAD shows neither.
 // It reads the whole config in one call and filters it here, so a branch name needs no regex escaping and a
 // workspace listing spends two git calls per workspace rather than five.
 export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: string) {
@@ -27,7 +29,10 @@ export const isForkCheckout = Effect.fn("isForkCheckout")(function* (path: strin
 	if (remote === "" || remote === ".") return false;
 	const merge = config.get(`branch.${branch}.merge`) ?? "";
 	if (merge.startsWith("refs/pull/")) return true;
-	return !remoteNames(config).has(remote);
+	if (remote === "origin" || remote === "upstream") return false;
+	// What `gh repo set-default`, or gh's own question in a repository with several remotes, records. Git keeps
+	// the remote name's case in the listing.
+	return config.get(`remote.${remote}.gh-resolved`) !== "base";
 });
 
 // Splits `git config --null --list` output into key and value. A key set without a value (`[branch "x"] remote`)
@@ -53,14 +58,6 @@ const readForkMark = (value: string | null | undefined) => {
 	if (["false", "no", "off", "0", ""].includes(word)) return false;
 	return "unknown";
 };
-
-// The remotes `git remote` lists: every name with a remote.<name>.<key> entry, where the name may hold dots.
-const remoteNames = (config: ReadonlyMap<string, string | null>) =>
-	new Set(
-		[...config.keys()]
-			.filter((key) => key.startsWith("remote.") && key.lastIndexOf(".") > "remote".length)
-			.map((key) => key.slice("remote.".length, key.lastIndexOf("."))),
-	);
 
 const countAsFork = (path: string) => (cause: unknown) =>
 	Effect.logWarning("Could not tell whether the branch is a fork's, so it counts as one", cause).pipe(

@@ -1,6 +1,6 @@
+import { DIFF_FILE_LINE_LIMIT, DIFF_TOTAL_LINE_LIMIT, GitService, PATCH_MAX_LENGTH } from "./GitService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
-import { DIFF_FILE_LINE_LIMIT, GitService } from "./GitService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { runServiceTest } from "../testing/runServiceTest.ts";
 import { describe, expect, test } from "bun:test";
@@ -95,6 +95,19 @@ describe("GitService diff", () => {
 		expect(byPath.get("image.bin")?.content).toEqual({ kind: "binary" });
 	});
 
+	test("marks the files whose patch passes the output cap as too large, rather than fail the diff", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const created = yield* createWorkspace(tempDir);
+				// One line counts as one line against the budget, however long it is, as in a minified bundle.
+				yield* fs.writeFileString(join(created.path, "README.md"), `${"x".repeat(PATCH_MAX_LENGTH)}\n`);
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		expect(diff.files).toMatchObject([{ path: "README.md", additions: 1, content: { kind: "tooLarge" } }]);
+	});
+
 	test("shows only the changed line of a file that was renamed and edited", async () => {
 		const lines = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
 		const diff = await runServiceTest((tempDir) =>
@@ -168,6 +181,61 @@ describe("GitService diff", () => {
 			}),
 		);
 		expect(diff.files.map((file) => [file.path, file.status])).toEqual([["feature.txt", "added"]]);
+	});
+
+	test("diffs against a base branch that only origin has", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const repositoryPath = yield* makeTestRepository(join(tempDir, "repo"));
+				yield* addOrigin(tempDir, repositoryPath);
+				yield* runGit(repositoryPath, ["checkout", "-b", "develop"]);
+				yield* runGit(repositoryPath, ["commit", "--allow-empty", "-m", "develop work"]);
+				yield* runGit(repositoryPath, ["push", "origin", "develop"]);
+				yield* runGit(repositoryPath, ["checkout", "main"]);
+				yield* runGit(repositoryPath, ["branch", "-D", "develop"]);
+				const project = yield* projects.add(repositoryPath);
+				const created = yield* workspaces.create({
+					kind: "worktree",
+					projectId: project.id,
+					name: "feature",
+					baseBranch: "develop",
+				});
+				yield* fs.writeFileString(join(created.path, "feature.txt"), "feature\n");
+				yield* runGit(created.path, ["add", "feature.txt"]);
+				yield* runGit(created.path, ["commit", "-m", "feature"]);
+				return {
+					diff: yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id)),
+					base: yield* runGit(repositoryPath, ["rev-parse", "origin/develop"]),
+				};
+			}),
+		);
+		expect(diff.diff.mergeBase).toBe(diff.base);
+		expect(diff.diff.files.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
+	test("once the line budget is spent, still labels untracked files and counts their lines", async () => {
+		const diff = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const created = yield* createWorkspace(tempDir);
+				const lines = `${Array.from({ length: DIFF_FILE_LINE_LIMIT }, (_, line) => `line ${line}`).join("\n")}\n`;
+				const fitting = DIFF_TOTAL_LINE_LIMIT / DIFF_FILE_LINE_LIMIT;
+				for (let index = 0; index < fitting; index++) {
+					yield* fs.writeFileString(join(created.path, `file-${String(index).padStart(2, "0")}.txt`), lines);
+				}
+				yield* fs.writeFileString(join(created.path, "zz-over.txt"), "one\ntwo\n");
+				yield* fs.writeFile(join(created.path, "zz-picture.bin"), new Uint8Array([0, 1, 2, 0]));
+				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
+			}),
+		);
+		expect(diff.files.slice(0, -2).every((file) => file.content.kind === "text")).toBe(true);
+		expect(diff.files.slice(-2)).toMatchObject([
+			{ path: "zz-over.txt", status: "untracked", additions: 2, content: { kind: "tooLarge" } },
+			{ path: "zz-picture.bin", status: "untracked", additions: 0, content: { kind: "binary" } },
+		]);
 	});
 
 	test("leaves a huge file out of the summary and loads it on request", async () => {
@@ -607,7 +675,7 @@ describe("GitService on a branch that tracks another remote", () => {
 		}
 	});
 
-	test("treats a branch that tracks a named remote such as upstream as the project's own, and pushes it to origin", async () => {
+	test("treats a branch that tracks the base repository gh resolved, such as upstream, as the project's own, and pushes it to origin", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
@@ -618,6 +686,8 @@ describe("GitService on a branch that tracks another remote", () => {
 				const upstream = join(tempDir, "upstream.git");
 				yield* runGit(tempDir, ["init", "--bare", "--initial-branch=main", upstream]);
 				yield* runGit(repositoryPath, ["remote", "add", "upstream", upstream]);
+				// What `gh repo set-default` and gh's first question in a repository with several remotes leave.
+				yield* runGit(repositoryPath, ["config", "remote.upstream.gh-resolved", "base"]);
 				yield* runGit(repositoryPath, ["config", "branch.feature.remote", "upstream"]);
 				yield* runGit(repositoryPath, ["config", "branch.feature.merge", "refs/heads/main"]);
 				yield* addMarkingHooks(tempDir, repositoryPath);

@@ -1,5 +1,6 @@
 import { ConfigProvider, Duration, Effect, Option, Redacted, Stdio, Stream } from "effect";
 import { DaemonConfig, TAURI_ORIGINS } from "./DaemonConfig.ts";
+import { TEST_TOKEN } from "../testing/testDaemonConfig.ts";
 import { describe, expect, test } from "bun:test";
 
 const encoder = new TextEncoder();
@@ -43,15 +44,23 @@ const devOriginsWith = (env: Record<string, string>) =>
 
 describe("DaemonConfig", () => {
 	test("reads the token from the first line of stdin", async () => {
-		const result = await configFromStdin("abc", "123\n", "ignored\n");
+		const result = await configFromStdin(TEST_TOKEN.slice(0, 10), `${TEST_TOKEN.slice(10)}\n`, "ignored\n");
 		expect(result._tag).toBe("Success");
 		if (result._tag === "Success") {
-			expect(Redacted.value(result.success.token)).toBe("abc123");
+			expect(Redacted.value(result.success.token)).toBe(TEST_TOKEN);
+		}
+	});
+
+	// The desktop shell always sends 32 random bytes as hex, so anything else did not come from it.
+	test("refuses a token that is not 32 bytes of hex", async () => {
+		for (const token of ["abc", `${TEST_TOKEN}0`, TEST_TOKEN.toUpperCase().replace(/./, "G")]) {
+			const result = await configFromStdin(`${token}\n`);
+			expect(result).toMatchObject({ _tag: "Failure", failure: { _tag: "DaemonTokenInvalidError" } });
 		}
 	});
 
 	test("allows only the desktop app's pages by default", async () => {
-		const result = await configFromStdin("abc\n");
+		const result = await configFromStdin(`${TEST_TOKEN}\n`);
 		expect(result).toMatchObject({ _tag: "Success", success: { allowedOrigins: TAURI_ORIGINS } });
 	});
 
@@ -73,12 +82,15 @@ describe("DaemonConfig", () => {
 	});
 
 	test("reports the parent gone once stdin closes after the token", async () => {
-		const result = await parentExitedWithin(stdinOf("abc\n"), Duration.seconds(1));
+		const result = await parentExitedWithin(stdinOf(`${TEST_TOKEN}\n`), Duration.seconds(1));
 		expect(result).toMatchObject({ _tag: "Success", success: true });
 	});
 
 	test("keeps waiting while stdin stays open", async () => {
-		const result = await parentExitedWithin(Stream.concat(stdinOf("abc\n"), Stream.never), Duration.millis(50));
+		const result = await parentExitedWithin(
+			Stream.concat(stdinOf(`${TEST_TOKEN}\n`), Stream.never),
+			Duration.millis(50),
+		);
 		expect(result).toMatchObject({ _tag: "Success", success: false });
 	});
 });

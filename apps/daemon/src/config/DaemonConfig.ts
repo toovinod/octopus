@@ -9,6 +9,15 @@ class DaemonTokenMissingError extends Schema.TaggedError<DaemonTokenMissingError
 	}
 }
 
+class DaemonTokenInvalidError extends Schema.TaggedError<DaemonTokenInvalidError>()("DaemonTokenInvalidError", {}) {
+	override get message() {
+		return "octopusd got a token the Octopus app does not make. Start it from the Octopus app.";
+	}
+}
+
+// What the desktop shell sends: 32 random bytes as lowercase hex. A shorter one would be easier to guess.
+const DaemonToken = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+
 // The desktop shell writes the token on stdin rather than in the environment, because every
 // agent, script and git process the daemon starts inherits its environment. It keeps stdin open
 // afterwards, and the OS closes it when the shell exits for any reason, including a crash.
@@ -23,6 +32,9 @@ const readStdin = Effect.gen(function* () {
 	const token = Option.getOrElse(firstLine, () => "").trim();
 	if (token === "") {
 		return yield* new DaemonTokenMissingError();
+	}
+	if (!Schema.is(DaemonToken)(token)) {
+		return yield* new DaemonTokenInvalidError();
 	}
 	return { token: Redacted.make(token), parentExited: Effect.orDie(Stream.runDrain(rest)) };
 });

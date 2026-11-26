@@ -1,13 +1,18 @@
+import { LIVE_LINES, MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
-import { MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
+import { Duration, Effect, Fiber, FileSystem, Layer, Schedule, Stream } from "effect";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
-import { Duration, Effect, Fiber, FileSystem, Stream } from "effect";
+import { testAgentServices } from "../testing/testAgentServices.ts";
+import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
+import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
+import { STOP_GRACE } from "../processes/stopProcessGroup.ts";
+import { DaemonServices } from "../server/DaemonServices.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { scriptRun, workspace } from "../database/schema.ts";
 import { LINE_MAX_LENGTH } from "./capLineLength.ts";
@@ -84,6 +89,25 @@ describe("WorkspaceService", () => {
 			}),
 		);
 		expect(new Set(paths).size).toBe(2);
+	});
+
+	test("branches whose names make the same folder name each get a folder of their own", async () => {
+		const paths = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const long = "a".repeat(70);
+				const branches = ["feat/x", `${long}-one`, `${long}-two`];
+				for (const branch of branches) yield* runGit(project.path, ["branch", branch]);
+				const named = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feat-x" });
+				const fromBranches = yield* Effect.forEach(branches, (branch) =>
+					workspaces.create({ kind: "branch", projectId: project.id, branch }),
+				);
+				return [named, ...fromBranches].map((created) => created.path);
+			}),
+		);
+		expect(new Set(paths).size).toBe(4);
+		expect(paths.every((path) => (path.split("/").at(-1)?.length ?? 0) <= 63)).toBe(true);
 	});
 
 	test("refuses a name whose branch already exists", async () => {
@@ -235,6 +259,131 @@ describe("WorkspaceService", () => {
 		expect(result.workspace.status).toBe("active");
 	});
 
+	test("a forced archive interrupted after stashing still finishes, so the stash belongs to an archived workspace", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), "node_modules/\n");
+				yield* runGit(project.path, ["add", ".gitignore"]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				// Many ignored files are not stashed, so `git worktree remove` takes a while to delete them.
+				const modules = join(created.path, "node_modules");
+				yield* fs.makeDirectory(modules);
+				yield* Effect.forEach(
+					Array.from({ length: 4000 }, (_, index) => index),
+					(index) => fs.writeFileString(join(modules, `${index}.js`), "installed\n"),
+					{ concurrency: 64, discard: true },
+				);
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				const archiving = yield* Effect.forkChild(workspaces.archive(created.id, { force: true }));
+				// Interrupted, as a quit or a dropped connection would, as soon as the changes are stashed.
+				yield* runGit(project.path, ["stash", "list"]).pipe(
+					Effect.repeat({ schedule: Schedule.spaced("2 millis"), until: (list) => list !== "" }),
+					Effect.timeout("10 seconds"),
+				);
+				yield* Fiber.interrupt(archiving);
+				return {
+					workspace: yield* workspaces.get(created.id),
+					folderExists: yield* fs.exists(created.path),
+					stashes: yield* runGit(project.path, ["stash", "list"]),
+				};
+			}),
+		);
+		expect(result.workspace.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
+		expect(result.stashes).toContain(`octopus-archive/${result.workspace.id}`);
+	});
+
+	test("a forced archive whose stash push fails after saving puts the changes back and drops that stash", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				yield* fs.writeFileString(join(created.path, "notes.txt"), "mine\n");
+				// git saves the stash, then cannot delete this untracked file, so the push fails with the folder half
+				// cleaned, as a kill in the middle of it would leave it.
+				const locked = join(created.path, "locked");
+				yield* fs.makeDirectory(locked);
+				yield* fs.writeFileString(join(locked, "draft.txt"), "draft\n");
+				yield* fs.chmod(locked, 0o555);
+				const failed = yield* Effect.flip(workspaces.archive(created.id, { force: true })).pipe(
+					Effect.ensuring(fs.chmod(locked, 0o755).pipe(Effect.ignore)),
+				);
+				return {
+					failed,
+					workspace: yield* workspaces.get(created.id),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+					notes: yield* fs.readFileString(join(created.path, "notes.txt")),
+					draft: yield* fs.readFileString(join(locked, "draft.txt")),
+					status: yield* runGit(created.path, ["status", "--porcelain"]),
+					stashes: yield* runGit(project.path, ["stash", "list"]),
+				};
+			}),
+		);
+		expect(result.failed).toBeDefined();
+		expect(result.workspace.status).toBe("active");
+		expect(result.readme).toBe("edited\n");
+		expect(result.notes).toBe("mine\n");
+		expect(result.draft).toBe("draft\n");
+		expect(result.status.split("\n").sort()).toEqual([" M README.md", "?? locked/", "?? notes.txt"]);
+		expect(result.stashes).toBe("");
+	});
+
+	test("a forced archive on a detached HEAD keeps the commits made there on a branch", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, ["checkout", "--detach"]);
+				yield* runGit(created.path, ["commit", "--allow-empty", "-m", "detached work"]);
+				const commit = yield* runGit(created.path, ["rev-parse", "HEAD"]);
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				yield* workspaces.archive(created.id, { force: true });
+				return {
+					refused,
+					commit,
+					kept: yield* runGit(project.path, ["rev-parse", `refs/heads/octopus-archive/${created.id}-head`]),
+				};
+			}),
+		);
+		expect(result.refused).toMatchObject({ _tag: "WorkspaceHasUnsavedWorkError", unpushedCommits: 1 });
+		expect(result.kept).toBe(result.commit);
+	});
+
+	test("restoring a workspace archived on a detached HEAD puts it back at those commits, with its changes", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, ["checkout", "--detach"]);
+				yield* fs.writeFileString(join(created.path, "README.md"), "committed\n");
+				yield* runGit(created.path, ["commit", "-am", "detached work"]);
+				const commit = yield* runGit(created.path, ["rev-parse", "HEAD"]);
+				yield* fs.writeFileString(join(created.path, "README.md"), "uncommitted\n");
+				yield* workspaces.archive(created.id, { force: true });
+				yield* workspaces.unarchive(created.id);
+				return {
+					commit,
+					head: yield* runGit(created.path, ["rev-parse", "HEAD"]),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+					kept: yield* runGit(project.path, ["branch", "--list", `octopus-archive/${created.id}-head`]),
+				};
+			}),
+		);
+		expect(result.head).toBe(result.commit);
+		expect(result.readme).toBe("uncommitted\n");
+		expect(result.kept).toBe("");
+	});
+
 	test("counts commits no remote has as unsaved work", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -354,6 +503,54 @@ describe("WorkspaceService", () => {
 		);
 		expect(result.archived.status).toBe("archived");
 		expect(result.folderExists).toBe(false);
+	});
+
+	test("does not take a worktree git cannot read for a folder that is no longer one", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				// Like a safe.directory refusal: the worktree is there, but git cannot tell what it holds.
+				const gitFile = join(created.path, ".git");
+				yield* fs.chmod(gitFile, 0o000);
+				const failed = yield* Effect.flip(workspaces.archive(created.id, { force: false })).pipe(
+					Effect.ensuring(fs.chmod(gitFile, 0o644).pipe(Effect.ignore)),
+				);
+				return {
+					failed,
+					workspace: yield* workspaces.get(created.id),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+				};
+			}),
+		);
+		expect(result.failed).toMatchObject({ _tag: "GitCommandError" });
+		expect(result.workspace.status).toBe("active");
+		expect(result.readme).toBe("edited\n");
+	});
+
+	test("archives a worktree whose folder is no longer a worktree, and leaves the folder", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				// The `.git` file links the folder to the repository. Without it git cannot work in the folder.
+				yield* fs.remove(join(created.path, ".git"));
+				const archived = yield* workspaces.archive(created.id, { force: false });
+				return {
+					archived,
+					readme: yield* fs.exists(join(created.path, "README.md")),
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+				};
+			}),
+		);
+		expect(result.archived.status).toBe("archived");
+		expect(result.readme).toBe(true);
+		expect(result.worktrees).not.toContain("feature");
 	});
 
 	test("archiving an in-place workspace removes nothing", async () => {
@@ -512,6 +709,31 @@ describe("WorkspaceService", () => {
 			...Array.from({ length: SETUP_SCRIPTS_AT_ONCE }, () => "start"),
 			"end",
 		]);
+	});
+
+	test("a setup script waiting out its retry delay lets the next one run", async () => {
+		const run = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				// Only the `fast` workspace's script finishes; the others time out and wait to retry.
+				const project = yield* addProject(
+					tempDir,
+					'if [ "$(git branch --show-current)" = fast ]; then echo ok; else sleep 5; fi',
+				);
+				const names = [...Array.from({ length: SETUP_SCRIPTS_AT_ONCE }, (_, index) => `slow-${index}`), "fast"];
+				const created = yield* Effect.forEach(names, (name) =>
+					workspaces.create({ kind: "worktree", projectId: project.id, name }),
+				);
+				return yield* waitForScriptRun(created.at(-1)?.id ?? "");
+			}).pipe(
+				Effect.provideService(SetupScriptSettings, {
+					timeout: Duration.millis(100),
+					maxAttempts: 3,
+					retryBaseDelay: Duration.minutes(1),
+				}),
+			),
+		);
+		expect(run?.status).toBe("completed");
 	});
 
 	test("a timed-out setup script is retried, then dead-lettered", async () => {
@@ -679,6 +901,27 @@ describe("WorkspaceService", () => {
 		expect(results.map((archived) => archived.status)).toEqual(["archived", "archived", "archived", "archived"]);
 	});
 
+	test("archiving stops the workspace's scripts at once, not one after another", async () => {
+		const took = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				// Scripts that ignore SIGTERM, so each needs the whole stop grace and then SIGKILL.
+				const stubborn = "trap '' TERM; echo ready; while true; do sleep 0.1; done";
+				yield* projects.updateScripts(project.id, { setupScript: stubborn, runScript: stubborn });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const runs = [yield* workspaces.startSetupScriptRun(created.id), yield* workspaces.startRunScript(created.id)];
+				for (const run of runs) {
+					yield* workspaces.followScriptRunOutput(run.id).pipe(Stream.take(1), Stream.runDrain);
+				}
+				const [elapsed] = yield* Effect.timed(workspaces.archive(created.id, { force: false }));
+				return Duration.toMillis(elapsed);
+			}),
+		);
+		expect(took).toBeLessThan(Duration.toMillis(STOP_GRACE) * 1.5);
+	}, 20_000);
+
 	test("runs the run script, streams its output, and stops it", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -735,6 +978,55 @@ describe("WorkspaceService", () => {
 		);
 		expect(result.ports).toEqual([result.printed]);
 		expect(result.afterStop).toEqual([]);
+	});
+
+	test("watchers of one run script share each look for its ports", async () => {
+		const spawned: Array<number> = [];
+		const recordingRegistry = Layer.succeed(
+			ProcessRegistry,
+			ProcessRegistry.of({
+				add: (pgid) => Effect.sync(() => spawned.push(pgid)),
+				remove: () => Effect.void,
+				stopAll: Effect.void,
+			}),
+		);
+		const counts = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: "echo serving; sleep 30" });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const started = yield* workspaces.startRunScript(created.id);
+				yield* workspaces.followScriptRunOutput(started.id).pipe(Stream.take(1), Stream.runDrain);
+				// Each look spawns the same commands, so the spawns count the looks.
+				const spawnsFor = Effect.fn("spawnsFor")(function* (watchers: number) {
+					const before = spawned.length;
+					yield* Effect.all(
+						Array.from({ length: watchers }, () =>
+							workspaces.watchRunScriptPorts(created.id).pipe(Stream.take(1), Stream.runDrain),
+						),
+						{ concurrency: "unbounded" },
+					);
+					return spawned.length - before;
+				});
+				const one = yield* spawnsFor(1);
+				// Past the poll interval, so the next look is a fresh one.
+				yield* Effect.sleep("2100 millis");
+				const three = yield* spawnsFor(3);
+				yield* workspaces.stopRunScript(created.id);
+				return { one, three };
+			}).pipe(
+				Effect.provide(
+					DaemonServices.pipe(
+						Layer.provideMerge(testAgentServices()),
+						Layer.provide([testDaemonConfig(join(tempDir, "data")), recordingRegistry]),
+					),
+				),
+			),
+		);
+		expect(counts.one).toBeGreaterThan(0);
+		expect(counts.three).toBe(counts.one);
 	});
 
 	test("a run script that exits records its exit code", async () => {
@@ -878,6 +1170,28 @@ describe("WorkspaceService", () => {
 		expect(result).toEqual({ failed: "WorktreeRemoveError", run: "run" });
 	});
 
+	// Architecture section 14 caps each subscriber's buffer at 1,000 events or 1 MB.
+	test("a slow follower's live buffer holds at most about a megabyte", () => {
+		expect(LIVE_LINES * LINE_MAX_LENGTH).toBeLessThanOrEqual(1024 * 1024);
+	});
+
+	test("keeps a 16 KiB line of output whole", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const script = "head -c 16384 /dev/zero | tr '\\0' x; echo";
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: script });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const run = yield* workspaces.startRunScript(created.id);
+				yield* Stream.runDrain(workspaces.followScriptRunOutput(run.id));
+				return workspaces.getScriptRunOutput(run.id).output;
+			}),
+		);
+		expect(result).toBe("x".repeat(16 * 1024));
+	});
+
 	test("a long line is cut to the line cap before it is kept or streamed", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
@@ -965,6 +1279,37 @@ describe("WorkspaceService.unarchive", () => {
 			}),
 		);
 		expect(restored).toMatchObject({ status: "active", fromFork: true });
+	});
+
+	test("a project removed while a workspace is being restored leaves no folder behind", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* workspaces.archive(created.id, { force: false });
+				const restoring = yield* Effect.forkChild(Effect.exit(workspaces.unarchive(created.id)));
+				// While git adds the worktree again, the project, with only archived workspaces, can still go.
+				yield* fs
+					.exists(created.path)
+					.pipe(
+						Effect.repeat({ schedule: Schedule.spaced("1 millis"), until: (exists) => exists }),
+						Effect.timeout("10 seconds"),
+					);
+				yield* projects.remove(project.id);
+				const restored = yield* Fiber.join(restoring);
+				return {
+					failure: restored._tag === "Failure" ? String(restored.cause) : null,
+					folderExists: yield* fs.exists(created.path),
+					worktrees: yield* runGit(project.path, ["worktree", "list", "--porcelain"]),
+				};
+			}),
+		);
+		expect(result.failure).toContain("WorkspaceNotFoundError");
+		expect(result.folderExists).toBe(false);
+		expect(result.worktrees).not.toContain("feature");
 	});
 
 	test("brings back a force-archived worktree with its stashed changes", async () => {
