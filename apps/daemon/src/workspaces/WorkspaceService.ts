@@ -676,7 +676,14 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							cwd: current.path,
 							onLine,
 							onSpawn: (pid) => runScriptGroups.set(scriptRunId, pid),
-						}).pipe(Effect.ensuring(Effect.sync(() => runScriptGroups.delete(scriptRunId)))),
+						}).pipe(
+							Effect.ensuring(
+								Effect.sync(() => {
+									runScriptGroups.delete(scriptRunId);
+									portLooks.delete(scriptRunId);
+								}),
+							),
+						),
 					);
 					yield* Effect.logInfo("Started run script").pipe(Effect.annotateLogs({ workspaceId, scriptRunId }));
 					return new ScriptRun({
@@ -732,10 +739,23 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 				Effect.provide(services),
 			);
 
+			// Each look spawns pgrep and lsof, so every watcher of a run, one per open window, shares the latest one.
+			const portLooks = new Map<string, Effect.Effect<ReadonlyArray<number>>>();
 			const readRunScriptPorts = Effect.fn("WorkspaceService.readRunScriptPorts")(function* (workspaceId: string) {
 				const running = yield* findRunningRunScript(workspaceId);
 				const group = running === null ? undefined : runScriptGroups.get(running.id);
-				return group === undefined ? [] : yield* listListeningPorts(group);
+				if (running === null || group === undefined) {
+					return [];
+				}
+				let look = portLooks.get(running.id);
+				if (look === undefined) {
+					look = yield* Effect.cachedWithTTL(
+						listListeningPorts(group).pipe(Effect.provide(services)),
+						RUN_SCRIPT_PORT_POLL,
+					);
+					portLooks.set(running.id, look);
+				}
+				return yield* look;
 			}, Effect.provide(services));
 
 			// The ports the workspace's run script listens on, sent again each time they change. A dev server

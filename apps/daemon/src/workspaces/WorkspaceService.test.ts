@@ -1,14 +1,18 @@
 import { LIVE_LINES, MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
-import { Duration, Effect, Fiber, FileSystem, Schedule, Stream } from "effect";
+import { Duration, Effect, Fiber, FileSystem, Layer, Schedule, Stream } from "effect";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
+import { testAgentServices } from "../testing/testAgentServices.ts";
+import { ProcessRegistry } from "../processes/ProcessRegistry.ts";
 import { TerminalService } from "../terminals/TerminalService.ts";
+import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import { STOP_GRACE } from "../processes/stopProcessGroup.ts";
+import { DaemonServices } from "../server/DaemonServices.ts";
 import { LocalDatabase } from "../database/LocalDatabase.ts";
 import { scriptRun, workspace } from "../database/schema.ts";
 import { LINE_MAX_LENGTH } from "./capLineLength.ts";
@@ -883,6 +887,55 @@ describe("WorkspaceService", () => {
 		);
 		expect(result.ports).toEqual([result.printed]);
 		expect(result.afterStop).toEqual([]);
+	});
+
+	test("watchers of one run script share each look for its ports", async () => {
+		const spawned: Array<number> = [];
+		const recordingRegistry = Layer.succeed(
+			ProcessRegistry,
+			ProcessRegistry.of({
+				add: (pgid) => Effect.sync(() => spawned.push(pgid)),
+				remove: () => Effect.void,
+				stopAll: Effect.void,
+			}),
+		);
+		const counts = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: "echo serving; sleep 30" });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const started = yield* workspaces.startRunScript(created.id);
+				yield* workspaces.followScriptRunOutput(started.id).pipe(Stream.take(1), Stream.runDrain);
+				// Each look spawns the same commands, so the spawns count the looks.
+				const spawnsFor = Effect.fn("spawnsFor")(function* (watchers: number) {
+					const before = spawned.length;
+					yield* Effect.all(
+						Array.from({ length: watchers }, () =>
+							workspaces.watchRunScriptPorts(created.id).pipe(Stream.take(1), Stream.runDrain),
+						),
+						{ concurrency: "unbounded" },
+					);
+					return spawned.length - before;
+				});
+				const one = yield* spawnsFor(1);
+				// Past the poll interval, so the next look is a fresh one.
+				yield* Effect.sleep("2100 millis");
+				const three = yield* spawnsFor(3);
+				yield* workspaces.stopRunScript(created.id);
+				return { one, three };
+			}).pipe(
+				Effect.provide(
+					DaemonServices.pipe(
+						Layer.provideMerge(testAgentServices()),
+						Layer.provide([testDaemonConfig(join(tempDir, "data")), recordingRegistry]),
+					),
+				),
+			),
+		);
+		expect(counts.one).toBeGreaterThan(0);
+		expect(counts.three).toBe(counts.one);
 	});
 
 	test("a run script that exits records its exit code", async () => {
