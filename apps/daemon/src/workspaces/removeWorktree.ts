@@ -37,6 +37,33 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 // The stash a forced archive leaves, found again by this message when the workspace is restored.
 export const archiveStashMessage = (workspaceId: string) => `octopus-archive/${workspaceId}`;
 
+// Commits made on a detached HEAD are on no branch, so removing the folder would leave them to git's garbage
+// collection. They go on this branch instead.
+export const archiveHeadBranch = (workspaceId: string) => `${archiveStashMessage(workspaceId)}-head`;
+
+const keepDetachedCommits = Effect.fn("keepDetachedCommits")(function* (worktreePath: string, workspaceId: string) {
+	const onBranch = yield* runGit(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).pipe(
+		Effect.as(true),
+		Effect.catchTag("GitCommandError", () => Effect.succeed(false)),
+	);
+	if (onBranch) return;
+	const unreachable = yield* runGit(worktreePath, [
+		"rev-list",
+		"--count",
+		"HEAD",
+		"--not",
+		"--branches",
+		"--tags",
+		"--remotes",
+	]);
+	if (Number(unreachable) === 0) return;
+	const branch = archiveHeadBranch(workspaceId);
+	yield* runGit(worktreePath, ["branch", "--force", branch, "HEAD"]);
+	yield* Effect.logWarning("Kept the commits of a detached HEAD on a branch before archiving").pipe(
+		Effect.annotateLogs({ worktreePath, branch }),
+	);
+});
+
 // Removes the worktree folder and keeps its branch, so commits stay reachable.
 // With `stashChanges`, uncommitted and untracked files are stashed first; stashes live in the
 // shared repository, so they survive the folder. If the folder cannot be removed, the stash goes back into it.
@@ -47,6 +74,7 @@ export const removeWorktree = Effect.fn("removeWorktree")(function* (options: {
 	readonly stashChanges: boolean;
 }) {
 	const { repositoryPath, worktreePath, workspaceId, stashChanges } = options;
+	yield* keepDetachedCommits(worktreePath, workspaceId);
 	if (stashChanges) {
 		yield* runGit(worktreePath, ["stash", "push", "--include-untracked", "-m", archiveStashMessage(workspaceId)]);
 		yield* Effect.logInfo("Stashed uncommitted changes before archiving").pipe(

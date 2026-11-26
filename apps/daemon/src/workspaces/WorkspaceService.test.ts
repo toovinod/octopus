@@ -273,6 +273,28 @@ describe("WorkspaceService", () => {
 		expect(result.stashes).toContain(`octopus-archive/${result.workspace.id}`);
 	});
 
+	test("a forced archive on a detached HEAD keeps the commits made there on a branch", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, ["checkout", "--detach"]);
+				yield* runGit(created.path, ["commit", "--allow-empty", "-m", "detached work"]);
+				const commit = yield* runGit(created.path, ["rev-parse", "HEAD"]);
+				const refused = yield* Effect.flip(workspaces.archive(created.id, { force: false }));
+				yield* workspaces.archive(created.id, { force: true });
+				return {
+					refused,
+					commit,
+					kept: yield* runGit(project.path, ["rev-parse", `refs/heads/octopus-archive/${created.id}-head`]),
+				};
+			}),
+		);
+		expect(result.refused).toMatchObject({ _tag: "WorkspaceHasUnsavedWorkError", unpushedCommits: 1 });
+		expect(result.kept).toBe(result.commit);
+	});
+
 	test("counts commits no remote has as unsaved work", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
