@@ -1175,6 +1175,23 @@ describe("WorkspaceService", () => {
 		expect(LIVE_LINES * LINE_MAX_LENGTH).toBeLessThanOrEqual(1024 * 1024);
 	});
 
+	test("keeps a 16 KiB line of output whole", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const projects = yield* ProjectService;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const script = "head -c 16384 /dev/zero | tr '\\0' x; echo";
+				yield* projects.updateScripts(project.id, { setupScript: null, runScript: script });
+				const created = yield* workspaces.create({ kind: "inPlace", projectId: project.id });
+				const run = yield* workspaces.startRunScript(created.id);
+				yield* Stream.runDrain(workspaces.followScriptRunOutput(run.id));
+				return workspaces.getScriptRunOutput(run.id).output;
+			}),
+		);
+		expect(result).toBe("x".repeat(16 * 1024));
+	});
+
 	test("a long line is cut to the line cap before it is kept or streamed", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {

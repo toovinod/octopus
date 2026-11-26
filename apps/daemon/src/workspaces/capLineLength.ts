@@ -1,8 +1,7 @@
 import { Stream } from "effect";
 
-// Small enough that a cut line, even at 3 UTF-8 bytes per character, fits CappedOutput's budget, and that a
-// follower's buffer of live lines stays within its megabyte.
-export const LINE_MAX_LENGTH = 1024;
+// Small enough that a cut line, even at 3 UTF-8 bytes per character, fits CappedOutput's budget.
+export const LINE_MAX_LENGTH = 16 * 1024;
 
 const LINE_BREAK = /(\r|\n)/;
 
