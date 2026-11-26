@@ -34,15 +34,17 @@ import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts"
 import { makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
+import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { AgentEvent } from "@repo/contracts/AgentEvent";
 import { SessionService } from "./SessionService.ts";
+import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
+import { asc, eq, sql } from "drizzle-orm";
 import { TestClock } from "effect/testing";
 import { runGit } from "../git/runGit.ts";
-import { asc, eq } from "drizzle-orm";
 import { join } from "node:path";
 
 const addWorkspace = Effect.fn("addWorkspace")(function* (tempDir: string) {
@@ -782,6 +784,69 @@ describe("SessionService", () => {
 			[3, { type: "approval.resolved", requestId: "open", outcome: "cancelled" }],
 			[4, { type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } }],
 		]);
+	});
+
+	test("a restart that cannot close a cut-off turn leaves it to close on the next start", async () => {
+		const result = await runInTempDir((tempDir) =>
+			Effect.gen(function* () {
+				const dataDir = join(tempDir, "data");
+				// Only the database, since every other service needs the startup that keeps failing.
+				const dropTrigger = LocalDatabase.use((database) =>
+					database.query((db) => db.run(sql`DROP TRIGGER refuseEvents`)),
+				).pipe(Effect.provide(LocalDatabase.layer.pipe(Layer.provide([testDaemonConfig(dataDir), BunServices.layer]))));
+				const sessionId = yield* withServices(dataDir)(
+					Effect.gen(function* () {
+						const database = yield* LocalDatabase;
+						const session = yield* addSession(tempDir);
+						yield* database.query((db) =>
+							db.update(agentSession).set({ status: "running" }).where(eq(agentSession.id, session.id)),
+						);
+						// The disk fills up, say, just as the restart writes the closing events.
+						yield* database.query((db) =>
+							db.run(
+								sql`CREATE TRIGGER refuseEvents BEFORE INSERT ON sessionEvent BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+							),
+						);
+						return session.id;
+					}),
+				);
+				const failedStart = yield* Effect.exit(withServices(dataDir)(Effect.void));
+				yield* dropTrigger;
+				return yield* withServices(dataDir)(
+					Effect.all({
+						failedStart: Effect.succeed(failedStart._tag),
+						status: statusOf(sessionId),
+						stored: storedEvents(sessionId),
+					}),
+				);
+			}),
+		);
+		expect(result.failedStart).toBe("Failure");
+		expect(result.status).toBe("interrupted");
+		expect(result.stored.map((row) => row.payload)).toEqual([
+			{ type: "turn.completed", turnId: expect.any(String), result: { status: "interrupted" } },
+		]);
+	});
+
+	test("a native session id the database refuses leaves no session.started in history", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const database = yield* LocalDatabase;
+				const session = yield* addSession(tempDir);
+				yield* database.query((db) =>
+					db.run(
+						sql`CREATE TRIGGER refuseNativeId BEFORE UPDATE OF nativeSessionId ON agentSession WHEN NEW.nativeSessionId IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+					),
+				);
+				yield* sessions.sendMessage(session.id, "run the tests", [], false);
+				yield* waitForStatus(session.id, "failed");
+				const [row] = yield* sessions.list(session.workspaceId);
+				return { types: (yield* storedEvents(session.id)).map((stored) => stored.type), row };
+			}),
+		);
+		expect(result.types).not.toContain("session.started");
+		expect(result.row?.nativeSessionId).toBeNull();
 	});
 
 	test("an agent process that dies mid-turn leaves its approval cancelled and its turn ended", async () => {

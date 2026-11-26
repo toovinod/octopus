@@ -101,6 +101,9 @@ const IDLE_TIMEOUT = Duration.toNanosUnsafe("5 minutes");
 const IDLE_SWEEP_INTERVAL = "30 seconds";
 
 type SessionRow = typeof agentSession.$inferSelect;
+type SessionPatch = Partial<
+	Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort" | "mode">
+>;
 type RestingStatus = Extract<AgentSessionStatus, "idle" | "interrupted" | "failed">;
 
 // The live agent process of one session and what the daemon tracks about its turns.
@@ -288,12 +291,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return row;
 		});
 
-		const updateSession = Effect.fnUntraced(function* (
-			sessionId: string,
-			patch: Partial<
-				Pick<SessionRow, "status" | "nativeSessionId" | "authMode" | "title" | "model" | "effort" | "mode">
-			>,
-		) {
+		const updateSession = Effect.fnUntraced(function* (sessionId: string, patch: SessionPatch) {
 			const updatedAt = yield* nowIso;
 			const [row] = yield* database.query((db) =>
 				db
@@ -332,12 +330,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return (stored?.last ?? -1) + 1;
 		});
 
-		// Stores events at consecutive sequences from first.
+		// Stores events at consecutive sequences from first. A patch to the session they change is written in the
+		// same transaction, so a crash keeps both or neither. Returns the patched row.
 		const insertEvents = Effect.fnUntraced(function* (
 			sessionId: string,
 			first: number,
 			events: ReadonlyArray<AgentEvent>,
 			createdAt: string,
+			patch?: SessionPatch,
 		) {
 			const values = yield* Effect.forEach(events, (event, index) =>
 				Effect.map(newId, (id) => ({
@@ -349,8 +349,33 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					createdAt,
 				})),
 			);
-			yield* database.query((db) => db.insert(sessionEvent).values(values));
+			return yield* database.query((db) =>
+				db.transaction((tx) =>
+					Effect.gen(function* () {
+						yield* tx.insert(sessionEvent).values(values);
+						if (patch === undefined) return undefined;
+						const [row] = yield* tx
+							.update(agentSession)
+							.set({ ...patch, updatedAt: createdAt })
+							.where(eq(agentSession.id, sessionId))
+							.returning();
+						return row;
+					}),
+				),
+			);
 		}, Effect.provide(services));
+
+		// What a stored event changes on its session.
+		const patchOf = (event: AgentEvent): SessionPatch | undefined => {
+			switch (event.type) {
+				case "session.started":
+					return { nativeSessionId: event.nativeSessionId };
+				case "mode.changed":
+					return { mode: event.mode };
+				default:
+					return undefined;
+			}
+		};
 
 		// Stored events are written before they are published, so a subscriber never misses one.
 		const record = Effect.fnUntraced(function* (runtime: Runtime, event: AgentEvent) {
@@ -366,16 +391,11 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}
 			keepStreamed(runtime.streamed, event);
 			const sequence = runtime.nextSequence;
-			yield* insertEvents(sessionId, sequence, [event], createdAt);
+			const patched = yield* insertEvents(sessionId, sequence, [event], createdAt, patchOf(event));
 			runtime.nextSequence++;
 			yield* publish(new SessionEvent({ sessionId, sequence, event, createdAt }));
+			if (patched !== undefined) yield* PubSub.publish(sessionChanges, toSession(patched));
 			switch (event.type) {
-				case "session.started":
-					yield* updateSession(sessionId, { nativeSessionId: event.nativeSessionId });
-					break;
-				case "mode.changed":
-					yield* updateSession(sessionId, { mode: event.mode });
-					break;
 				// A plan or a question waits on the user like an approval does, so the chat shows it needs them.
 				case "approval.requested":
 				case "plan.proposed":
@@ -1258,25 +1278,26 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 				...open.values(),
 				{ type: "turn.completed", turnId: yield* newId, result: { status: "interrupted" } },
 			];
-			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso);
+			// With its status, so a crash before both are written leaves the session to close on the next start.
+			yield* insertEvents(sessionId, yield* nextSequenceOf(sessionId), closing, yield* nowIso, {
+				status: "interrupted",
+			});
 		}, Effect.provide(services));
 
 		// Startup recovery: a restart cut off every turn that was running or waiting for an approval.
 		const recoverSessions = Effect.gen(function* () {
-			const updatedAt = yield* nowIso;
 			const cutOff = yield* database.query((db) =>
 				db
-					.update(agentSession)
-					.set({ status: "interrupted", updatedAt })
-					.where(inArray(agentSession.status, ["running", "awaitingApproval"]))
-					.returning({ id: agentSession.id }),
+					.select({ id: agentSession.id })
+					.from(agentSession)
+					.where(inArray(agentSession.status, ["running", "awaitingApproval"])),
 			);
+			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 			if (cutOff.length > 0) {
 				yield* Effect.logInfo("Marked sessions cut off by a restart as interrupted").pipe(
 					Effect.annotateLogs({ count: cutOff.length }),
 				);
 			}
-			yield* Effect.forEach(cutOff, ({ id }) => closeCutOffHistory(id), { discard: true });
 		});
 		yield* recoverSessions;
 
