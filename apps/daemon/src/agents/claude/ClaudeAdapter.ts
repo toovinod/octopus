@@ -10,21 +10,14 @@ import {
 	type StartSessionInput,
 	type UserMessage,
 } from "../AgentAdapter.ts";
-import type {
-	CanUseTool,
-	Options,
-	PermissionResult,
-	PermissionMode,
-	PermissionUpdate,
-	SDKUserMessage,
-	SpawnOptions,
-} from "@anthropic-ai/claude-agent-sdk";
 import {
+	Config,
 	Context,
 	Deferred,
 	Effect,
 	Exit,
 	FiberHandle,
+	FileSystem,
 	Layer,
 	Option,
 	Predicate,
@@ -36,6 +29,15 @@ import {
 	Scope,
 	Stream,
 } from "effect";
+import type {
+	CanUseTool,
+	Options,
+	PermissionResult,
+	PermissionMode,
+	PermissionUpdate,
+	SDKUserMessage,
+	SpawnOptions,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
 	type AgentCapabilities,
 	type AgentMode,
@@ -63,6 +65,7 @@ import { keepOutputTail } from "../keepOutputTail.ts";
 import { toAgentError } from "../toAgentError.ts";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 // Octopus runs the user's own `claude`, found on PATH unless this names another one. Inside a
 // `bun build --compile` binary the SDK cannot find the CLI it bundles, and the user's install
@@ -135,14 +138,42 @@ const models: AgentModels = {
 	defaultModel: "claude-opus-5-5",
 };
 
-// A key or token in the shell that started Octopus would make claude bill the API instead of the
-// subscription, or bill another key than the one stored for Octopus. CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
-const apiCredentials = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
-const withoutApiCredentials = ({
-	ANTHROPIC_API_KEY: _key,
-	ANTHROPIC_AUTH_TOKEN: _token,
-	...env
-}: SpawnOptions["env"]): SpawnOptions["env"] => env;
+// What would make claude bill the API instead of the subscription, bill another key than the one stored for
+// Octopus, or send its requests elsewhere: a key or token, another API host, or a cloud provider.
+// CLAUDE_CODE_OAUTH_TOKEN stays: it is a subscription token from `claude setup-token`.
+const credentialEnv = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"CLAUDE_CODE_USE_MANTLE",
+	"CLAUDE_CODE_USE_GATEWAY",
+] as const;
+const credentialNames = new Set<string>(credentialEnv);
+const unsetCredentials = Object.fromEntries(credentialEnv.map((name) => [name, undefined]));
+const withoutCredentials = (env: SpawnOptions["env"]): SpawnOptions["env"] =>
+	Object.fromEntries(Object.entries(env).filter(([name]) => !credentialNames.has(name)));
+
+// claude also takes these from the env block of its settings files, and a key from their apiKeyHelper. Flag settings
+// outrank every settings file, and empty values turn them off, but they never override claude's own environment
+// (checked with claude 2.1.332), so the environment is cleaned as well. Claude hands the env block on to the commands
+// its Bash tool runs, where an empty value is not the same as none (dotenv skips a set variable, and an SDK takes an
+// empty base URL as one), so only what a settings file sets is emptied.
+const blankSettings = (names: Iterable<string>, apiKeyHelper: boolean) => ({
+	...(apiKeyHelper ? { apiKeyHelper: "" } : {}),
+	env: Object.fromEntries([...names].map((name) => [name, ""])),
+});
+
+const ClaudeSettingsFile = Schema.fromJsonString(
+	Schema.Struct({
+		env: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+		apiKeyHelper: Schema.optional(Schema.Unknown),
+	}),
+);
 
 // claude prints the sign-in link as an OSC 8 hyperlink and as text. Both hold the same URL, and
 // requiring the character after it keeps a link split across two reads from matching early.
@@ -298,7 +329,11 @@ const toolResultText = (
 	return keepOutputTail(content.map((part) => ("text" in part ? part.text : "")).join("\n"));
 };
 
-const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
+// The answer to a Stop from a claude new enough to send one: the messages it still runs after the Stop.
+const InterruptReceipt = Schema.Struct({ still_queued: Schema.Array(Schema.String) });
+
+// interruptAgain stops a turn claude runs by itself after a Stop, from a steer it still had queued.
+const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession, interruptAgain: Effect.Effect<void>) {
 	// Stream deltas and finished blocks share an item id: the message id plus the block index.
 	const streamingMessageId = yield* Ref.make("");
 	const finishedBlocks = yield* Ref.make({ messageId: "", count: 0 });
@@ -309,11 +344,33 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 	const interrupting = yield* Ref.make(false);
 	// The uuid of the last message Octopus sent claude.
 	const lastSent = yield* Ref.make("");
+	// A Stop can leave a steer in claude's queue, which claude then runs as a turn of its own once the stopped turn
+	// ends. That turn takes a Stop only once it runs, so it is stopped at its first message, not at the stopped turn's
+	// result: claude may still be picking the steer up then, and a Stop sent in that moment reaches no turn.
+	const idleSteer = { queued: false, stoppedTurnEnded: false, steerTurnRunning: false, stopSent: false };
+	const queuedSteer = yield* Ref.make(idleSteer);
+	const stopSteerTurn = Ref.modify(queuedSteer, (steer) =>
+		steer.queued && steer.steerTurnRunning && !steer.stopSent ? [true, { ...steer, stopSent: true }] : [false, steer],
+	).pipe(Effect.flatMap((stop) => (stop ? interruptAgain : Effect.void)));
+	// The receipt lists the steer when claude still runs it. A claude too old to send one may run it too.
+	const stopped = (receipt: unknown) =>
+		Effect.gen(function* () {
+			const decoded = Schema.decodeUnknownOption(InterruptReceipt)(receipt);
+			const steer = yield* Ref.get(lastSent);
+			const queued = Option.isNone(decoded) || decoded.value.still_queued.includes(steer);
+			yield* Ref.update(queuedSteer, (current) => ({ ...current, queued }));
+			yield* stopSteerTurn;
+		});
+	const turnStarting = Ref.set(interrupting, false).pipe(Effect.andThen(Ref.set(queuedSteer, idleSteer)));
 	// The context after the turn is what its last model call read and wrote.
 	const lastUsage = yield* Ref.make(Option.none<{ readonly model: string; readonly contextTokens: number }>());
 
 	const handle = Effect.fnUntraced(function* (message: ClaudeMessage) {
 		yield* session.touch;
+		if (message.type !== "result" && (yield* Ref.get(queuedSteer)).stoppedTurnEnded) {
+			yield* Ref.update(queuedSteer, (steer) => ({ ...steer, steerTurnRunning: true }));
+			yield* stopSteerTurn;
+		}
 		// Subagent frames belong to the Task tool call that started them.
 		if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return;
 		switch (message.type) {
@@ -429,6 +486,13 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 				if (isAuthFailureText(failure)) {
 					return yield* new AgentAuthError({ agent: "claude", cause: failure });
 				}
+				// A tool claude cut off, as on a Stop, never gets a result, so it ends with claude's turn rather than
+				// running forever in the chat.
+				for (const [itemId, tool] of tools) {
+					yield* session.emit({ type: "tool.completed", itemId, tool, status: "failed", output: null });
+				}
+				tools.clear();
+				cardTools.clear();
 				const usage = yield* Ref.getAndSet(lastUsage, Option.none());
 				if (Option.isSome(usage)) {
 					yield* session.emit({
@@ -440,7 +504,11 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 				// claude may run a steer as a turn of its own, whose result follows the running turn's. The turn Octopus
 				// started ends only with the result for the last message it sent, so no result ends a later turn.
 				if (message.user_message_uuid !== undefined && message.user_message_uuid !== (yield* Ref.get(lastSent))) {
-					return yield* Effect.logDebug("Claude ended a turn a later message continues");
+					yield* Effect.logDebug("Claude ended a turn a later message continues");
+					if (yield* Ref.get(interrupting)) {
+						yield* Ref.update(queuedSteer, (steer) => ({ ...steer, stoppedTurnEnded: true }));
+					}
+					return;
 				}
 				const interrupted = yield* Ref.getAndSet(interrupting, false);
 				return yield* session.emit({
@@ -473,7 +541,7 @@ const makeMessageHandler = Effect.fnUntraced(function* (session: AgentSession) {
 		}
 	});
 
-	return { handle, interrupting, lastSent };
+	return { handle, interrupting, lastSent, stopped, turnStarting };
 });
 
 // claude runs its own claude.ai sign-in on a terminal. Octopus shows its link and passes it a
@@ -493,6 +561,12 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 		ClaudeAdapter,
 		Effect.gen(function* () {
 			const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+			const fs = yield* FileSystem.FileSystem;
+			// A string with a default cannot fail to read.
+			const configDir = yield* Config.String("CLAUDE_CONFIG_DIR").pipe(
+				Config.withDefault(join(homedir(), ".claude")),
+				Effect.orDie,
+			);
 			const claudeQuery = yield* ClaudeQuery;
 			const registry = yield* ProcessRegistry;
 			// Holds the sign-in waiting for the browser. A new sign-in replaces it and stops its claude.
@@ -504,7 +578,14 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 			const checkAuth = Effect.gen(function* () {
 				const { executable } = yield* ClaudeAdapterConfig;
 				const output = yield* spawner
-					.string(ChildProcess.make(executable, ["auth", "status", "--json"], { env: apiCredentials, extendEnv: true }))
+					.string(
+						ChildProcess.make(
+							executable,
+							// Flag settings must come before the subcommand.
+							["--settings", JSON.stringify(blankSettings(credentialEnv, true)), "auth", "status", "--json"],
+							{ env: unsetCredentials, extendEnv: true },
+						),
+					)
 					.pipe(Effect.mapError(toAgentError(executable, "Could not run claude auth status.")));
 				const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ClaudeAuthStatus))(output);
 				if (Option.isNone(decoded)) {
@@ -597,6 +678,27 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				terminal.value.write(`${code.trim()}\r`);
 			});
 
+			// The settings files claude reads for this session, as its settingSources pick them.
+			const settingsCredentials = Effect.fnUntraced(function* (input: StartSessionInput) {
+				const files = [
+					join(configDir, "settings.json"),
+					...(input.trustProjectSettings
+						? [join(input.cwd, ".claude", "settings.json"), join(input.cwd, ".claude", "settings.local.json")]
+						: []),
+				];
+				const found = yield* Effect.forEach(files, (file) =>
+					fs.readFileString(file).pipe(Effect.flatMap(Schema.decodeUnknownEffect(ClaudeSettingsFile)), Effect.option),
+				);
+				const settings = found.flatMap((file) => (Option.isSome(file) ? [file.value] : []));
+				const names = new Set(settings.flatMap((file) => Object.keys(file.env ?? {})));
+				const apiKeyHelper = settings.some((file) => file.apiKeyHelper !== undefined);
+				// An API key session empties nothing, so a host or provider the user set in a settings file still applies.
+				return blankSettings(
+					input.auth.mode === "subscription" ? credentialEnv.filter((name) => names.has(name)) : [],
+					apiKeyHelper,
+				);
+			});
+
 			const startSession = Effect.fn("ClaudeAdapter.startSession")(function* (input: StartSessionInput) {
 				const { executable } = yield* ClaudeAdapterConfig;
 				// The SDK wants a path, not a command name.
@@ -605,11 +707,24 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					return yield* new AgentNotInstalledError({ executable });
 				}
 				const session = yield* makeAgentSession(capabilities);
+				const credentialSettings = yield* settingsCredentials(input);
 				const prompts = yield* Queue.unbounded<SDKUserMessage>();
-				const { handle, interrupting, lastSent } = yield* makeMessageHandler(session);
 				const context = yield* Effect.context();
 				const runPromise = Effect.runPromiseWith(context);
 				const sessionScope = yield* Effect.scope;
+				const { handle, interrupting, lastSent, stopped, turnStarting } = yield* makeMessageHandler(
+					session,
+					// Sent on its own fiber, so the reader goes on delivering claude's messages while claude answers it.
+					Effect.tryPromise({
+						try: () => run.interrupt(),
+						catch: (cause) =>
+							new AgentProcessError({ message: "Could not stop a steer claude still had queued.", cause }),
+					}).pipe(
+						Effect.catchTag("AgentProcessError", (error) => Effect.logWarning(error.message, error.cause)),
+						Effect.forkIn(sessionScope),
+						Effect.asVoid,
+					),
+				);
 				let claudePid: number | undefined;
 
 				const proposePlan = (toolInput: Record<string, unknown>, request: Parameters<CanUseTool>[2]) =>
@@ -710,10 +825,11 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					// and approving a plan in Full access do. Only a trusted project may offer that mode.
 					allowDangerouslySkipPermissions: input.trustProjectSettings,
 					settingSources: input.trustProjectSettings ? ["user", "project", "local"] : ["user"],
+					settings: credentialSettings,
 					pathToClaudeCodeExecutable: executablePath,
 					spawnClaudeCodeProcess: (spawnOptions) => {
 						// The SDK passes the daemon's whole environment, so tools keep SSH agents, toolchains and the like.
-						const env = withoutApiCredentials(spawnOptions.env);
+						const env = withoutCredentials(spawnOptions.env);
 						const child = spawnInProcessGroup({
 							...spawnOptions,
 							env:
@@ -849,7 +965,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 
 				return yield* session.start({
 					// An interrupt that arrived after the last turn's result must not mark this one.
-					startTurn: (message) => Ref.set(interrupting, false).pipe(Effect.andThen(sendMessage(message))),
+					startTurn: (message) => turnStarting.pipe(Effect.andThen(sendMessage(message))),
 					steerTurn: (message) => Effect.as(sendMessage(message), true),
 					updateSettings: (next) =>
 						Effect.gen(function* () {
@@ -886,7 +1002,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 					),
 					interruptTurn: Effect.gen(function* () {
 						yield* Ref.set(interrupting, true);
-						yield* Effect.tryPromise({
+						const receipt = yield* Effect.tryPromise({
 							try: () => run.interrupt(),
 							catch: (cause) =>
 								new AgentProcessError({
@@ -894,6 +1010,7 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 									cause,
 								}),
 						});
+						yield* stopped(receipt);
 					}),
 				});
 			});

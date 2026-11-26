@@ -243,6 +243,37 @@ describe("makeAgentSession queued messages", () => {
 		expect(discarded).toEqual(["two"]);
 	});
 
+	test("a stop while the agent is still taking a turn reaches the turn once the agent has it", async () => {
+		const calls: Array<string> = [];
+		const result = await Effect.gen(function* () {
+			const session = yield* makeAgentSession(capabilities);
+			const taking = yield* Deferred.make<void>();
+			const release = yield* Deferred.make<void>();
+			const handle: AgentSessionHandle = yield* session.start({
+				startTurn: () =>
+					Effect.gen(function* () {
+						calls.push("start");
+						yield* Deferred.succeed(taking, undefined);
+						yield* Deferred.await(release);
+						calls.push("started");
+					}),
+				steerTurn: () => Effect.succeed(true),
+				interruptTurn: Effect.sync(() => void calls.push("interrupt")).pipe(
+					Effect.andThen(session.emit({ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } })),
+				),
+				updateSettings: () => Effect.void,
+				listCommands: Effect.succeed([]),
+			});
+			yield* handle.sendMessage(userMessage("hi"));
+			yield* Deferred.await(taking);
+			yield* handle.interrupt;
+			yield* Deferred.succeed(release, undefined);
+			return yield* turnResults(handle);
+		}).pipe(Effect.scoped, Effect.runPromise);
+		expect(calls).toEqual(["start", "started", "interrupt"]);
+		expect(result).toEqual([{ type: "turn.completed", turnId: "turn-1", result: { status: "interrupted" } }]);
+	});
+
 	test("a stop while a queued message's beforeTurn runs drops it instead of starting it", async () => {
 		const started: Array<string> = [];
 		const dropped = await Effect.gen(function* () {
@@ -432,5 +463,25 @@ describe("makeAgentSession questions", () => {
 				}),
 		);
 		expect(outcomes).toEqual([{ type: "cancelled" }, { type: "cancelled" }]);
+	});
+});
+
+describe("makeAgentSession native id", () => {
+	test("reports each new native id, as after /clear, so a restart resumes the latest conversation", async () => {
+		const [events, id] = await runQuietAgent(
+			() => Effect.void,
+			(handle, session) =>
+				Effect.gen(function* () {
+					yield* session.setNativeSessionId("native-1");
+					yield* session.setNativeSessionId("native-1");
+					yield* session.setNativeSessionId("native-2");
+					return [yield* handle.events.pipe(Stream.take(2), Stream.runCollect), yield* handle.nativeSessionId] as const;
+				}),
+		);
+		expect(events).toEqual([
+			{ type: "session.started", nativeSessionId: "native-1" },
+			{ type: "session.started", nativeSessionId: "native-2" },
+		]);
+		expect(id).toBe("native-2");
 	});
 });

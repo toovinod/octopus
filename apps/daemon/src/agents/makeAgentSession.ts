@@ -111,7 +111,9 @@ export interface AgentSession {
 export const makeAgentSession = Effect.fnUntraced(function* (capabilities: AgentCapabilities) {
 	const events = yield* Queue.bounded<AgentEvent, AgentError | Cause.Done>(EVENT_BUFFER);
 	yield* Effect.addFinalizer(() => endWith(Queue.end(events)));
+	// Resolves with the first native id. latestNativeId follows the ids the agent starts after it, as Claude does on /clear.
 	const nativeId = yield* Deferred.make<string, AgentError>();
+	const latestNativeId = yield* Ref.make(Option.none<string>());
 	const inbox = yield* Queue.bounded<{
 		readonly message: UserMessage;
 		readonly beforeTurn: Effect.Effect<void>;
@@ -120,7 +122,10 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 	// Sending, starting, dropping a queued message and ending the session each happen as one step under it, so a
 	// message is either stored and started, or dropped and handed back, never both or neither.
 	const sendLock = yield* Semaphore.make(1);
-	const currentTurn = yield* Ref.make(Option.none<Deferred.Deferred<void>>());
+	// A turn is starting while the agent takes it. A stop cannot reach it yet, so it waits until the turn runs.
+	const currentTurn = yield* Ref.make(
+		Option.none<{ readonly done: Deferred.Deferred<void>; readonly phase: "starting" | "stopRequested" | "running" }>(),
+	);
 	const lastEventAt = yield* Ref.make(0);
 	// Set while the watchdog stops a turn, so the agent's own end of that turn reports this failure.
 	const stalled = yield* Ref.make(Option.none<string>());
@@ -151,6 +156,14 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 
 	const touch = Effect.flatMap(Clock.currentTimeMillis, (now) => Ref.set(lastEventAt, now));
 
+	// Waits for the first id, and fails as the session does if it ends before there is one.
+	const nativeSessionId = Effect.flatMap(Deferred.await(nativeId), (first) =>
+		Effect.map(
+			Ref.get(latestNativeId),
+			Option.getOrElse(() => first),
+		),
+	);
+
 	const emit = (agentEvent: AgentEvent) =>
 		Effect.gen(function* () {
 			yield* touch;
@@ -163,7 +176,7 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			const offered = yield* Queue.offer(events, event);
 			if (event.type === "turn.completed") {
 				const turn = yield* Ref.get(currentTurn);
-				if (Option.isSome(turn)) yield* Deferred.succeed(turn.value, undefined);
+				if (Option.isSome(turn)) yield* Deferred.succeed(turn.value.done, undefined);
 			}
 			return offered;
 		});
@@ -287,29 +300,39 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 			yield* Effect.gen(function* () {
 				const next = yield* Queue.peek(inbox);
 				yield* next.beforeTurn;
+				const done = yield* Deferred.make<void>();
 				// Still queued until now, so a stop during beforeTurn drops it rather than starting it. Stored only
-				// now, so history holds just the messages the agent got.
+				// now, so history holds just the messages the agent got. The turn is set in the same step, so a stop
+				// from here on reaches it.
 				const started = yield* Effect.gen(function* () {
 					if (Queue.sizeUnsafe(inbox) === 0 || (yield* Queue.peek(inbox)) !== next) return false;
 					yield* Queue.take(inbox);
-					return yield* recordMessage(next.message);
+					if (!(yield* recordMessage(next.message))) return false;
+					yield* Ref.set(currentTurn, Option.some({ done, phase: "starting" as const }));
+					return true;
 				}).pipe(Semaphore.withPermit(sendLock));
 				if (!started) return;
-				const { message } = next;
-				const done = yield* Deferred.make<void>();
-				yield* Ref.set(currentTurn, Option.some(done));
 				yield* Ref.set(lastEventAt, yield* Clock.currentTimeMillis);
 				// A rejected or unanswered turn fails only that turn. A process that really died also ends the
 				// adapter's event reader, which ends the session.
 				yield* driver
-					.startTurn(message)
+					.startTurn(next.message)
 					.pipe(Effect.catchTags({ AgentProtocolError: failTurn, AgentProcessError: failTurn }));
+				const stopRequested = yield* Ref.modify(currentTurn, (turn) => [
+					Option.isSome(turn) && turn.value.phase === "stopRequested",
+					Option.some({ done, phase: "running" as const }),
+				]);
+				if (stopRequested && !(yield* Deferred.isDone(done))) {
+					yield* driver.interruptTurn.pipe(
+						Effect.catch((error) => Effect.logWarning("Could not stop a turn that was starting", error)),
+					);
+				}
 				yield* Deferred.await(done).pipe(Effect.raceFirst(watchTurn(driver, done)));
 				yield* Ref.set(currentTurn, Option.none());
 			}).pipe(Effect.forever, Effect.catch(fail), Effect.forkScoped);
 
 			return {
-				nativeSessionId: Deferred.await(nativeId),
+				nativeSessionId,
 				events: Stream.fromQueue(events),
 				sendMessage: (message, options) =>
 					Effect.gen(function* () {
@@ -384,9 +407,13 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				interrupt: Effect.gen(function* () {
 					yield* cancelApprovals;
 					yield* cancelPlansAndQuestions;
-					if (Option.isSome(yield* Ref.get(currentTurn))) {
-						yield* driver.interruptTurn;
-					}
+					// A turn the agent is still taking is stopped as soon as it has it.
+					const running = yield* Ref.modify(currentTurn, (turn) =>
+						Option.isSome(turn) && turn.value.phase !== "running"
+							? [false, Option.some({ ...turn.value, phase: "stopRequested" as const })]
+							: [Option.isSome(turn), turn],
+					);
+					if (running) yield* driver.interruptTurn;
 				}),
 				updateSettings: driver.updateSettings,
 				listCommands: driver.listCommands,
@@ -414,12 +441,14 @@ export const makeAgentSession = Effect.fnUntraced(function* (capabilities: Agent
 				yield* emit({ type: "question.asked", ...request });
 			}),
 		cancelQuestions,
-		nativeSessionId: Deferred.await(nativeId),
+		nativeSessionId,
 		setNativeSessionId: (id) =>
 			Effect.gen(function* () {
-				if (yield* Deferred.succeed(nativeId, id)) {
-					yield* emit({ type: "session.started", nativeSessionId: id });
-				}
+				const previous = yield* Ref.getAndSet(latestNativeId, Option.some(id));
+				if (Option.isSome(previous) && previous.value === id) return;
+				yield* Deferred.succeed(nativeId, id);
+				// Stored with the session, so a restart resumes the conversation the agent is in now.
+				yield* emit({ type: "session.started", nativeSessionId: id });
 			}),
 		fail,
 		end: endWith(Queue.end(events)),

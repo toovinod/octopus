@@ -5,16 +5,19 @@ import type {
 	PermissionUpdate,
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { ConfigProvider, Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import { ClaudeAdapter, ClaudeAdapterConfig, sessionAllowRules } from "./ClaudeAdapter.ts";
-import { Duration, Effect, Fiber, Layer, Option, Redacted, Stream } from "effect";
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import { testProcessRegistry } from "../../testing/testProcessRegistry.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { ClaudeQuery } from "./ClaudeQuery.ts";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const newSession: StartSessionInput = {
 	cwd: "/repo",
@@ -37,6 +40,8 @@ const bashSuggestion: PermissionUpdate = {
 const startedWith: Array<Options> = [];
 const settingsChanges: Array<unknown> = [];
 const prompts: Array<SDKUserMessage> = [];
+// How many Stops claude had taken when it started a turn of its own for a queued steer.
+const stopsBeforeSteerTurn: Array<number> = [];
 
 const settingsChanged = Promise.withResolvers<void>();
 
@@ -45,6 +50,12 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 		start: ({ prompt, options }) => {
 			startedWith.push(options);
 			let resolveInterrupt = () => {};
+			let interrupts = 0;
+			// The steers a Stop leaves in claude's queue, which its receipt lists once claude has read the steer.
+			let stillQueued = Promise.resolve<Array<string>>([]);
+			const interruptCount = async (count: number) => {
+				while (interrupts < count) await new Promise((resolve) => setTimeout(resolve, 5));
+			};
 			let turn = 0;
 			// Recorded from claude 2.1.332 resuming a session whose transcript was deleted: it answers before reading
 			// any message, then exits.
@@ -73,6 +84,53 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 							subtype: "init",
 							session_id: options.resume ?? "claude-new",
 						};
+					}
+					if (text === "/clear") {
+						// Recorded from claude 2.1.332: /clear starts a new session and announces it like the first one.
+						yield { type: "system", subtype: "init", session_id: `claude-cleared-${turn}` };
+						yield { type: "result", subtype: "success", uuid: `result-${turn}` };
+						continue;
+					}
+					if (text.includes("steer, then stop")) {
+						// Not recorded; it follows the SDK's documented interrupt receipt. A Stop while the steer waits in
+						// claude's queue ends the running turn and lists the steer as still queued, and claude then runs
+						// the steer as a turn of its own, which takes a Stop only once it runs.
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s1", content: [{ type: "text", text: "1, 2, 3" }] },
+						};
+						const read = Promise.withResolvers<Array<string>>();
+						stillQueued = read.promise;
+						const steer = await input.next();
+						if (steer.done) return;
+						prompts.push(steer.value);
+						// "unlisted" stands for a steer claude took into the stopped turn after all.
+						const listed = !text.includes("unlisted");
+						read.resolve(steer.value.uuid === undefined || !listed ? [] : [steer.value.uuid]);
+						await interruptCount(1);
+						stillQueued = Promise.resolve([]);
+						yield {
+							type: "result",
+							subtype: "error_during_execution",
+							uuid: "result-s1",
+							user_message_uuid: user.uuid,
+						};
+						stopsBeforeSteerTurn.push(interrupts);
+						yield {
+							type: "assistant",
+							parent_tool_use_id: null,
+							message: { id: "msg_s2", content: [{ type: "text", text: "4, 5" }] },
+						};
+						if (listed) await interruptCount(2);
+						stopsBeforeSteerTurn.push(interrupts);
+						yield {
+							type: "result",
+							subtype: listed ? "error_during_execution" : "success",
+							uuid: "result-s2",
+							user_message_uuid: steer.value.uuid,
+						};
+						continue;
 					}
 					if (text.includes("steer me")) {
 						// Recorded from claude 2.1.332: a message sent while a turn streams, or just after its last
@@ -373,7 +431,12 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 					if (options.resume?.startsWith("claude-gone"))
 						throw new Error(`Claude Code returned an error result: ${missingSession}`);
 				},
-				interrupt: async () => resolveInterrupt(),
+				interrupt: async () => {
+					const receipt = { still_queued: await stillQueued };
+					interrupts++;
+					resolveInterrupt();
+					return receipt;
+				},
 				setModel: async (model) => void settingsChanges.push({ model }),
 				setEffort: async (effort) => void settingsChanges.push({ effort }),
 				setPermissionMode: async (permissionMode) => {
@@ -393,6 +456,9 @@ const makeFakeQuery = (permissions: Array<PermissionResult>) =>
 
 const fakeClaude = `${import.meta.dir}/fixtures/fakeClaude.ts`;
 
+// Stands in for ~/.claude, so no test reads the real user's settings.
+const claudeConfigDir = mkdtempSync(join(tmpdir(), "octopus-claude-config-"));
+
 const runWithClaude = <A, E>(
 	program: Effect.Effect<A, E, ClaudeAdapter>,
 	permissions: Array<PermissionResult> = [],
@@ -407,6 +473,7 @@ const runWithClaude = <A, E>(
 			),
 		),
 		Effect.provideService(ClaudeAdapterConfig, { executable }),
+		Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { CLAUDE_CONFIG_DIR: claudeConfigDir } }))),
 		Effect.runPromise,
 	);
 
@@ -455,16 +522,35 @@ describe("ClaudeAdapter", () => {
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
 	});
 
-	test("subscription mode never hands claude an API key or auth token from the environment", async () => {
+	test("checks the claude.ai login, not an apiKeyHelper from claude's settings file", async () => {
+		process.env.FAKE_CLAUDE_API_KEY_HELPER = "1";
+		const status = await runWithClaude(Effect.flatMap(ClaudeAdapter, (claude) => claude.checkAuth)).finally(() => {
+			delete process.env.FAKE_CLAUDE_API_KEY_HELPER;
+		});
+		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
+	});
+
+	test("subscription mode never hands claude another credential, API host or cloud provider from the environment", async () => {
 		const printed = await runSession(() =>
 			Effect.promise(async () => {
 				const spawnClaude = startedWith.at(-1)?.spawnClaudeCodeProcess;
 				if (spawnClaude === undefined) return "no spawn hook";
 				const child = spawnClaude({
 					command: "sh",
-					args: ["-c", 'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$KEEP"'],
+					args: [
+						"-c",
+						'printf "%s|%s|%s|%s|%s|%s" "$ANTHROPIC_API_KEY" "$ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_BASE_URL" "$CLAUDE_CODE_USE_BEDROCK" "$CLAUDE_CODE_USE_VERTEX" "$KEEP"',
+					],
 					cwd: "/",
-					env: { PATH: "/bin:/usr/bin", ANTHROPIC_API_KEY: "sk-shell", ANTHROPIC_AUTH_TOKEN: "tok", KEEP: "kept" },
+					env: {
+						PATH: "/bin:/usr/bin",
+						ANTHROPIC_API_KEY: "sk-shell",
+						ANTHROPIC_AUTH_TOKEN: "tok",
+						ANTHROPIC_BASE_URL: "https://proxy.example.com",
+						CLAUDE_CODE_USE_BEDROCK: "1",
+						CLAUDE_CODE_USE_VERTEX: "1",
+						KEEP: "kept",
+					},
 					signal: new AbortController().signal,
 				});
 				let text = "";
@@ -472,7 +558,46 @@ describe("ClaudeAdapter", () => {
 				return text;
 			}),
 		);
-		expect(printed).toBe("||kept");
+		expect(printed).toBe("|||||kept");
+	});
+
+	describe("credentials in claude's settings files", () => {
+		const writeSettings = (dir: string, settings: unknown) => {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
+		};
+		const settingsFor = async (input: Partial<StartSessionInput>) => {
+			await runSession(() => Effect.void, { input: { ...newSession, ...input } });
+			return startedWith.at(-1)?.settings;
+		};
+		const project = () => mkdtempSync(join(tmpdir(), "octopus-claude-project-"));
+		const cleanUp = () => rmSync(join(claudeConfigDir, "settings.json"), { force: true });
+
+		test("subscription mode empties only the ones they set, so claude's tools never see the rest as set but empty", async () => {
+			const cwd = project();
+			writeSettings(claudeConfigDir, { env: { ANTHROPIC_BASE_URL: "https://proxy.example.com", EDITOR: "vim" } });
+			writeSettings(join(cwd, ".claude"), { env: { CLAUDE_CODE_USE_BEDROCK: "1" }, apiKeyHelper: "print-key" });
+			const settings = await settingsFor({ cwd, trustProjectSettings: true }).finally(cleanUp);
+			expect(settings).toEqual({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: "", CLAUDE_CODE_USE_BEDROCK: "" } });
+		});
+
+		test("subscription mode empties nothing when they set no credential", async () => {
+			expect(await settingsFor({})).toEqual({ env: {} });
+		});
+
+		test("an untrusted project's settings are not read, as claude does not read them either", async () => {
+			const cwd = project();
+			writeSettings(join(cwd, ".claude"), { env: { ANTHROPIC_AUTH_TOKEN: "tok" } });
+			expect(await settingsFor({ cwd, trustProjectSettings: false })).toEqual({ env: {} });
+		});
+
+		test("API key mode empties no env value, only an apiKeyHelper that would replace its key", async () => {
+			writeSettings(claudeConfigDir, { env: { ANTHROPIC_AUTH_TOKEN: "tok" }, apiKeyHelper: "print-key" });
+			const settings = await settingsFor({ auth: { mode: "apiKey", apiKey: Redacted.make("sk-test") } }).finally(
+				cleanUp,
+			);
+			expect(settings).toEqual({ apiKeyHelper: "", env: {} });
+		});
 	});
 
 	describe("sign-in", () => {
@@ -778,6 +903,14 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(events).toEqual([
 			{ type: "approval.resolved", requestId: "toolu_1", outcome: "cancelled" },
+			// Claude cut the tool off, so it never sends its result. It ends with the turn instead of running forever.
+			{
+				type: "tool.completed",
+				itemId: "toolu_1",
+				tool: { kind: "command", command: "bun test", cwd: null },
+				status: "failed",
+				output: null,
+			},
 			{
 				type: "turn.completed",
 				turnId: "result-1",
@@ -875,6 +1008,19 @@ describe("ClaudeAdapter", () => {
 		expect(id).toBe("claude-old");
 	});
 
+	test("reports the new session /clear starts, so a restart resumes it rather than the cleared one", async () => {
+		const [events, id] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("hi"));
+				yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("/clear"));
+				return [yield* takeUntil(handle, "turn.completed"), yield* handle.nativeSessionId] as const;
+			}),
+		);
+		expect(events).toContainEqual({ type: "session.started", nativeSessionId: "claude-cleared-2" });
+		expect(id).toBe("claude-cleared-2");
+	});
+
 	test("a resume of a session claude no longer has goes on in a new session with a notice", async () => {
 		const [id, events] = await runSession(
 			(handle) =>
@@ -904,6 +1050,40 @@ describe("ClaudeAdapter", () => {
 		);
 		expect(startedWith.at(-1)).toMatchObject({ model: "claude-haiku-5-5", effort: "low", permissionMode: "default" });
 		expect(startedWith.at(-1)?.resume).toBeUndefined();
+	});
+
+	test("Stop while a steer waits in claude's queue also stops the turn claude would run it as", async () => {
+		const [results, next] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer, then stop"));
+				yield* takeUntil(handle, "message.completed");
+				yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				yield* handle.interrupt;
+				const events = yield* takeUntil(handle, "turn.completed");
+				yield* handle.sendMessage(userMessage("hi"));
+				return [
+					events.filter((event) => event.type === "turn.completed"),
+					(yield* takeUntil(handle, "turn.completed")).at(-1),
+				] as const;
+			}),
+		);
+		expect(results).toEqual([{ type: "turn.completed", turnId: "result-s2", result: { status: "interrupted" } }]);
+		expect(next).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+		// The second Stop waits for the steer's turn to run, since one sent before reaches no turn.
+		expect(stopsBeforeSteerTurn.splice(0)).toEqual([1, 2]);
+	});
+
+	test("Stop sends no second Stop when claude's receipt does not list the steer as still queued", async () => {
+		await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("steer, then stop unlisted"));
+				yield* takeUntil(handle, "message.completed");
+				yield* handle.sendMessage(userMessage("also say DONE"), { steer: true });
+				yield* handle.interrupt;
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(stopsBeforeSteerTurn.splice(0)).toEqual([1, 1]);
 	});
 
 	test("a steer that claude runs as its own turn ends with the turn it was sent into", async () => {
