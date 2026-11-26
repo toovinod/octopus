@@ -134,7 +134,9 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 			case "message.delta": {
 				const key = `message:${event.itemId}`;
 				const current = find(key);
-				const text = current?.kind === "assistant" ? current.text + event.text : event.text;
+				// A snapshot read before the item completed can arrive after its stored completion.
+				if (current?.kind === "assistant" && !current.streaming) break;
+				const text = current?.kind === "assistant" && !event.snapshot ? current.text + event.text : event.text;
 				put({ kind: "assistant", key, text, streaming: true });
 				break;
 			}
@@ -144,7 +146,9 @@ export const applyEvents = (state: ChatState, events: ReadonlyArray<SessionEvent
 			case "reasoning.delta": {
 				const key = `reasoning:${event.itemId}`;
 				const current = find(key);
-				const text = current?.kind === "reasoning" ? current.text + event.text : event.text;
+				// A snapshot read before the item completed can arrive after its stored completion.
+				if (current?.kind === "reasoning" && !current.streaming) break;
+				const text = current?.kind === "reasoning" && !event.snapshot ? current.text + event.text : event.text;
 				put({ kind: "reasoning", key, text, streaming: true });
 				break;
 			}

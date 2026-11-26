@@ -84,6 +84,10 @@ export const TurnResult = Schema.Union([
 ]);
 export type TurnResult = typeof TurnResult.Type;
 
+// Set on the text streamed so far, which a subscription sends first. It replaces what the client holds for
+// the item instead of adding to it, so a chat opened mid-reply shows all of it.
+const SnapshotFlag = Schema.optionalKey(Schema.Literal(true));
+
 export const AgentEvent = Schema.Union([
 	Schema.Struct({
 		type: Schema.Literal("session.started"),
@@ -114,6 +118,7 @@ export const AgentEvent = Schema.Union([
 		type: Schema.Literal("message.delta"),
 		itemId: Schema.String,
 		text: Schema.String,
+		snapshot: SnapshotFlag,
 	}),
 	Schema.Struct({
 		type: Schema.Literal("message.completed"),
@@ -125,6 +130,7 @@ export const AgentEvent = Schema.Union([
 		type: Schema.Literal("reasoning.delta"),
 		itemId: Schema.String,
 		text: Schema.String,
+		snapshot: SnapshotFlag,
 	}),
 	Schema.Struct({
 		type: Schema.Literal("reasoning.completed"),

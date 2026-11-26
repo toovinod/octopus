@@ -63,6 +63,34 @@ describe("applyEvents", () => {
 		]);
 	});
 
+	test("a snapshot of the text so far replaces what the chat holds, and later deltas add to it", () => {
+		nextSequence = 0;
+		// The chat saw the start of the reply, then lost its connection while more streamed.
+		const before = applyEvents(emptyChat("s"), [
+			live({ type: "reasoning.delta", itemId: "r1", text: "Thi" }),
+			live({ type: "message.delta", itemId: "m1", text: "Hel" }),
+		]);
+		const state = applyEvents(before, [
+			live({ type: "reasoning.delta", itemId: "r1", text: "Think", snapshot: true }),
+			live({ type: "message.delta", itemId: "m1", text: "Hello", snapshot: true }),
+			live({ type: "message.delta", itemId: "m1", text: "!" }),
+		]);
+		expect(state.items).toEqual([
+			{ kind: "reasoning", key: "reasoning:r1", text: "Think", streaming: true },
+			{ kind: "assistant", key: "message:m1", text: "Hello!", streaming: true },
+		]);
+	});
+
+	test("a snapshot or delta that arrives after its item completed leaves the completed text", () => {
+		nextSequence = 0;
+		const state = applyEvents(emptyChat("s"), [
+			stored({ type: "message.completed", itemId: "m1", text: "Hello!" }),
+			live({ type: "message.delta", itemId: "m1", text: "Hello", snapshot: true }),
+			live({ type: "message.delta", itemId: "m1", text: "!" }),
+		]);
+		expect(state.items).toEqual([{ kind: "assistant", key: "message:m1", text: "Hello!", streaming: false }]);
+	});
+
 	test("a turn that ends before thinking completes stops it streaming", () => {
 		nextSequence = 0;
 		const state = applyEvents(emptyChat("s"), [

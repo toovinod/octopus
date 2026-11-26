@@ -236,6 +236,74 @@ describe("SessionService", () => {
 		]);
 	});
 
+	test("a subscriber that joins mid-reply first gets the text streamed so far", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const more = Effect.runSync(Deferred.make<void>());
+		// A turn that streams part of a reply, then waits, as a model does between tokens.
+		const codex: AgentAdapter = {
+			...replay,
+			startSession: () =>
+				Effect.gen(function* () {
+					const session = yield* makeAgentSession(replay.capabilities);
+					yield* session.setNativeSessionId("thread-partial");
+					return yield* session.start({
+						startTurn: () =>
+							Effect.gen(function* () {
+								const streamed: Array<AgentEvent> = [
+									{ type: "message.delta", itemId: "m0", text: "Done" },
+									{ type: "message.completed", itemId: "m0", text: "Done" },
+									{ type: "reasoning.delta", itemId: "r1", text: "Thi" },
+									{ type: "reasoning.delta", itemId: "r1", text: "nk" },
+									{ type: "message.delta", itemId: "m1", text: "Hel" },
+									{ type: "message.delta", itemId: "m1", text: "lo" },
+								];
+								yield* Effect.forEach(streamed, session.emit, { discard: true });
+								yield* Deferred.await(more);
+								yield* session.emit({ type: "message.delta", itemId: "m1", text: "!" });
+							}),
+						steerTurn: () => Effect.succeed(true),
+						interruptTurn: Effect.void,
+						updateSettings: () => Effect.void,
+						listCommands: Effect.succeed([]),
+					});
+				}),
+		};
+		const received = await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					const session = yield* addSession(tempDir);
+					yield* sessions.sendMessage(session.id, "go", [], false);
+					yield* waitForStored(session.id, 3);
+					// Let the deltas after the stored reply reach the service.
+					yield* Effect.sleep("100 millis");
+					const subscriber = yield* sessions
+						.subscribe(session.id, -1)
+						.pipe(Stream.take(6), Stream.runCollect, Effect.timeout("5 seconds"), Effect.forkChild);
+					yield* Effect.sleep("100 millis");
+					yield* Deferred.succeed(more, undefined);
+					return yield* Fiber.join(subscriber);
+				}),
+			),
+		);
+		expect(received.map((stored) => [stored.event.type, stored.sequence])).toEqual([
+			["session.started", 0],
+			["user.message", 1],
+			["message.completed", 2],
+			["reasoning.delta", null],
+			["message.delta", null],
+			["message.delta", null],
+		]);
+		expect(received.slice(3).map((stored) => stored.event)).toEqual([
+			{ type: "reasoning.delta", itemId: "r1", text: "Think", snapshot: true },
+			{ type: "message.delta", itemId: "m1", text: "Hello", snapshot: true },
+			{ type: "message.delta", itemId: "m1", text: "!" },
+		]);
+	});
+
 	test("a cursor subscription has no gap or duplicate while events arrive during paging", async () => {
 		const recording: Recording = {
 			kind: "codex",

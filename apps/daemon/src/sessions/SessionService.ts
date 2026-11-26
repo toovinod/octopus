@@ -122,6 +122,9 @@ interface Runtime {
 	unsent: ReadonlyArray<UserMessage>;
 	// Each approval, plan or question waiting on the user, with what to store if nothing ever answers it.
 	readonly approvals: Map<string, Cancellation>;
+	// The text each reply and thinking item streamed so far, until it completes. Deltas are never stored, so
+	// a subscriber that joins mid-reply gets this first.
+	readonly streamed: Map<string, StreamedText>;
 	// The status when no turn or approval is pending.
 	resting: RestingStatus;
 	status: AgentSessionStatus;
@@ -131,6 +134,30 @@ interface Published {
 	readonly event: SessionEvent;
 	readonly bytes: number;
 }
+
+type StreamedText = Extract<AgentEvent, { type: "message.delta" | "reasoning.delta" }>;
+
+// Keeps what an item streamed so far as a snapshot, and drops it once the item or its turn completes.
+const keepStreamed = (streamed: Map<string, StreamedText>, event: AgentEvent) => {
+	switch (event.type) {
+		case "message.delta":
+		case "reasoning.delta": {
+			const key = `${event.type}:${event.itemId}`;
+			const text = (streamed.get(key)?.text ?? "") + event.text;
+			streamed.set(key, { type: event.type, itemId: event.itemId, text, snapshot: true });
+			break;
+		}
+		case "message.completed":
+			streamed.delete(`message.delta:${event.itemId}`);
+			break;
+		case "reasoning.completed":
+			streamed.delete(`reasoning.delta:${event.itemId}`);
+			break;
+		case "turn.completed":
+			streamed.clear();
+			break;
+	}
+};
 
 type Cancellation = Extract<AgentEvent, { type: "approval.resolved" | "plan.resolved" | "question.resolved" }>;
 
@@ -214,6 +241,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 		const attachmentsDir = (sessionId: string) => join(dataDir, "attachments", sessionId);
 		const clock = yield* Clock.Clock;
 		const events = yield* PubSub.unbounded<Published>();
+		// Held while a delta is kept and published, and while a subscriber registers and reads the snapshot,
+		// so each delta is either in the snapshot or reaches the subscriber, never both or neither.
+		const liveLock = yield* Semaphore.make(1);
 		const sessionChanges = yield* PubSub.unbounded<AgentSession>();
 		const runtimes = new Map<string, Runtime>();
 		const processLocks = yield* RcMap.make({ lookup: (_sessionId: string) => Semaphore.make(1) });
@@ -327,8 +357,14 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			const { sessionId } = runtime;
 			const createdAt = yield* nowIso;
 			if (isLiveOnly(event)) {
-				return yield* publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
+				return yield* liveLock.withPermit(
+					Effect.suspend(() => {
+						keepStreamed(runtime.streamed, event);
+						return publish(new SessionEvent({ sessionId, sequence: null, event, createdAt }));
+					}),
+				);
 			}
+			keepStreamed(runtime.streamed, event);
 			const sequence = runtime.nextSequence;
 			yield* insertEvents(sessionId, sequence, [event], createdAt);
 			runtime.nextSequence++;
@@ -567,6 +603,7 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					outstanding: 0,
 					unsent: [],
 					approvals: new Map(),
+					streamed: new Map(),
 					resting: isBusy(row.status) ? "idle" : row.status,
 					status: row.status,
 				};
@@ -1024,13 +1061,19 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					),
 				);
 
-		// Live events are buffered from the start, then stored history is paged, then the buffer
-		// drains with already-sent sequences skipped. That leaves no gap and no duplicate.
+		// Live events are buffered from the start, then stored history is paged, then the text streamed so far
+		// is sent, then the buffer drains with already-sent sequences skipped. That leaves no gap and no duplicate.
 		const subscribe = (sessionId: string, afterSequence: number) =>
 			Stream.unwrap(
 				Effect.gen(function* () {
 					yield* getRow(sessionId);
-					const subscription = yield* PubSub.subscribe(events);
+					const { subscription, streamed } = yield* liveLock.withPermit(
+						Effect.map(PubSub.subscribe(events), (subscription) => ({
+							subscription,
+							streamed: [...(runtimes.get(sessionId)?.streamed.values() ?? [])],
+						})),
+					);
+					const snapshotAt = yield* nowIso;
 					const buffer = yield* Queue.unbounded<Published, ResubscribeRequiredError | Cause.Done>();
 					let bufferedBytes = 0;
 					let lastSequence = afterSequence;
@@ -1059,7 +1102,11 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 							return published.event;
 						}),
 					);
-					return Stream.concat(history, live).pipe(
+					// After history, so a snapshot item takes its place below the stored events before it.
+					const snapshot = Stream.fromIterable(
+						streamed.map((event) => new SessionEvent({ sessionId, sequence: null, event, createdAt: snapshotAt })),
+					);
+					return history.pipe(Stream.concat(snapshot), Stream.concat(live)).pipe(
 						Stream.filter((event) => {
 							if (event.sequence === null) return true;
 							if (event.sequence <= lastSequence) return false;
