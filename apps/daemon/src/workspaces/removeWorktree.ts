@@ -37,13 +37,21 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 });
 
 // Whether a folder is still a worktree of the repository, with `folder` as a real path. One whose `.git` is
-// gone, or that now holds another repository, is not, and git would refuse to stash in or remove it.
+// gone, or that now holds another repository, is not, and git would refuse to stash in or remove it. Any other
+// failure, such as an unreadable `.git` or a safe.directory refusal, fails here: taken for "not a worktree", it
+// would skip the unsaved-work check and leave the folder for start-up to delete.
 export const isWorktreeOf = Effect.fn("isWorktreeOf")(function* (repositoryPath: string, folder: string) {
+	const fs = yield* FileSystem.FileSystem;
 	const locate = (cwd: string) =>
 		runGit(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]).pipe(
 			Effect.map((output) => output.split("\n")),
 		);
-	const here = yield* locate(folder).pipe(Effect.catchTag("GitCommandError", () => Effect.succeed(null)));
+	if (!(yield* fs.exists(join(folder, ".git")).pipe(Effect.orDie))) return false;
+	const here = yield* locate(folder).pipe(
+		Effect.catchTag("GitCommandError", (error) =>
+			error.stderr.includes("not a git repository") ? Effect.succeed(null) : Effect.fail(error),
+		),
+	);
 	if (here === null) return false;
 	const [, repositoryCommonDir] = yield* locate(repositoryPath);
 	return here[0] === folder && here[1] === repositoryCommonDir;

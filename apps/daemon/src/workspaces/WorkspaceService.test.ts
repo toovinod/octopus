@@ -505,6 +505,32 @@ describe("WorkspaceService", () => {
 		expect(result.folderExists).toBe(false);
 	});
 
+	test("does not take a worktree git cannot read for a folder that is no longer one", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				// Like a safe.directory refusal: the worktree is there, but git cannot tell what it holds.
+				const gitFile = join(created.path, ".git");
+				yield* fs.chmod(gitFile, 0o000);
+				const failed = yield* Effect.flip(workspaces.archive(created.id, { force: false })).pipe(
+					Effect.ensuring(fs.chmod(gitFile, 0o644).pipe(Effect.ignore)),
+				);
+				return {
+					failed,
+					workspace: yield* workspaces.get(created.id),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+				};
+			}),
+		);
+		expect(result.failed).toMatchObject({ _tag: "GitCommandError" });
+		expect(result.workspace.status).toBe("active");
+		expect(result.readme).toBe("edited\n");
+	});
+
 	test("archives a worktree whose folder is no longer a worktree, and leaves the folder", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
