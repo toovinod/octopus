@@ -21,5 +21,11 @@ export const errorMessage = (error: unknown): string => {
 		: "Something went wrong. Try again.";
 };
 
+// What the screen a failed start shows. Nothing reconnects there, so a dropped socket does not say to wait for it.
+export const bootErrorMessage = (error: unknown): string =>
+	errorTag(error) === "RpcClientError"
+		? "Octopus could not connect to its daemon. Retry, or quit Octopus and open it again."
+		: errorMessage(error);
+
 // Only a dropped socket is worth retrying. A daemon error would fail the same way again.
 export const isConnectionDrop = (error: unknown) => errorTag(error) === "RpcClientError";

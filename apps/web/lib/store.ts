@@ -15,12 +15,12 @@ import { allComments, keepComments, releaseComments } from "./pendingComments.ts
 import { loginEnvMissing, playChime, showNotification } from "./desktop.ts";
 import { saveForReload, takeSavedForReload } from "./keepAcrossReload.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
+import { bootErrorMessage, isConnectionDrop } from "./errorMessage.ts";
 import { allDrafts, keepDraft, releaseDrafts } from "./drafts.ts";
 import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { draftImageOf, type DraftImage } from "./images.ts";
 import type { Workspace } from "@repo/contracts/Workspace";
 import type { Project } from "@repo/contracts/Project";
-import { isConnectionDrop } from "./errorMessage.ts";
 import { logWarning } from "./logWarning.ts";
 import { useSyncExternalStore } from "react";
 import { toast as showToast } from "sonner";
@@ -208,7 +208,7 @@ export const boot = async () => {
 			return true;
 		},
 		(error: unknown) => {
-			setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
+			setState(() => ({ connection: { status: "failed", message: bootErrorMessage(error) } }));
 			return false;
 		},
 	);
@@ -351,7 +351,7 @@ const reconnect = (attempt: number) => {
 					reconnect(attempt + 1);
 					return;
 				}
-				setState(() => ({ connection: { status: "failed", message: errorMessage(error) } }));
+				setState(() => ({ connection: { status: "failed", message: bootErrorMessage(error) } }));
 				showToast.dismiss(CONNECTION_TOAST);
 			},
 		);
