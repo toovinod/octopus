@@ -468,6 +468,21 @@ describe("CodexAdapter", () => {
 		expect(reply).toMatchObject({ text: JSON.stringify(expected) });
 	});
 
+	test("a thread whose folder has a trailing slash is still marked untrusted", async () => {
+		const reply = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("thread config"));
+					const events = yield* takeUntil(handle, "turn.completed");
+					return events.find((event) => event.type === "message.completed");
+				}),
+			{ ...newSession, cwd: `${import.meta.dir}/` },
+		);
+		expect(reply).toMatchObject({
+			text: JSON.stringify({ projects: { [import.meta.dir]: { trust_level: "untrusted" } } }),
+		});
+	});
+
 	test("resumes an existing thread", async () => {
 		const id = await runSession((handle) => handle.nativeSessionId, {
 			...newSession,

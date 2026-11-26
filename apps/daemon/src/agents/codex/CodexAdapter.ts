@@ -126,7 +126,8 @@ const threadPolicy = {
 // thread starts in it, and then loads the folder's .codex config, hooks and exec policies. Marking the folder
 // untrusted for the thread keeps a project Octopus does not trust from configuring Codex, and writes nothing.
 const projectTrust = ({ cwd, trustProjectSettings }: StartSessionInput) =>
-	trustProjectSettings ? {} : { config: { projects: { [cwd]: { trust_level: "untrusted" } } } };
+	// Codex looks the folder up by its resolved path, so "/repo/" would miss and leave the project trusted.
+	trustProjectSettings ? {} : { config: { projects: { [resolve(cwd)]: { trust_level: "untrusted" } } } };
 
 const codexDecisions = {
 	allowOnce: "accept",
