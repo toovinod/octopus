@@ -13,6 +13,24 @@ export class GitCommandError extends Schema.TaggedError<GitCommandError>()("GitC
 	stderr: Schema.String,
 }) {}
 
+// Past these, stderr keeps its start, which says what went wrong, and stdout fails the command, since a listing
+// or a patch cut short would read as a whole one. Both are far past what any command the daemon runs prints.
+export const STDOUT_MAX_LENGTH = 32 * 1024 * 1024;
+export const STDERR_MAX_LENGTH = 64 * 1024;
+
+// A child's output as text, holding at most `maxLength` characters however much it prints.
+export const collectText = <E, R>(bytes: Stream.Stream<Uint8Array, E, R>, maxLength: number) =>
+	Stream.runFold(
+		Stream.decodeText(bytes),
+		() => ({ text: "", cut: false }),
+		(kept, chunk) => {
+			const room = maxLength - kept.text.length;
+			return chunk.length <= room
+				? { text: kept.text + chunk, cut: kept.cut }
+				: { text: kept.text + chunk.slice(0, room), cut: true };
+		},
+	);
+
 // These reach a remote, so they get the longer deadline.
 const NETWORK_COMMANDS = new Set(["push", "fetch", "pull", "clone", "ls-remote"]);
 
@@ -32,21 +50,17 @@ export const runGit = Effect.fn("runGit")(
 			}),
 		);
 		const [stdout, stderr, exitCode] = yield* Effect.all(
-			[
-				Stream.mkString(Stream.decodeText(handle.stdout)),
-				Stream.mkString(Stream.decodeText(handle.stderr)),
-				handle.exitCode,
-			],
+			[collectText(handle.stdout, STDOUT_MAX_LENGTH), collectText(handle.stderr, STDERR_MAX_LENGTH), handle.exitCode],
 			{ concurrency: "unbounded" },
 		);
-		if (exitCode !== 0) {
+		if (exitCode !== 0 || stdout.cut) {
 			return yield* new GitCommandError({
 				args: [...args],
 				exitCode,
-				stderr: stderr.trim(),
+				stderr: stdout.cut ? `The output passed ${STDOUT_MAX_LENGTH} characters.` : stderr.text.trim(),
 			});
 		}
-		return stdout.trimEnd();
+		return stdout.text.trimEnd();
 	},
 	Effect.scoped,
 	(effect, _cwd, args, _env?) =>

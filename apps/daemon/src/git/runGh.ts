@@ -1,7 +1,8 @@
 import { GhNotAuthenticatedError, GhNotInstalledError } from "@repo/contracts/Git";
+import { collectText, STDERR_MAX_LENGTH, STDOUT_MAX_LENGTH } from "./runGit.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { withGitDeadline } from "./GitTimeoutSettings.ts";
-import { Context, Effect, Schema, Stream } from "effect";
+import { Context, Effect, Schema } from "effect";
 
 export const GhSettings = Context.Reference<{ readonly executable: string }>("octopus/daemon/git/GhSettings", {
 	defaultValue: () => ({ executable: "gh" }),
@@ -28,17 +29,17 @@ export const runGh = Effect.fn("runGh")(
 			}),
 		);
 		const [stdout, stderr, exitCode] = yield* Effect.all(
-			[
-				Stream.mkString(Stream.decodeText(handle.stdout)),
-				Stream.mkString(Stream.decodeText(handle.stderr)),
-				handle.exitCode,
-			],
+			[collectText(handle.stdout, STDOUT_MAX_LENGTH), collectText(handle.stderr, STDERR_MAX_LENGTH), handle.exitCode],
 			{ concurrency: "unbounded" },
 		);
-		if (exitCode !== 0) {
-			return yield* new GhCommandError({ args: [...args], exitCode, stderr: stderr.trim() });
+		if (exitCode !== 0 || stdout.cut) {
+			return yield* new GhCommandError({
+				args: [...args],
+				exitCode,
+				stderr: stdout.cut ? `The output passed ${STDOUT_MAX_LENGTH} characters.` : stderr.text.trim(),
+			});
 		}
-		return stdout.trim();
+		return stdout.text.trim();
 	},
 	Effect.scoped,
 	(effect, _cwd, args) =>
