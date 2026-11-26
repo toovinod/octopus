@@ -63,9 +63,11 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import type { UserInput } from "./generated/v2/UserInput.ts";
 import { epochSecondsToIso } from "../epochSecondsToIso.ts";
 import { isAuthFailureText } from "../isAuthFailureText.ts";
+import { leavesRoot } from "../../files/leavesRoot.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { makeUniqueId } from "../makeUniqueId.ts";
 import { toAgentError } from "../toAgentError.ts";
+import { relative, resolve } from "node:path";
 
 const CODEX_VERSION = codexVersionFile.trim();
 
@@ -106,6 +108,13 @@ const turnPolicies: Record<AgentMode, Pick<TurnStartParams, "approvalPolicy" | "
 };
 
 const approvalChoices = ["allowOnce", "allowForSession", "deny"] as const;
+
+// Allowing a root for the session would let Codex write there for the rest of it, and session approvals must
+// never widen writes past the workspace, so a root outside it can only be allowed once.
+const fileChangeChoices = (cwd: string, grantRoot: string | null | undefined) =>
+	!grantRoot || !leavesRoot(relative(cwd, resolve(cwd, grantRoot)))
+		? approvalChoices
+		: (["allowOnce", "deny"] as const);
 
 // Set on every thread so the user's own Codex config cannot turn Octopus's approvals off.
 const threadPolicy = {
@@ -414,6 +423,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
 	requests: OpenRequests,
+	cwd: string,
 	request: Extract<CodexIncoming, { _tag: "request" }>,
 ) {
 	const requestId = toRequestId(requests, request.id);
@@ -446,7 +456,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 					kind: "fileChange",
 					summary: params.grantRoot ? `Allow writes under ${params.grantRoot}` : "Apply file changes",
 					reason: params.reason ?? null,
-					choices: approvalChoices,
+					choices: fileChangeChoices(cwd, params.grantRoot),
 				},
 				respond,
 			);
@@ -681,7 +691,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							Effect.andThen(
 								message._tag === "notification"
 									? handleNotification(session, currentTurn, plans, requests, message.method, message.params)
-									: handleServerRequest(session, client, requests, message),
+									: handleServerRequest(session, client, requests, input.cwd, message),
 							),
 							Effect.catchTag("AgentProtocolError", (error) =>
 								skipUnreadable(session, client, requests, message, error),

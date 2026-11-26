@@ -244,6 +244,17 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("grant")) {
+		// A patch that also asks for writes under a root for the rest of the session.
+		await ask(600, "item/fileChange/requestApproval", {
+			threadId,
+			turnId,
+			itemId: "patch-1",
+			reason: "Write the build output",
+			grantRoot: text.includes("inside") ? `${process.cwd()}/fixtures` : "/etc",
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("withdraw")) {
 		// Codex can take back a request it no longer needs, as when its auto-reviewer decides first.
 		const request = text.includes("question")

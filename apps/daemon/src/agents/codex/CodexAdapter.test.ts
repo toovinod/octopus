@@ -277,6 +277,24 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test.each([
+		["outside the workspace never offers", "grant", "/etc", ["allowOnce", "deny"]],
+		[
+			"inside the workspace offers",
+			"grant inside",
+			`${import.meta.dir}/fixtures`,
+			["allowOnce", "allowForSession", "deny"],
+		],
+	])("a file change asking for a root %s Allow for session", async (_kind, text, root, choices) => {
+		const requested = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage(text));
+				return (yield* takeUntil(handle, "approval.requested")).at(-1);
+			}),
+		);
+		expect(requested).toMatchObject({ kind: "fileChange", summary: `Allow writes under ${root}`, choices });
+	});
+
 	test("a resumed chat's approvals never reuse the ids of an earlier app-server", async () => {
 		const askOnce = (input: StartSessionInput) =>
 			runSession(
