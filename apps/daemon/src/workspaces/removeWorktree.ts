@@ -1,7 +1,7 @@
+import { addBranchWorktree, refExists, resolveBranchRef } from "./createWorktree.ts";
+import { WorktreeCreateError, WorktreeRemoveError } from "@repo/contracts/Workspace";
 import { KeepThroughShutdown } from "../processes/ProcessRegistry.ts";
-import { WorktreeRemoveError } from "@repo/contracts/Workspace";
 import { Array as Arr, Effect, FileSystem } from "effect";
-import { resolveBranchRef } from "./createWorktree.ts";
 import { runGit } from "../git/runGit.ts";
 import { join } from "node:path";
 
@@ -55,6 +55,39 @@ export const archiveStashMessage = (workspaceId: string) => `octopus-archive/${w
 // Commits made on a detached HEAD are on no branch, so removing the folder would leave them to git's garbage
 // collection. They go on this branch instead.
 export const archiveHeadBranch = (workspaceId: string) => `${archiveStashMessage(workspaceId)}-head`;
+
+// Recreates an archived workspace's worktree where it was: detached at the commits the archive kept, when it was
+// on a detached HEAD, so its stash applies onto the base it was made on. True when it is detached there.
+export const addArchivedWorktree = Effect.fn("addArchivedWorktree")(function* (options: {
+	readonly repositoryPath: string;
+	readonly worktreePath: string;
+	readonly workspaceId: string;
+	readonly branch: string;
+}) {
+	const { repositoryPath, worktreePath, workspaceId, branch } = options;
+	const kept = archiveHeadBranch(workspaceId);
+	if (!(yield* refExists(repositoryPath, `refs/heads/${kept}`))) {
+		yield* addBranchWorktree({ repositoryPath, worktreePath, branch });
+		return false;
+	}
+	yield* runGit(repositoryPath, ["worktree", "add", "--detach", worktreePath, kept]).pipe(
+		Effect.catchTag("GitCommandError", (cause) =>
+			Effect.logError("git worktree add failed", cause).pipe(
+				Effect.andThen(Effect.fail(new WorktreeCreateError({ branch }))),
+			),
+		),
+	);
+	return true;
+});
+
+// Once a restore went cleanly, the branch the archive kept a detached HEAD's commits on has done its job: the
+// worktree's HEAD holds them again, as it did before the archive.
+export const dropArchiveHeadBranch = Effect.fn("dropArchiveHeadBranch")(function* (
+	repositoryPath: string,
+	workspaceId: string,
+) {
+	yield* runGit(repositoryPath, ["branch", "-D", archiveHeadBranch(workspaceId)]);
+});
 
 const keepDetachedCommits = Effect.fn("keepDetachedCommits")(function* (worktreePath: string, workspaceId: string) {
 	const onBranch = yield* runGit(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]).pipe(
@@ -222,7 +255,8 @@ export const discardWorktree = Effect.fn("discardWorktree")(
 
 // Puts back what a forced archive stashed, then drops the stash. Found by message and applied by sha, since
 // other worktrees share the stash list and can shift its indexes meanwhile. If the changes do not apply
-// cleanly, git leaves the conflicts in the folder and the stash stays, so nothing is lost.
+// cleanly, git leaves the conflicts in the folder and the stash stays, so nothing is lost. True when nothing is
+// left in the stash.
 export const restoreArchiveStash = Effect.fn("restoreArchiveStash")(function* (
 	worktreePath: string,
 	workspaceId: string,
@@ -236,7 +270,7 @@ export const restoreArchiveStash = Effect.fn("restoreArchiveStash")(function* (
 	const entry = (yield* stashFor("%s")).find((fields) => fields.slice(1).join(" ").endsWith(`: ${message}`));
 	const sha = entry?.[0];
 	if (sha === undefined) {
-		return;
+		return true;
 	}
 	const applied = yield* runGit(worktreePath, ["stash", "apply", "--index", sha]).pipe(
 		Effect.as(true),
@@ -248,7 +282,7 @@ export const restoreArchiveStash = Effect.fn("restoreArchiveStash")(function* (
 		),
 	);
 	if (!applied) {
-		return;
+		return false;
 	}
 	const ref = (yield* stashFor("%gd")).find((fields) => fields[0] === sha)?.[1];
 	if (ref !== undefined) {
@@ -257,4 +291,5 @@ export const restoreArchiveStash = Effect.fn("restoreArchiveStash")(function* (
 	yield* Effect.logInfo("Restored the changes stashed by the archive").pipe(
 		Effect.annotateLogs({ worktreePath, message }),
 	);
+	return true;
 });

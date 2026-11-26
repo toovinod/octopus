@@ -7,7 +7,9 @@ import {
 	type WorktreeRemoveError,
 } from "@repo/contracts/Workspace";
 import {
+	addArchivedWorktree,
 	discardWorktree,
+	dropArchiveHeadBranch,
 	findUnsavedWork,
 	isWorktreeOf,
 	removeWorktree,
@@ -520,11 +522,13 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 						.get(current.projectId)
 						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
 					let setupRun: ScriptRunRow | null = null;
+					let detached = false;
 					if (current.kind === "worktree") {
 						yield* makeWorktreesDir;
-						yield* addBranchWorktree({
+						detached = yield* addArchivedWorktree({
 							repositoryPath: owner.path,
 							worktreePath: current.path,
+							workspaceId,
 							branch: current.branch,
 						});
 						// Ignored files such as installed dependencies were not kept, so setup runs again. Only where it ran
@@ -572,7 +576,10 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							: new WorkspacePathInUseError({ path: current.path });
 					}
 					if (current.kind === "worktree") {
-						yield* restoreArchiveStash(current.path, workspaceId);
+						const clean = yield* restoreArchiveStash(current.path, workspaceId);
+						if (clean && detached) {
+							yield* dropArchiveHeadBranch(owner.path, workspaceId);
+						}
 					}
 					yield* Effect.logInfo("Restored workspace").pipe(Effect.annotateLogs({ workspaceId }));
 					if (setupRun !== null && owner.setupScript !== null) {

@@ -357,6 +357,33 @@ describe("WorkspaceService", () => {
 		expect(result.kept).toBe(result.commit);
 	});
 
+	test("restoring a workspace archived on a detached HEAD puts it back at those commits, with its changes", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				yield* runGit(created.path, ["checkout", "--detach"]);
+				yield* fs.writeFileString(join(created.path, "README.md"), "committed\n");
+				yield* runGit(created.path, ["commit", "-am", "detached work"]);
+				const commit = yield* runGit(created.path, ["rev-parse", "HEAD"]);
+				yield* fs.writeFileString(join(created.path, "README.md"), "uncommitted\n");
+				yield* workspaces.archive(created.id, { force: true });
+				yield* workspaces.unarchive(created.id);
+				return {
+					commit,
+					head: yield* runGit(created.path, ["rev-parse", "HEAD"]),
+					readme: yield* fs.readFileString(join(created.path, "README.md")),
+					kept: yield* runGit(project.path, ["branch", "--list", `octopus-archive/${created.id}-head`]),
+				};
+			}),
+		);
+		expect(result.head).toBe(result.commit);
+		expect(result.readme).toBe("uncommitted\n");
+		expect(result.kept).toBe("");
+	});
+
 	test("counts commits no remote has as unsaved work", async () => {
 		const result = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
