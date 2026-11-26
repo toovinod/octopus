@@ -216,22 +216,26 @@ describe("GitService diff", () => {
 		expect(diff.diff.files.map((file) => file.path)).toEqual(["feature.txt"]);
 	});
 
-	test("once the line budget is spent, lists untracked files without reading them", async () => {
+	test("once the line budget is spent, still labels untracked files and counts their lines", async () => {
 		const diff = await runServiceTest((tempDir) =>
 			Effect.gen(function* () {
 				const fs = yield* FileSystem.FileSystem;
 				const created = yield* createWorkspace(tempDir);
 				const lines = `${Array.from({ length: DIFF_FILE_LINE_LIMIT }, (_, line) => `line ${line}`).join("\n")}\n`;
 				const fitting = DIFF_TOTAL_LINE_LIMIT / DIFF_FILE_LINE_LIMIT;
-				for (let index = 0; index <= fitting; index++) {
+				for (let index = 0; index < fitting; index++) {
 					yield* fs.writeFileString(join(created.path, `file-${String(index).padStart(2, "0")}.txt`), lines);
 				}
+				yield* fs.writeFileString(join(created.path, "zz-over.txt"), "one\ntwo\n");
+				yield* fs.writeFile(join(created.path, "zz-picture.bin"), new Uint8Array([0, 1, 2, 0]));
 				return yield* Effect.flatMap(GitService, (git) => git.getWorkspaceDiff(created.id));
 			}),
 		);
-		const last = diff.files.at(-1);
-		expect(diff.files.slice(0, -1).every((file) => file.content.kind === "text")).toBe(true);
-		expect(last).toMatchObject({ status: "untracked", additions: 0, content: { kind: "tooLarge" } });
+		expect(diff.files.slice(0, -2).every((file) => file.content.kind === "text")).toBe(true);
+		expect(diff.files.slice(-2)).toMatchObject([
+			{ path: "zz-over.txt", status: "untracked", additions: 2, content: { kind: "tooLarge" } },
+			{ path: "zz-picture.bin", status: "untracked", additions: 0, content: { kind: "binary" } },
+		]);
 	});
 
 	test("leaves a huge file out of the summary and loads it on request", async () => {
