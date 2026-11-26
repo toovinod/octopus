@@ -1,9 +1,9 @@
 import { runInTempDir, runServiceTest, waitForScriptRun, withServices } from "../testing/runServiceTest.ts";
 import { MAX_FINISHED_OUTPUTS, SETUP_SCRIPTS_AT_ONCE, WorkspaceService } from "./WorkspaceService.ts";
 import { checkpointRef, saveCheckpoint } from "../checkpoints/workspaceCheckpoints.ts";
+import { Duration, Effect, Fiber, FileSystem, Schedule, Stream } from "effect";
 import { SLOW_TO_STOP, waitForFile } from "../testing/processTesting.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
-import { Duration, Effect, Fiber, FileSystem, Stream } from "effect";
 import { TerminalService } from "../terminals/TerminalService.ts";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { SessionService } from "../sessions/SessionService.ts";
@@ -233,6 +233,44 @@ describe("WorkspaceService", () => {
 		expect(result.untracked).toBe(true);
 		expect(result.stashes).toBe("");
 		expect(result.workspace.status).toBe("active");
+	});
+
+	test("a forced archive interrupted after stashing still finishes, so the stash belongs to an archived workspace", async () => {
+		const result = await runServiceTest((tempDir) =>
+			Effect.gen(function* () {
+				const fs = yield* FileSystem.FileSystem;
+				const workspaces = yield* WorkspaceService;
+				const project = yield* addProject(tempDir);
+				yield* fs.writeFileString(join(project.path, ".gitignore"), "node_modules/\n");
+				yield* runGit(project.path, ["add", ".gitignore"]);
+				yield* runGit(project.path, ["commit", "-m", "ignore"]);
+				const created = yield* workspaces.create({ kind: "worktree", projectId: project.id, name: "feature" });
+				// Many ignored files are not stashed, so `git worktree remove` takes a while to delete them.
+				const modules = join(created.path, "node_modules");
+				yield* fs.makeDirectory(modules);
+				yield* Effect.forEach(
+					Array.from({ length: 4000 }, (_, index) => index),
+					(index) => fs.writeFileString(join(modules, `${index}.js`), "installed\n"),
+					{ concurrency: 64, discard: true },
+				);
+				yield* fs.writeFileString(join(created.path, "README.md"), "edited\n");
+				const archiving = yield* Effect.forkChild(workspaces.archive(created.id, { force: true }));
+				// Interrupted, as a quit or a dropped connection would, as soon as the changes are stashed.
+				yield* runGit(project.path, ["stash", "list"]).pipe(
+					Effect.repeat({ schedule: Schedule.spaced("2 millis"), until: (list) => list !== "" }),
+					Effect.timeout("10 seconds"),
+				);
+				yield* Fiber.interrupt(archiving);
+				return {
+					workspace: yield* workspaces.get(created.id),
+					folderExists: yield* fs.exists(created.path),
+					stashes: yield* runGit(project.path, ["stash", "list"]),
+				};
+			}),
+		);
+		expect(result.workspace.status).toBe("archived");
+		expect(result.folderExists).toBe(false);
+		expect(result.stashes).toContain(`octopus-archive/${result.workspace.id}`);
 	});
 
 	test("counts commits no remote has as unsaved work", async () => {

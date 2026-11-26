@@ -37,35 +37,37 @@ export const findUnsavedWork = Effect.fn("findUnsavedWork")(function* (worktreeP
 // The stash a forced archive leaves, found again by this message when the workspace is restored.
 export const archiveStashMessage = (workspaceId: string) => `octopus-archive/${workspaceId}`;
 
-const restoreStash = (worktreePath: string) =>
-	runGit(worktreePath, ["stash", "pop", "--index"]).pipe(
-		Effect.catchTag("GitCommandError", (cause) =>
-			Effect.logError("Could not restore the stashed changes, they are still in git stash", cause),
-		),
-	);
-
 // Removes the worktree folder and keeps its branch, so commits stay reachable.
 // With `stashChanges`, uncommitted and untracked files are stashed first; stashes live in the
-// shared repository, so they survive the folder.
+// shared repository, so they survive the folder. If the folder cannot be removed, the stash goes back into it.
 export const removeWorktree = Effect.fn("removeWorktree")(function* (options: {
 	readonly repositoryPath: string;
 	readonly worktreePath: string;
-	readonly stashMessage: string | null;
+	readonly workspaceId: string;
+	readonly stashChanges: boolean;
 }) {
-	const { repositoryPath, worktreePath, stashMessage } = options;
-	if (stashMessage !== null) {
-		yield* runGit(worktreePath, ["stash", "push", "--include-untracked", "-m", stashMessage]);
+	const { repositoryPath, worktreePath, workspaceId, stashChanges } = options;
+	if (stashChanges) {
+		yield* runGit(worktreePath, ["stash", "push", "--include-untracked", "-m", archiveStashMessage(workspaceId)]);
 		yield* Effect.logInfo("Stashed uncommitted changes before archiving").pipe(
-			Effect.annotateLogs({ worktreePath, stashMessage }),
+			Effect.annotateLogs({ worktreePath, workspaceId }),
 		);
 	}
 	// Forced, since git refuses any worktree with submodules otherwise. The caller has already checked for
 	// unsaved work, or stashed it. A locked worktree still refuses.
 	yield* runGit(repositoryPath, ["worktree", "remove", "--force", worktreePath]).pipe(
+		// On any failure, not just git's refusal: the workspace stays active, so its changes go back into its folder.
+		Effect.onError(() =>
+			stashChanges
+				? restoreArchiveStash(worktreePath, workspaceId).pipe(
+						Effect.catch((cause) =>
+							Effect.logError("Could not restore the stashed changes, they are still in git stash", cause),
+						),
+					)
+				: Effect.void,
+		),
 		Effect.catchTag("GitCommandError", (cause) =>
 			Effect.logError("git worktree remove failed", cause).pipe(
-				// The workspace stays active, so its changes go back into its folder.
-				Effect.andThen(stashMessage === null ? Effect.void : restoreStash(worktreePath)),
 				Effect.andThen(Effect.fail(new WorktreeRemoveError({ path: worktreePath }))),
 			),
 		),

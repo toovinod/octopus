@@ -4,21 +4,17 @@ import {
 	WorkspaceHasUnsavedWorkError,
 	WorkspaceNotFoundError,
 	WorkspacePathInUseError,
+	type WorktreeRemoveError,
 } from "@repo/contracts/Workspace";
-import {
-	archiveStashMessage,
-	discardWorktree,
-	findUnsavedWork,
-	removeWorktree,
-	restoreArchiveStash,
-} from "./removeWorktree.ts";
 import { RunScriptMissingError, ScriptRun, ScriptRunOutput, SetupScriptMissingError } from "@repo/contracts/ScriptRun";
 import { Context, Duration, Effect, FiberMap, FileSystem, Layer, PubSub, Schedule, Semaphore, Stream } from "effect";
+import { discardWorktree, findUnsavedWork, removeWorktree, restoreArchiveStash } from "./removeWorktree.ts";
 import { listBranches, listOpenIssues, listOpenPullRequests } from "./listWorkspaceSources.ts";
 import { addBranchWorktree, createWorktree, worktreeFolderName } from "./createWorktree.ts";
 import { applyScriptRunEvent, runSetupScript, setupRetryDelay } from "./runSetupScript.ts";
 import { LocalDatabase, PRIVATE_DIRECTORY_MODE } from "../database/LocalDatabase.ts";
 import { checkoutPullRequest, findPullRequestHead } from "./checkoutPullRequest.ts";
+import { type GitCommandError, type GitSpawnError, runGit } from "../git/runGit.ts";
 import { holdsForkCode, isForkBranch, markForkBranch } from "./forkBranch.ts";
 import { deleteCheckpoints } from "../checkpoints/workspaceCheckpoints.ts";
 import type { CreateWorkspaceInput } from "@repo/contracts/WorkspaceRpcs";
@@ -29,6 +25,7 @@ import { SessionService } from "../sessions/SessionService.ts";
 import { SetupScriptSettings } from "./SetupScriptSettings.ts";
 import type { ScriptRunKind } from "@repo/contracts/ScriptRun";
 import { listListeningPorts } from "./listListeningPorts.ts";
+import type { GitTimeoutError } from "@repo/contracts/Git";
 import type { ChildProcessSpawner } from "effect/process";
 import { DaemonConfig } from "../config/DaemonConfig.ts";
 import { ScriptRunChanges } from "./ScriptRunChanges.ts";
@@ -41,7 +38,6 @@ import { CappedOutput } from "./CappedOutput.ts";
 import { runRunScript } from "./runRunScript.ts";
 import { nowIso } from "../database/nowIso.ts";
 import { newId } from "../database/newId.ts";
-import { runGit } from "../git/runGit.ts";
 
 type WorkspaceRow = typeof workspace.$inferSelect;
 type ScriptRunRow = typeof scriptRun.$inferInsert;
@@ -413,6 +409,12 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 					if (current.status === "archived") {
 						return current;
 					}
+					// What takes the workspace's folder away. It runs with the rest of the archive, below.
+					let remove: Effect.Effect<
+						void,
+						WorktreeRemoveError | GitCommandError | GitSpawnError | GitTimeoutError,
+						ChildProcessSpawner.ChildProcessSpawner
+					> = Effect.void;
 					if (current.kind === "worktree") {
 						// The foreign key keeps the project while it has workspaces.
 						const owner = yield* projects
@@ -436,10 +438,11 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 							yield* stopWorkspaceProcesses(workspaceId);
 							// And again after: agents and scripts can write files until they stop.
 							const unsaved = yield* refuseUnsaved();
-							yield* removeWorktree({
+							remove = removeWorktree({
 								repositoryPath: owner.path,
 								worktreePath: current.path,
-								stashMessage: unsaved.changedFiles.length > 0 ? archiveStashMessage(workspaceId) : null,
+								workspaceId,
+								stashChanges: unsaved.changedFiles.length > 0,
 							});
 						} else {
 							// Someone deleted the folder already. Forget it in git and carry on.
@@ -447,29 +450,35 @@ export class WorkspaceService extends Context.Service<WorkspaceService>()(
 								Effect.annotateLogs({ workspaceId, path: current.path }),
 							);
 							yield* stopWorkspaceProcesses(workspaceId);
-							yield* runGit(owner.path, ["worktree", "prune"]);
+							remove = runGit(owner.path, ["worktree", "prune"]).pipe(Effect.asVoid);
 						}
 					} else {
 						// In place: the folder is the project itself, so nothing is removed.
 						yield* stopWorkspaceProcesses(workspaceId);
 					}
 
-					const archivedAt = yield* nowIso;
-					yield* database.query((db) =>
-						db.update(workspace).set({ status: "archived", archivedAt }).where(eq(workspace.id, workspaceId)),
-					);
-					yield* sessions.deleteWorkspaceAttachments(workspaceId);
-					// Checkpoints keep old copies of files alive in git, so they go with the workspace.
-					const { path: repository } = yield* projects
-						.get(current.projectId)
-						.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
-					yield* deleteCheckpoints(repository, workspaceId).pipe(
-						Effect.catch((cause) => Effect.logWarning("Could not delete the workspace's checkpoints", cause)),
-					);
-					const runs = yield* listScriptRuns(workspaceId);
-					for (const run of runs) {
-						outputs.delete(run.id);
-					}
+					const markArchived = Effect.gen(function* () {
+						const archivedAt = yield* nowIso;
+						yield* database.query((db) =>
+							db.update(workspace).set({ status: "archived", archivedAt }).where(eq(workspace.id, workspaceId)),
+						);
+						yield* sessions.deleteWorkspaceAttachments(workspaceId);
+						// Checkpoints keep old copies of files alive in git, so they go with the workspace.
+						const { path: repository } = yield* projects
+							.get(current.projectId)
+							.pipe(Effect.catchTag("ProjectNotFoundError", Effect.die));
+						yield* deleteCheckpoints(repository, workspaceId).pipe(
+							Effect.catch((cause) => Effect.logWarning("Could not delete the workspace's checkpoints", cause)),
+						);
+						const runs = yield* listScriptRuns(workspaceId);
+						for (const run of runs) {
+							outputs.delete(run.id);
+						}
+					});
+					// Not cut short by a quit or a dropped connection: stopped between stashing and saving the row, the
+					// workspace would stay active with its changes only in a stash. Each git command keeps its deadline,
+					// and a failed removal puts the stash back.
+					yield* Effect.uninterruptible(remove.pipe(Effect.andThen(markArchived)));
 					yield* Effect.logInfo("Archived workspace").pipe(Effect.annotateLogs({ workspaceId }));
 					return yield* get(workspaceId);
 				},
