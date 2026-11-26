@@ -77,12 +77,29 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	// Set once the app-server exits, so later calls fail at once instead of waiting out their deadline.
 	let ended: AgentError | undefined;
 
-	const send = (message: object) => Effect.asVoid(Queue.offer(outgoing, `${JSON.stringify(message)}\n`));
+	// Once the connection ended nothing more can reach Codex, so nothing more is queued for it.
+	const send = (message: object) =>
+		Effect.suspend(() =>
+			ended === undefined ? Effect.asVoid(Queue.offer(outgoing, `${JSON.stringify(message)}\n`)) : Effect.void,
+		);
 
 	const exited = new AgentProcessError({
 		message: "Codex app-server exited.",
 		cause: null,
 	});
+
+	// Fails every waiting request and the incoming stream, so callers learn at once instead of at their deadlines.
+	const end = (error: AgentError) =>
+		Effect.gen(function* () {
+			if (ended !== undefined) return;
+			ended = error;
+			for (const deferred of pending.values()) {
+				yield* Deferred.fail(deferred, error);
+			}
+			pending.clear();
+			yield* Queue.shutdown(outgoing);
+			yield* Queue.fail(incoming, error);
+		});
 
 	const handleLine = (line: string) =>
 		Effect.gen(function* () {
@@ -139,7 +156,19 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 	yield* Stream.fromQueue(outgoing).pipe(
 		Stream.encodeText,
 		Stream.run(handle.stdin),
-		Effect.catch((cause) => Effect.logWarning("Writing to Codex failed", cause)),
+		// A write that fails would drop every later request and answer, so the connection ends with it.
+		Effect.catch((cause) =>
+			Effect.logWarning("Writing to Codex failed", cause).pipe(
+				Effect.andThen(
+					end(
+						new AgentProcessError({
+							message: "Octopus could not write to Codex, so the chat stopped. Start it again.",
+							cause,
+						}),
+					),
+				),
+			),
+		),
 		Effect.forkScoped,
 	);
 
@@ -157,16 +186,7 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		Stream.mapError((cause) => new AgentProcessError({ message: "Reading from Codex failed.", cause })),
 		Stream.runForEach(handleLine),
 		Effect.andThen(Effect.fail(exited)),
-		Effect.catch((error: AgentError) =>
-			Effect.gen(function* () {
-				ended = error;
-				for (const deferred of pending.values()) {
-					yield* Deferred.fail(deferred, error);
-				}
-				pending.clear();
-				yield* Queue.fail(incoming, error);
-			}),
-		),
+		Effect.catch(end),
 		Effect.forkScoped,
 	);
 
@@ -174,10 +194,12 @@ export const makeCodexRpcClient = Effect.fn("makeCodexRpcClient")(function* (com
 		incoming: Stream.fromQueue(incoming),
 		request: (method, params) =>
 			Effect.gen(function* () {
-				if (ended !== undefined) return yield* Effect.fail(ended);
 				const { timeout } = yield* CodexRequestSettings;
 				const id = nextId++;
 				const deferred = yield* Deferred.make<unknown, AgentError>();
+				// Checked right before the waiter is registered, with no yield in between, so end() either fails this
+				// waiter or has already run and fails the request here. Never left to wait out its deadline.
+				if (ended !== undefined) return yield* Effect.fail(ended);
 				pending.set(id, deferred);
 				return yield* send({ id, method, params }).pipe(
 					Effect.andThen(Deferred.await(deferred)),

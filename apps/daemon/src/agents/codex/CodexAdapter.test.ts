@@ -1,13 +1,13 @@
 import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
+import { Duration, Effect, Fiber, Option, Redacted, Stream } from "effect";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { CodexAdapter, CodexAdapterConfig } from "./CodexAdapter.ts";
-import { Duration, Effect, Fiber, Option, Stream } from "effect";
 import { TurnWatchdogSettings } from "../makeAgentSession.ts";
 import type { AgentEvent } from "@repo/contracts/AgentEvent";
 import { CodexRequestSettings } from "./codexRpcClient.ts";
 import { userMessage } from "../../testing/userMessage.ts";
 import { BunServices } from "@effect/platform-bun";
-import { describe, expect, test } from "bun:test";
 
 const fakeCodex = `${import.meta.dir}/fixtures/fakeCodex.ts`;
 const newSession: StartSessionInput = {
@@ -178,6 +178,81 @@ describe("CodexAdapter", () => {
 		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
 	});
 
+	test.each([
+		["a status this version does not know", "new status", "paused"],
+		["inProgress, which cannot end a turn", "new status, in progress", "inProgress"],
+	])("a turn that ends with %s ends as failed", async (_kind, text, status) => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage(text));
+				return yield* takeUntil(handle, "turn.completed");
+			}).pipe(Effect.timeout("3 seconds")),
+		);
+		expect(events.at(-1)).toEqual({
+			type: "turn.completed",
+			turnId: "turn-1",
+			result: { status: "failed", message: `Codex ended the turn with an unexpected status: ${status}.` },
+		});
+	});
+
+	test("a reply whose text moved into content parts still completes the message", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("new reply"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "message.completed")).toEqual({
+			type: "message.completed",
+			itemId: "msg-1",
+			text: "Hello",
+		});
+	});
+
+	test("a reply with no text Octopus can find shows an error instead of vanishing", async () => {
+		const events = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("new reply, unreadable"));
+				return yield* takeUntil(handle, "turn.completed");
+			}),
+		);
+		expect(events.find((event) => event.type === "error")).toMatchObject({ willRetry: false });
+		expect(events.at(-1)).toMatchObject({ type: "turn.completed", result: { status: "completed" } });
+	});
+
+	describe("with an OPENAI_API_KEY in the daemon's own environment", () => {
+		beforeAll(() => {
+			process.env.OPENAI_API_KEY = "sk-daemon";
+		});
+		afterAll(() => {
+			delete process.env.OPENAI_API_KEY;
+		});
+
+		const keyCodexSees = (auth: StartSessionInput["auth"]) =>
+			runSession(
+				(handle) =>
+					Effect.gen(function* () {
+						yield* handle.sendMessage(userMessage("api key"));
+						return (yield* takeUntil(handle, "turn.completed")).find((event) => event.type === "message.completed");
+					}),
+				{ ...newSession, auth },
+			);
+
+		test("a subscription session gets no API key, so Codex bills the ChatGPT plan", async () => {
+			expect(await keyCodexSees({ mode: "subscription" })).toMatchObject({ text: "null" });
+		});
+
+		test("an API key session gets the user's key", async () => {
+			expect(await keyCodexSees({ mode: "apiKey", apiKey: Redacted.make("sk-user") })).toMatchObject({
+				text: JSON.stringify("sk-user"),
+			});
+		});
+
+		test("the sign-in check reads the ChatGPT sign-in, not the daemon's key", async () => {
+			expect(await runWithCodex(checkAuth)).toEqual({ status: "loggedIn", account: "dev@example.com" });
+		});
+	});
+
 	test("stops paging models when Codex repeats a cursor", async () => {
 		const { models } = await runWithCodex(
 			Effect.flatMap(CodexAdapter, (codex) => codex.listModels),
@@ -195,6 +270,28 @@ describe("CodexAdapter", () => {
 			}).pipe(Effect.timeout("2 seconds")),
 		);
 		expect(error).toMatchObject({ _tag: "AgentProcessError", message: "Codex app-server exited." });
+	});
+
+	test("a failed write to Codex ends the session at once instead of waiting for deadlines", async () => {
+		const [request, session] = await runWithCodex(
+			Effect.gen(function* () {
+				const handle = yield* Effect.flatMap(CodexAdapter, (codex) => codex.startSession(newSession));
+				yield* handle.sendMessage(userMessage("close stdin"));
+				yield* Effect.sleep("200 millis");
+				const request = yield* Effect.flip(handle.listCommands);
+				return [request, yield* Effect.flip(Stream.runDrain(handle.events))] as const;
+			}).pipe(
+				Effect.scoped,
+				Effect.provideService(CodexRequestSettings, { timeout: Duration.seconds(10) }),
+				Effect.timeout("3 seconds"),
+			),
+		);
+		const failed = {
+			_tag: "AgentProcessError",
+			message: "Octopus could not write to Codex, so the chat stopped. Start it again.",
+		};
+		expect(request).toMatchObject(failed);
+		expect(session).toMatchObject(failed);
 	});
 
 	test("runs a skill named with punctuation after it", async () => {
@@ -277,6 +374,44 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test.each([
+		["outside the workspace", "grant", "/etc"],
+		["inside the workspace, which a symlink can lead out of", "grant inside", `${import.meta.dir}/fixtures`],
+	])("a file change asking for a root %s never offers Allow for session", async (_kind, text, root) => {
+		const requested = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage(text));
+				return (yield* takeUntil(handle, "approval.requested")).at(-1);
+			}),
+		);
+		expect(requested).toMatchObject({
+			kind: "fileChange",
+			summary: `Allow writes under ${root}`,
+			choices: ["allowOnce", "deny"],
+		});
+	});
+
+	test.each([
+		[
+			"more access, network host",
+			"bun install (also asks for network access to registry.npmjs.org over https)",
+			["allowOnce", "deny"],
+		],
+		["more access", "bun install (also asks for network access, write access to /etc)", ["allowOnce", "deny"]],
+		["more access, nothing", "bun install", ["allowOnce", "allowForSession", "deny"]],
+	])(
+		"a command approval asking for %s shows it and never widens access for the session",
+		async (text, summary, choices) => {
+			const requested = await runSession((handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage(text));
+					return (yield* takeUntil(handle, "approval.requested")).at(-1);
+				}),
+			);
+			expect(requested).toMatchObject({ kind: "command", summary, choices });
+		},
+	);
+
 	test("a resumed chat's approvals never reuse the ids of an earlier app-server", async () => {
 		const askOnce = (input: StartSessionInput) =>
 			runSession(
@@ -311,6 +446,26 @@ describe("CodexAdapter", () => {
 		]);
 	});
 
+	test.each([
+		["approval", "withdraw", { type: "approval.resolved", requestId: "", outcome: "cancelled" }],
+		["question", "withdraw question", { type: "question.resolved", requestId: "", outcome: { type: "cancelled" } }],
+	] satisfies ReadonlyArray<[string, string, AgentEvent]>)(
+		"a %s Codex withdraws is resolved as cancelled and never answered",
+		async (_kind, text, resolved) => {
+			const events = await runSession((handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage(text));
+					return yield* takeUntil(handle, "turn.completed");
+				}),
+			);
+			expect(events.find((event) => event.type === resolved.type)).toEqual({
+				...resolved,
+				requestId: expect.stringMatching(/:500$/),
+			});
+			expect(events.find((event) => event.type === "message.completed")).toMatchObject({ text: "answered false" });
+		},
+	);
+
 	test("an interrupt sent before Codex names the turn stops it once the name arrives", async () => {
 		const events = await runSession((handle) =>
 			Effect.gen(function* () {
@@ -335,6 +490,37 @@ describe("CodexAdapter", () => {
 		);
 		expect(sent).toBe("queued");
 		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
+	});
+
+	test.each([
+		["ended", "ends quietly"],
+		["moved on", "moves on"],
+	])("a steer Codex refuses because its turn %s waits for its own turn", async (_kind, text) => {
+		const [sent, events] = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage(text));
+				yield* Effect.sleep("100 millis");
+				const sent = yield* handle.sendMessage(userMessage("hi"), { steer: true });
+				yield* takeUntil(handle, "turn.completed");
+				return [sent, yield* takeUntil(handle, "turn.completed")] as const;
+			}),
+		);
+		expect(sent).toBe("queued");
+		expect(events.at(-1)).toEqual({ type: "turn.completed", turnId: "turn-2", result: { status: "completed" } });
+	});
+
+	test("a steer Codex refuses for another reason fails visibly, even once the turn has ended", async () => {
+		const error = await runSession((handle) =>
+			Effect.gen(function* () {
+				yield* handle.sendMessage(userMessage("refuses steer"));
+				yield* Effect.sleep("100 millis");
+				return yield* Effect.flip(handle.sendMessage(userMessage("hi"), { steer: true }));
+			}),
+		);
+		expect(error).toMatchObject({
+			_tag: "AgentProtocolError",
+			message: "Codex rejected a request: cannot steer a review turn",
+		});
 	});
 
 	test("a turn that finishes before Codex answers turn/start leaves no stale turn behind", async () => {
@@ -428,6 +614,21 @@ describe("CodexAdapter", () => {
 			{ ...newSession, trustProjectSettings, ...(resumeId === undefined ? {} : { resumeId }) },
 		);
 		expect(reply).toMatchObject({ text: JSON.stringify(expected) });
+	});
+
+	test("a thread whose folder has a trailing slash is still marked untrusted", async () => {
+		const reply = await runSession(
+			(handle) =>
+				Effect.gen(function* () {
+					yield* handle.sendMessage(userMessage("thread config"));
+					const events = yield* takeUntil(handle, "turn.completed");
+					return events.find((event) => event.type === "message.completed");
+				}),
+			{ ...newSession, cwd: `${import.meta.dir}/` },
+		);
+		expect(reply).toMatchObject({
+			text: JSON.stringify({ projects: { [import.meta.dir]: { trust_level: "untrusted" } } }),
+		});
 	});
 
 	test("resumes an existing thread", async () => {

@@ -20,6 +20,8 @@ const threadId = "thread-new";
 let turns = 0;
 let turnId = "";
 let interrupted = false;
+// How Codex refuses a steer once the turn ended or moved on, and whether it ends the turn before refusing.
+let steerRefusal: { readonly message: string; readonly endFirst: boolean } | null = null;
 let experimentalApi = false;
 // The config overrides the thread was started or resumed with.
 let threadConfig: unknown = null;
@@ -157,6 +159,14 @@ const runTurn = async (
 		}
 		return completeTurn(text.includes("fails") ? "failed" : "completed");
 	}
+	if (text.includes("api key")) {
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(Bun.env.OPENAI_API_KEY ?? null) },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("policy")) {
 		notify("item/completed", {
 			item: {
@@ -244,6 +254,77 @@ const runTurn = async (
 		});
 		return completeTurn("completed");
 	}
+	if (text.includes("more access")) {
+		// A command that also asks for access past the sandbox, for this command or as a managed-network prompt.
+		const extra = text.includes("network host")
+			? { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }
+			: text.includes("nothing")
+				? { additionalPermissions: { network: null, fileSystem: null } }
+				: {
+						additionalPermissions: {
+							network: { enabled: true },
+							fileSystem: { read: null, write: ["/etc"], entries: [] },
+						},
+					};
+		await ask(700, "item/commandExecution/requestApproval", {
+			threadId,
+			turnId,
+			itemId: "cmd-1",
+			command: "bun install",
+			...extra,
+		});
+		return completeTurn("completed");
+	}
+	if (text.includes("grant")) {
+		// A patch that also asks for writes under a root for the rest of the session.
+		await ask(600, "item/fileChange/requestApproval", {
+			threadId,
+			turnId,
+			itemId: "patch-1",
+			reason: "Write the build output",
+			grantRoot: text.includes("inside") ? `${process.cwd()}/fixtures` : "/etc",
+		});
+		return completeTurn("completed");
+	}
+	// What a newer Codex might send: a turn status this version lacks, and a reply whose fields changed.
+	if (text.includes("new status")) return completeTurn(text.includes("in progress") ? "inProgress" : "paused");
+	if (text.includes("new reply")) {
+		const content = text.includes("unreadable") ? { parts: 2 } : { content: [{ type: "text", text: "Hello" }] };
+		notify("item/completed", { item: { type: "agentMessage", id: "msg-1", ...content }, threadId, turnId });
+		return completeTurn("completed");
+	}
+	if (text.includes("withdraw")) {
+		// Codex can take back a request it no longer needs, as when its auto-reviewer decides first.
+		const request = text.includes("question")
+			? {
+					method: "item/tool/requestUserInput",
+					params: {
+						threadId,
+						turnId,
+						itemId: "input-1",
+						questions: [
+							{ id: "db", header: "Database", question: "Which?", isOther: true, isSecret: false, options: null },
+						],
+					},
+				}
+			: {
+					method: "item/commandExecution/requestApproval",
+					params: { threadId, turnId, itemId: "cmd-1", command: "bun test" },
+				};
+		let answered = false;
+		void ask(500, request.method, request.params).then(() => {
+			answered = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		notify("serverRequest/resolved", { threadId, requestId: 500 });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		notify("item/completed", {
+			item: { type: "agentMessage", id: "msg-1", text: `answered ${answered}` },
+			threadId,
+			turnId,
+		});
+		return completeTurn("completed");
+	}
 	if (text.includes("ask me")) {
 		const answer = await ask(300, "item/tool/requestUserInput", {
 			threadId,
@@ -324,7 +405,9 @@ const serve = async () => {
 				send({
 					id: message.id,
 					result: {
-						account: { type: "chatgpt", email: "dev@example.com" },
+						// Like Codex, an OPENAI_API_KEY in its environment wins over the ChatGPT sign-in.
+						account:
+							Bun.env.OPENAI_API_KEY === undefined ? { type: "chatgpt", email: "dev@example.com" } : { type: "apiKey" },
 						requiresOpenaiAuth: true,
 					},
 				});
@@ -427,16 +510,42 @@ const serve = async () => {
 			case "turn/start": {
 				turnId = `turn-${++turns}`;
 				interrupted = false;
+				steerRefusal = null;
 				const text: string = message.params.input[0].text;
 				const reply = () => send({ id: message.id, result: { turn: { id: turnId } } });
 				// Never answered, like a hung app-server.
 				if (text.includes("hang")) break;
 				// Like an app-server that crashes.
 				if (text.includes("quit now")) process.exit(1);
+				// Like an app-server that stops reading but keeps its output open, so only a write can tell. A child
+				// holds stdout while this process, the only reader of stdin, exits.
+				if (text.includes("close stdin")) {
+					reply();
+					Bun.spawn(["sleep", "3"], { stdin: "ignore", stdout: "inherit", stderr: "inherit" });
+					process.exit(0);
+				}
 				if (text.includes("early")) {
 					// The turn can finish before Codex answers turn/start.
 					completeTurn("completed");
 					reply();
+					break;
+				}
+				// Codex's turn has ended or moved on, but its turn/completed reaches Octopus late.
+				if (text.includes("ends quietly") || text.includes("moves on")) {
+					reply();
+					steerRefusal = {
+						message: text.includes("moves on")
+							? `expected active turn id \`${turnId}\` but found \`turn-other\``
+							: "no active turn to steer",
+						endFirst: false,
+					};
+					setTimeout(() => completeTurn("completed"), 300);
+					break;
+				}
+				// The turn ends while a steer is on its way, and Codex refuses it for another reason.
+				if (text.includes("refuses steer")) {
+					reply();
+					steerRefusal = { message: "cannot steer a review turn", endFirst: true };
 					break;
 				}
 				if (text.includes("slow")) {
@@ -448,6 +557,20 @@ const serve = async () => {
 				void runTurn(text, message.params);
 				break;
 			}
+			// Refused once the turn ended or moved on. Otherwise never answered, like a hung app-server.
+			case "turn/steer":
+				if (steerRefusal === null) break;
+				{
+					const refuse = { id: message.id, error: { code: -32600, message: steerRefusal.message } };
+					if (!steerRefusal.endFirst) {
+						send(refuse);
+						break;
+					}
+					// Late enough that Octopus has seen the turn end before the refusal arrives.
+					completeTurn("completed");
+					setTimeout(() => send(refuse), 100);
+				}
+				break;
 			case "turn/interrupt":
 				if (message.params.turnId !== turnId) {
 					send({ id: message.id, error: { code: -32602, message: `no running turn ${message.params.turnId}` } });

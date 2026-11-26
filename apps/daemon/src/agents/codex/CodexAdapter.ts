@@ -19,6 +19,7 @@ import {
 	TurnCompleted,
 	TurnResponse,
 	SkillsResponse,
+	ServerRequestResolved,
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
@@ -35,11 +36,25 @@ import {
 import {
 	type CodexIncoming,
 	type CodexRpcClient,
+	type RequestId as CodexRequestId,
 	INVALID_PARAMS,
 	METHOD_NOT_FOUND,
 	makeCodexRpcClient,
 } from "./codexRpcClient.ts";
-import { Context, Effect, Exit, FiberHandle, Layer, Option, Predicate, PubSub, Ref, Scope, Stream } from "effect";
+import {
+	Context,
+	Effect,
+	Exit,
+	FiberHandle,
+	Layer,
+	Option,
+	Predicate,
+	PubSub,
+	type Redacted,
+	Ref,
+	Scope,
+	Stream,
+} from "effect";
 import type { CommandExecutionApprovalDecision } from "./generated/v2/CommandExecutionApprovalDecision.ts";
 import type { AgentCapabilities, AgentMode, AgentModel } from "@repo/contracts/AgentSession";
 import type { ApprovalOutcome, PlanOutcome, ToolCall } from "@repo/contracts/AgentEvent";
@@ -64,6 +79,7 @@ import { isAuthFailureText } from "../isAuthFailureText.ts";
 import { keepOutputTail } from "../keepOutputTail.ts";
 import { makeUniqueId } from "../makeUniqueId.ts";
 import { toAgentError } from "../toAgentError.ts";
+import { resolve } from "node:path";
 
 const CODEX_VERSION = codexVersionFile.trim();
 
@@ -105,6 +121,27 @@ const turnPolicies: Record<AgentMode, Pick<TurnStartParams, "approvalPolicy" | "
 
 const approvalChoices = ["allowOnce", "allowForSession", "deny"] as const;
 
+// Allowing a root for the session would let Codex write there for the rest of it, and session approvals must
+// never add directories. Any root counts, since one inside the workspace can be a symlink that leads out of it,
+// and a root that truly is inside adds nothing.
+const fileChangeChoices = (grantRoot: string | null | undefined) =>
+	grantRoot ? (["allowOnce", "deny"] as const) : approvalChoices;
+
+// What a command asks for past the sandbox, in words. Allowing any of it for the session would keep it for every
+// later command, which session approvals must never do, so such a command can only be allowed once.
+const extraAccess = ({ additionalPermissions, networkApprovalContext }: typeof CommandApprovalParams.Type) => {
+	const files = additionalPermissions?.fileSystem;
+	return [
+		networkApprovalContext
+			? `network access to ${networkApprovalContext.host} over ${networkApprovalContext.protocol}`
+			: null,
+		additionalPermissions?.network?.enabled ? "network access" : null,
+		files?.read?.length ? `read access to ${files.read.join(", ")}` : null,
+		files?.write?.length ? `write access to ${files.write.join(", ")}` : null,
+		files?.entries?.length ? "other file access" : null,
+	].filter(Predicate.isNotNull);
+};
+
 // Set on every thread so the user's own Codex config cannot turn Octopus's approvals off.
 const threadPolicy = {
 	approvalPolicy: "on-request",
@@ -115,7 +152,8 @@ const threadPolicy = {
 // thread starts in it, and then loads the folder's .codex config, hooks and exec policies. Marking the folder
 // untrusted for the thread keeps a project Octopus does not trust from configuring Codex, and writes nothing.
 const projectTrust = ({ cwd, trustProjectSettings }: StartSessionInput) =>
-	trustProjectSettings ? {} : { config: { projects: { [cwd]: { trust_level: "untrusted" } } } };
+	// Codex looks the folder up by its resolved path, so "/repo/" would miss and leave the project trusted.
+	trustProjectSettings ? {} : { config: { projects: { [resolve(cwd)]: { trust_level: "untrusted" } } } };
 
 const codexDecisions = {
 	allowOnce: "accept",
@@ -191,10 +229,12 @@ const initialize = Effect.fn("CodexAdapter.initialize")(function* (client: Codex
 	yield* client.notify("initialized");
 });
 
-const appServer = (executable: string, cwd?: string, env?: ChildProcess.CommandOptions["env"]) =>
+// Codex bills OPENAI_API_KEY whenever it is set, so the app-server gets only the user's own key, never the one
+// the daemon may have inherited. An unset key removes the inherited one.
+const appServer = (executable: string, apiKey?: Redacted.Redacted<string>, cwd?: string) =>
 	ChildProcess.make(executable, ["app-server"], {
 		...(cwd === undefined ? {} : { cwd }),
-		...(env === undefined ? {} : { env }),
+		env: { OPENAI_API_KEY: apiKey },
 		extendEnv: true,
 	});
 
@@ -251,14 +291,32 @@ interface PlanTracking {
 	readonly choices: ReadonlyArray<AgentMode>;
 }
 
+// The server requests still waiting for Octopus's answer, by their Octopus request id.
+interface OpenRequests {
+	readonly processId: string;
+	readonly ids: Set<string>;
+}
+
+const toRequestId = (requests: OpenRequests, id: CodexRequestId) => `${requests.processId}:${id}`;
+
 const handleNotification = Effect.fnUntraced(function* (
 	session: AgentSession,
 	currentTurn: Ref.Ref<TurnState>,
 	plans: PlanTracking,
+	requests: OpenRequests,
 	method: string,
 	params: unknown,
 ) {
 	switch (method) {
+		// A request Codex withdrew, as when it timed out or its auto-reviewer decided first, ends in Octopus
+		// too. The answer that cancelling it would send is dropped, since Codex no longer waits for one.
+		case "serverRequest/resolved": {
+			const requestId = toRequestId(requests, (yield* decodeCodex(ServerRequestResolved)(params)).requestId);
+			if (!requests.ids.delete(requestId)) return;
+			yield* Effect.logInfo("Codex withdrew a request").pipe(Effect.annotateLogs({ requestId }));
+			yield* session.cancelApproval(requestId);
+			return yield* session.cancelQuestions(requestId);
+		}
 		case "item/agentMessage/delta": {
 			const { itemId, delta } = yield* decodeCodex(AgentMessageDelta)(params);
 			return yield* session.emit({
@@ -300,11 +358,24 @@ const handleNotification = Effect.fnUntraced(function* (
 			if (item.type === "plan" && "text" in item) {
 				return yield* Ref.set(plans.turnPlan, Option.some({ id: item.id, text: item.text }));
 			}
-			if (item.type === "agentMessage" && "text" in item) {
+			if (item.type === "agentMessage") {
+				const text =
+					"text" in item ? item.text : "content" in item ? item.content.map((part) => part.text).join("") : null;
+				if (text !== null) {
+					return yield* session.emit({
+						type: "message.completed",
+						itemId: item.id,
+						text,
+					});
+				}
+				yield* Effect.logWarning("Codex sent a reply with no text Octopus could find").pipe(
+					Effect.annotateLogs({ itemId: item.id }),
+				);
 				return yield* session.emit({
-					type: "message.completed",
-					itemId: item.id,
-					text: item.text,
+					type: "error",
+					message:
+						"Codex sent a reply Octopus could not read, so it is missing here. Update Octopus if this keeps happening.",
+					willRetry: false,
 				});
 			}
 			if (item.type === "reasoning" && "summary" in item) {
@@ -333,18 +404,26 @@ const handleNotification = Effect.fnUntraced(function* (
 			if (turn.status === "failed" && turn.error !== null && isAuthFailure(turn.error)) {
 				return yield* new AgentAuthError({ agent: "codex", cause: turn.error });
 			}
+			const known = turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed";
+			if (!known) {
+				yield* Effect.logWarning("Codex ended a turn with an unexpected status").pipe(
+					Effect.annotateLogs({ status: turn.status }),
+				);
+			}
 			yield* session.emit({
 				type: "turn.completed",
 				turnId: turn.id,
 				result:
-					turn.status === "interrupted"
-						? { status: "interrupted" }
-						: turn.status === "failed"
-							? {
+					turn.status === "completed"
+						? { status: "completed" }
+						: turn.status === "interrupted"
+							? { status: "interrupted" }
+							: {
 									status: "failed",
-									message: turn.error?.message ?? "The turn failed.",
-								}
-							: { status: "completed" },
+									message: known
+										? (turn.error?.message ?? "The turn failed.")
+										: `Codex ended the turn with an unexpected status: ${turn.status}.`,
+								},
 			});
 			// A stopped or failed turn offers no plan, as in Codex's own prompt.
 			if (turn.status !== "completed" || Option.isNone(plan)) return;
@@ -393,22 +472,28 @@ const handleNotification = Effect.fnUntraced(function* (
 const handleServerRequest = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
-	processId: string,
+	requests: OpenRequests,
 	request: Extract<CodexIncoming, { _tag: "request" }>,
 ) {
-	const respond = (outcome: ApprovalOutcome) => client.respond(request.id, { decision: codexDecisions[outcome] });
-	const requestId = `${processId}:${request.id}`;
+	const requestId = toRequestId(requests, request.id);
+	requests.ids.add(requestId);
+	// Answers only a request Codex still waits on.
+	const answer = (result: unknown) =>
+		Effect.suspend(() => (requests.ids.delete(requestId) ? client.respond(request.id, result) : Effect.void));
+	const respond = (outcome: ApprovalOutcome) => answer({ decision: codexDecisions[outcome] });
 	switch (request.method) {
 		case "item/commandExecution/requestApproval": {
 			const params = yield* decodeCodex(CommandApprovalParams)(request.params);
+			const extra = extraAccess(params);
+			const command = params.command ?? "Run a command";
 			return yield* session.requestApproval(
 				{
 					requestId,
 					itemId: params.itemId,
 					kind: "command",
-					summary: params.command ?? "Run a command",
+					summary: extra.length === 0 ? command : `${command} (also asks for ${extra.join(", ")})`,
 					reason: params.reason ?? null,
-					choices: approvalChoices,
+					choices: extra.length === 0 ? approvalChoices : (["allowOnce", "deny"] as const),
 				},
 				respond,
 			);
@@ -422,7 +507,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 					kind: "fileChange",
 					summary: params.grantRoot ? `Allow writes under ${params.grantRoot}` : "Apply file changes",
 					reason: params.reason ?? null,
-					choices: approvalChoices,
+					choices: fileChangeChoices(params.grantRoot),
 				},
 				respond,
 			);
@@ -446,7 +531,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 				},
 				// Unanswered questions get empty answers, so Codex goes on without them.
 				(outcome) =>
-					client.respond(request.id, {
+					answer({
 						answers: Object.fromEntries(
 							Object.entries(outcome.type === "answered" ? outcome.answers : {}).map(([id, answers]) => [
 								id,
@@ -458,6 +543,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 		}
 		default:
 			// Never leave Codex waiting on a request we cannot answer.
+			requests.ids.delete(requestId);
 			yield* client.respondError(request.id, METHOD_NOT_FOUND, `Octopus does not support ${request.method}`);
 			return yield* session.emit({
 				type: "error",
@@ -472,6 +558,7 @@ const handleServerRequest = Effect.fnUntraced(function* (
 const skipUnreadable = Effect.fnUntraced(function* (
 	session: AgentSession,
 	client: CodexRpcClient,
+	requests: OpenRequests,
 	message: CodexIncoming,
 	error: AgentProtocolError,
 ) {
@@ -479,6 +566,7 @@ const skipUnreadable = Effect.fnUntraced(function* (
 		Effect.annotateLogs({ method: message.method }),
 	);
 	if (message._tag === "request") {
+		requests.ids.delete(toRequestId(requests, message.id));
 		yield* client.respondError(message.id, INVALID_PARAMS, `Octopus could not read ${message.method}`);
 	}
 	yield* session.emit({
@@ -488,6 +576,9 @@ const skipUnreadable = Effect.fnUntraced(function* (
 		willRetry: false,
 	});
 });
+
+// What Codex answers a turn/steer once the turn it named has ended, or another turn has taken its place.
+const isEndedTurn = (error: AgentError) => /no active turn|expected active turn id/i.test(error.message);
 
 // What Codex answers a thread/resume whose thread it has no record of.
 const isMissingThread = (error: AgentError) =>
@@ -628,7 +719,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 				const { executable } = yield* CodexAdapterConfig;
 				yield* checkVersion(executable);
 				const session = yield* makeAgentSession(capabilities);
-				const processId = yield* makeUniqueId;
+				const requests: OpenRequests = { processId: yield* makeUniqueId, ids: new Set() };
 				const currentTurn = yield* Ref.make(idle);
 				const plans: PlanTracking = {
 					turnPlan: yield* Ref.make(Option.none<{ readonly id: string; readonly text: string }>()),
@@ -641,11 +732,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					mode: input.mode,
 				});
 				const client = yield* makeCodexRpcClient(
-					appServer(
-						executable,
-						input.cwd,
-						input.auth.mode === "apiKey" ? { OPENAI_API_KEY: input.auth.apiKey } : undefined,
-					),
+					appServer(executable, input.auth.mode === "apiKey" ? input.auth.apiKey : undefined, input.cwd),
 				);
 
 				yield* client.incoming.pipe(
@@ -653,10 +740,12 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 						session.touch.pipe(
 							Effect.andThen(
 								message._tag === "notification"
-									? handleNotification(session, currentTurn, plans, message.method, message.params)
-									: handleServerRequest(session, client, processId, message),
+									? handleNotification(session, currentTurn, plans, requests, message.method, message.params)
+									: handleServerRequest(session, client, requests, message),
 							),
-							Effect.catchTag("AgentProtocolError", (error) => skipUnreadable(session, client, message, error)),
+							Effect.catchTag("AgentProtocolError", (error) =>
+								skipUnreadable(session, client, requests, message, error),
+							),
 						),
 					),
 					Effect.andThen(session.end),
@@ -779,12 +868,23 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 							const state = yield* Ref.get(currentTurn);
 							// Codex steers only a turn it has named, so earlier the message waits for its own turn.
 							if (state._tag !== "running") return false;
-							yield* client.request("turn/steer", {
-								threadId,
-								input: yield* toInput(message),
-								expectedTurnId: state.turnId,
-							} satisfies TurnSteerParams);
-							return true;
+							return yield* client
+								.request("turn/steer", {
+									threadId,
+									input: yield* toInput(message),
+									expectedTurnId: state.turnId,
+								} satisfies TurnSteerParams)
+								.pipe(
+									Effect.as(true),
+									// The turn can end while the steer is on its way, and Codex may say so before its
+									// turn/completed arrives. The message then waits for its own turn instead of failing.
+									// Any other refusal still fails, even once the turn ended, so it is never hidden.
+									Effect.catchIf(isEndedTurn, () =>
+										Effect.logInfo("A steer missed the end of its turn, so it waits for the next one").pipe(
+											Effect.as(false),
+										),
+									),
+								);
 						}),
 					updateSettings: (next) => Ref.set(settings, next),
 					listCommands: Effect.map(listSkills, (skills) =>
