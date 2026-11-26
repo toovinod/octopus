@@ -127,7 +127,7 @@ interface Runtime {
 	readonly approvals: Map<string, Cancellation>;
 	// The text each reply and thinking item streamed so far, until it completes. Deltas are never stored, so
 	// a subscriber that joins mid-reply gets this first.
-	readonly streamed: Map<string, StreamedText>;
+	readonly streamed: Map<string, Streamed>;
 	// The status when no turn or approval is pending.
 	resting: RestingStatus;
 	status: AgentSessionStatus;
@@ -138,16 +138,28 @@ interface Published {
 	readonly bytes: number;
 }
 
-type StreamedText = Extract<AgentEvent, { type: "message.delta" | "reasoning.delta" }>;
+// Characters of in-flight text kept per item. A reply this long is rare, and its completed event still
+// carries all of it, so a late subscriber sees only the latest part until then.
+export const STREAMED_TEXT_MAX_LENGTH = 64_000;
 
-// Keeps what an item streamed so far as a snapshot, and drops it once the item or its turn completes.
-const keepStreamed = (streamed: Map<string, StreamedText>, event: AgentEvent) => {
+interface Streamed {
+	readonly type: Extract<AgentEvent, { type: "message.delta" | "reasoning.delta" }>["type"];
+	readonly itemId: string;
+	readonly text: string;
+	// The start was dropped to stay within the cap.
+	readonly cut: boolean;
+}
+
+// Keeps what an item streamed so far, and drops it once the item or its turn completes.
+const keepStreamed = (streamed: Map<string, Streamed>, event: AgentEvent) => {
 	switch (event.type) {
 		case "message.delta":
 		case "reasoning.delta": {
 			const key = `${event.type}:${event.itemId}`;
-			const text = (streamed.get(key)?.text ?? "") + event.text;
-			streamed.set(key, { type: event.type, itemId: event.itemId, text, snapshot: true });
+			const kept = streamed.get(key);
+			const text = (kept?.text ?? "") + event.text;
+			const cut = (kept?.cut ?? false) || text.length > STREAMED_TEXT_MAX_LENGTH;
+			streamed.set(key, { type: event.type, itemId: event.itemId, text: text.slice(-STREAMED_TEXT_MAX_LENGTH), cut });
 			break;
 		}
 		case "message.completed":
@@ -1136,7 +1148,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					);
 					// After history, so a snapshot item takes its place below the stored events before it.
 					const snapshot = Stream.fromIterable(
-						streamed.map((event) => new SessionEvent({ sessionId, sequence: null, event, createdAt: snapshotAt })),
+						streamed.map(
+							({ type, itemId, text, cut }) =>
+								new SessionEvent({
+									sessionId,
+									sequence: null,
+									event: { type, itemId, text: cut ? `…${text}` : text, snapshot: true },
+									createdAt: snapshotAt,
+								}),
+						),
 					);
 					return history.pipe(Stream.concat(snapshot), Stream.concat(live)).pipe(
 						Stream.filter((event) => {

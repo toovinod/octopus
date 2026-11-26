@@ -27,11 +27,12 @@ import {
 } from "../testing/testAgentServices.ts";
 import { agentSession, sessionAttachment, sessionEvent, workspace as workspaceTable } from "../database/schema.ts";
 import { runInTempDir, runServiceTest, type Services, withServices } from "../testing/runServiceTest.ts";
+import { type AgentSession, makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
 import type { AgentSessionStatus, AgentKind, AgentMode } from "@repo/contracts/AgentSession";
 import { makeReplayAdapter, type Recording } from "../agents/replay/ReplayAdapter.ts";
 import { CredentialStore, CredentialStoreError } from "../agents/CredentialStore.ts";
 import { DATABASE_FILE_NAME, LocalDatabase } from "../database/LocalDatabase.ts";
-import { makeAgentSession, unsentNotice } from "../agents/makeAgentSession.ts";
+import { SessionService, STREAMED_TEXT_MAX_LENGTH } from "./SessionService.ts";
 import { makeTestRepository } from "../testing/makeTestRepository.ts";
 import { WorkspaceService } from "../workspaces/WorkspaceService.ts";
 import { testDaemonConfig } from "../testing/testDaemonConfig.ts";
@@ -39,7 +40,6 @@ import type { SessionEvent } from "@repo/contracts/SessionEvent";
 import { ProjectService } from "../projects/ProjectService.ts";
 import { AgentProbeSettings } from "./AgentProbeSettings.ts";
 import { AgentEvent } from "@repo/contracts/AgentEvent";
-import { SessionService } from "./SessionService.ts";
 import { BunServices } from "@effect/platform-bun";
 import { describe, expect, test } from "bun:test";
 import { asc, eq, sql } from "drizzle-orm";
@@ -129,6 +129,48 @@ const runWithRecording = <A, E>(recording: Recording, program: (tempDir: string)
 			}),
 		)(program(tempDir)),
 	);
+
+// A Codex agent whose turn streams these deltas, then does what `then` says, as a model that pauses or dies
+// mid-reply. Interrupting the turn ends it, as a real agent does.
+const streamingAgent = (
+	deltas: ReadonlyArray<AgentEvent>,
+	then: (session: AgentSession) => Effect.Effect<void>,
+): AgentAdapter => {
+	const replay = makeReplayAdapter(commandWithApproval);
+	return {
+		...replay,
+		startSession: () =>
+			Effect.gen(function* () {
+				const session = yield* makeAgentSession(replay.capabilities);
+				yield* session.setNativeSessionId("thread-streaming");
+				return yield* session.start({
+					startTurn: () => Effect.forEach(deltas, session.emit, { discard: true }).pipe(Effect.andThen(then(session))),
+					steerTurn: () => Effect.succeed(true),
+					interruptTurn: session.emit({ type: "turn.completed", turnId: "t1", result: { status: "interrupted" } }),
+					updateSettings: () => Effect.void,
+					listCommands: Effect.succeed([]),
+				});
+			}),
+	};
+};
+
+const runWithCodex = <A, E>(codex: AgentAdapter, program: (tempDir: string) => Effect.Effect<A, E, Services>) =>
+	runInTempDir((tempDir) =>
+		withServices(
+			join(tempDir, "data"),
+			testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+		)(program(tempDir)),
+	);
+
+// What a subscriber that has every stored event gets within a moment: only the text streamed so far.
+const snapshotAfterStored = (sessionId: string) =>
+	Effect.gen(function* () {
+		const sessions = yield* SessionService;
+		const stored = yield* storedEvents(sessionId);
+		return yield* sessions
+			.subscribe(sessionId, stored.at(-1)?.sequence ?? -1)
+			.pipe(Stream.interruptWhen(Effect.sleep("200 millis")), Stream.runCollect);
+	});
 
 const sequences = (events: ReadonlyArray<SessionEvent>) => events.map((stored) => stored.sequence);
 
@@ -304,6 +346,65 @@ describe("SessionService", () => {
 			{ type: "message.delta", itemId: "m1", text: "Hello", snapshot: true },
 			{ type: "message.delta", itemId: "m1", text: "!" },
 		]);
+	});
+
+	test("keeps only the latest streamed text of a long reply, marked as cut", async () => {
+		const long = "a".repeat(STREAMED_TEXT_MAX_LENGTH);
+		const codex = streamingAgent(
+			[
+				{ type: "message.delta", itemId: "m1", text: `start${long}` },
+				{ type: "message.delta", itemId: "m1", text: "end" },
+			],
+			() => Effect.void,
+		);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStored(session.id, 2);
+				yield* Effect.sleep("100 millis");
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received.map((stored) => stored.event)).toEqual([
+			{ type: "message.delta", itemId: "m1", text: `…${long.slice(3)}end`, snapshot: true },
+		]);
+	});
+
+	test("an interrupted turn leaves no streamed text behind", async () => {
+		const codex = streamingAgent([{ type: "message.delta", itemId: "m1", text: "Hel" }], () => Effect.void);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStored(session.id, 2);
+				yield* Effect.sleep("100 millis");
+				yield* sessions.interrupt(session.id);
+				yield* waitForStored(session.id, 3);
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received).toEqual([]);
+	});
+
+	test("an agent that dies mid-reply leaves no streamed text behind", async () => {
+		const codex = streamingAgent([{ type: "message.delta", itemId: "m1", text: "Hel" }], (session) =>
+			Effect.sleep("50 millis").pipe(
+				Effect.andThen(session.fail(new AgentProtocolError({ message: "Codex exited.", cause: null }))),
+			),
+		);
+		const received = await runWithCodex(codex, (tempDir) =>
+			Effect.gen(function* () {
+				const sessions = yield* SessionService;
+				const session = yield* addSession(tempDir);
+				yield* sessions.sendMessage(session.id, "go", [], false);
+				yield* waitForStatus(session.id, "failed");
+				return yield* snapshotAfterStored(session.id);
+			}),
+		);
+		expect(received).toEqual([]);
 	});
 
 	test("a cursor subscription has no gap or duplicate while events arrive during paging", async () => {
