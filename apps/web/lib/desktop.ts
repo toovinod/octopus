@@ -2,6 +2,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 
 // What the desktop shell adds over a browser. In a browser during development these fall back or do nothing.
 export const isDesktop = () => isTauri();
@@ -21,6 +22,19 @@ export const openExternal = async (url: string) => {
 // The shell asks with this text before it quits. Must match the command in apps/desktop/src-tauri/src/lib.rs.
 export const setQuitWarning = async (warning: string | null) => {
 	if (isDesktop()) await invoke("set_quit_warning", { warning });
+};
+
+// Must match QUIT_CHECK_EVENT in apps/desktop/src-tauri/src/lib.rs.
+const QUIT_CHECK_EVENT = "quit-check";
+
+// Before a quit that would ask first, the shell has the webview bring its warning up to date, and waits a moment
+// for it to say it is done. Returns the function that stops listening.
+export const onQuitCheck = (check: () => Promise<void>) => {
+	if (!isDesktop()) return () => {};
+	const unlisten = listen(QUIT_CHECK_EVENT, () => {
+		void check().finally(() => invoke("quit_checked"));
+	});
+	return () => void unlisten.then((stop) => stop());
 };
 
 // Whether the shell had to start the daemon without the login shell's environment, so without the user's PATH.

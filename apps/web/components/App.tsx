@@ -6,7 +6,7 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup, usePanelRef } fro
 import { callDaemon, isReason, onDaemonStopped, restartDaemon } from "../lib/daemonRuntime.ts";
 import { isMac, shortcutKey } from "../lib/shortcutKey.ts";
 import { quitWarning } from "../lib/quitWarning.ts";
-import { isDesktop, setQuitWarning } from "../lib/desktop.ts";
+import { isDesktop, onQuitCheck, setQuitWarning } from "../lib/desktop.ts";
 import { logWarning } from "../lib/logWarning.ts";
 import { SidebarProvider } from "@repo/ui/components/sidebar";
 import { TooltipProvider } from "@repo/ui/components/tooltip";
@@ -60,7 +60,19 @@ const useShortcuts = () =>
 // Each check lists the processes of every terminal, so it runs rarely rather than on every change.
 const ACTIVITY_POLL_MS = 15_000;
 
-const noActivity = { busyTerminals: 0, runningScripts: 0 };
+type Activity = { readonly busyTerminals: number; readonly runningScripts: number };
+
+const noActivity: Activity = { busyTerminals: 0, runningScripts: 0 };
+
+// The latest counts, or null when the daemon could not be asked.
+const checkActivity = () =>
+	callDaemon((daemon) => daemon.listActivity()).then(
+		({ busyTerminals, runningScripts }): Activity => ({ busyTerminals, runningScripts }),
+		(error: unknown) => {
+			logWarning("Could not check what is running before a quit", error);
+			return null;
+		},
+	);
 
 // Terminals running a command and scripts still going. Only the desktop shell quits, so a browser never asks.
 const useActivity = () => {
@@ -68,14 +80,21 @@ const useActivity = () => {
 	const [activity, setActivity] = useState(noActivity);
 	useEffect(() => {
 		if (!ready || !isDesktop()) return;
-		const check = () =>
-			callDaemon((daemon) => daemon.listActivity()).then(setActivity, (error: unknown) =>
-				logWarning("Could not check what is running before a quit", error),
-			);
-		void check();
-		const timer = setInterval(check, ACTIVITY_POLL_MS);
-		// A daemon that went away took its terminals and scripts with it.
+		// A check that answers after the daemon went away must not bring back what it took with it.
+		let live = true;
+		const poll = () =>
+			void checkActivity().then((fresh) => {
+				if (!live || fresh === null) return;
+				setActivity((current) =>
+					current.busyTerminals === fresh.busyTerminals && current.runningScripts === fresh.runningScripts
+						? current
+						: fresh,
+				);
+			});
+		poll();
+		const timer = setInterval(poll, ACTIVITY_POLL_MS);
 		return () => {
+			live = false;
 			clearInterval(timer);
 			setActivity(noActivity);
 		};
@@ -84,13 +103,21 @@ const useActivity = () => {
 };
 
 // Keeps the shell's quit warning current, so quitting asks first while turns run, approvals wait, or terminals
-// and scripts are busy.
+// and scripts are busy. Polled counts can be a few seconds old, so a quit that asks first checks them again.
 const useQuitWarning = () => {
 	const activity = useActivity();
 	const warning = useAppState((current) => quitWarning(Object.values(current.sessions), activity));
 	useEffect(() => {
 		void setQuitWarning(warning);
 	}, [warning]);
+	useEffect(
+		() =>
+			onQuitCheck(async () => {
+				const fresh = await checkActivity();
+				if (fresh !== null) await setQuitWarning(quitWarning(Object.values(getState().sessions), fresh));
+			}),
+		[],
+	);
 };
 
 // null while the daemon runs; once it stops, the reason it gave, if any.

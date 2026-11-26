@@ -18,7 +18,7 @@ use tauri_plugin_shell::{
   process::{CommandChild, CommandEvent},
   ShellExt,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 // Must match READY_LINE_PREFIX in apps/daemon/src/server/DaemonServer.ts.
 const READY_LINE_PREFIX: &str = "OCTOPUS_DAEMON_READY ";
@@ -32,6 +32,13 @@ const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 // Must match the event the webview listens for in apps/web/lib/daemonRuntime.ts.
 const DAEMON_STOPPED_EVENT: &str = "daemon-stopped";
+
+// Must match QUIT_CHECK_EVENT in apps/web/lib/desktop.ts.
+const QUIT_CHECK_EVENT: &str = "quit-check";
+
+// How long a quit that asks first waits for the webview to check what is running. A webview that cannot
+// answer, such as one showing that the daemon stopped, leaves the warning it last reported.
+const QUIT_CHECK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct DaemonConnection {
@@ -132,6 +139,17 @@ const CLOSE_ACTION: CloseAction = if cfg!(target_os = "macos") { CloseAction::Hi
 // Set by the webview while turns run or approvals wait, with the text to show before quitting. The shell
 // does not track sessions itself. Starting empty means a webview that never reports cannot block a quit.
 struct QuitWarning(Mutex<Option<String>>);
+
+// The webview reports its warning as things change, but terminals and scripts only every few seconds. Before
+// asking, the shell has it check again, and this is how it says it is done.
+struct QuitCheck(Mutex<Option<oneshot::Sender<()>>>);
+
+#[tauri::command]
+fn quit_checked(quit_check: State<'_, QuitCheck>) {
+  if let Some(done) = quit_check.0.lock().ok().and_then(|mut slot| slot.take()) {
+    let _ = done.send(());
+  }
+}
 
 #[tauri::command]
 fn set_quit_warning(warning: Option<String>, quit_warning: State<'_, QuitWarning>) {
@@ -320,6 +338,7 @@ pub fn run() {
         login_env_missing: AtomicBool::new(false),
       });
       app.manage(QuitWarning(Mutex::new(None)));
+      app.manage(QuitCheck(Mutex::new(None)));
       #[cfg(target_os = "macos")]
       app.set_menu(app_menu(app.handle())?)?;
       start_daemon(app.handle().clone());
@@ -343,6 +362,7 @@ pub fn run() {
       daemon_connection,
       daemon_stopped,
       login_env_missing,
+      quit_checked,
       restart_daemon,
       set_quit_warning
     ])
@@ -414,8 +434,22 @@ fn holds_exit(quitting: bool, warning: Option<&str>) -> bool {
   !quitting && warning.is_some()
 }
 
-// Asks first when the webview reported running turns or pending approvals.
+// Has the webview check what is running, then asks first if anything would be lost.
 fn request_quit(app: &tauri::AppHandle) {
+  let (done, checked) = oneshot::channel();
+  if let Ok(mut slot) = app.state::<QuitCheck>().0.lock() {
+    *slot = Some(done);
+  }
+  let _ = app.emit(QUIT_CHECK_EVENT, ());
+  let app = app.clone();
+  tauri::async_runtime::spawn(async move {
+    let _ = tokio::time::timeout(QUIT_CHECK_WAIT, checked).await;
+    ask_before_quit(&app);
+  });
+}
+
+// Asks first when the webview reported running turns, pending approvals, or busy terminals and scripts.
+fn ask_before_quit(app: &tauri::AppHandle) {
   let Some(warning) = quit_warning(app) else {
     quit(app);
     return;
