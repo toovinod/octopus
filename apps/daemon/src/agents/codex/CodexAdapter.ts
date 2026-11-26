@@ -23,6 +23,7 @@ import {
 } from "./codexProtocol.ts";
 import {
 	type AgentAdapter,
+	type AgentAuth,
 	AgentAuthError,
 	type AgentAuthStatus,
 	type AgentError,
@@ -231,6 +232,8 @@ const initialize = Effect.fn("CodexAdapter.initialize")(function* (client: Codex
 
 // Codex bills OPENAI_API_KEY whenever it is set, so the app-server gets only the user's own key, never the one
 // the daemon may have inherited. An unset key removes the inherited one.
+const apiKeyOf = (auth: AgentAuth) => (auth.mode === "apiKey" ? auth.apiKey : undefined);
+
 const appServer = (executable: string, apiKey?: Redacted.Redacted<string>, cwd?: string) =>
 	ChildProcess.make(executable, ["app-server"], {
 		...(cwd === undefined ? {} : { cwd }),
@@ -612,72 +615,83 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 			yield* Effect.addFinalizer(() => PubSub.shutdown(loginResults));
 
 			// A short-lived app-server for questions outside a session. Closing the scope stops it.
-			const connect = Effect.gen(function* () {
-				const { executable } = yield* CodexAdapterConfig;
-				yield* checkVersion(executable);
-				const client = yield* makeCodexRpcClient(appServer(executable));
-				yield* initialize(client);
-				return client;
-			});
+			// With the key a session in the same auth mode would get, so the answers match what that session sees.
+			const connect = (apiKey?: Redacted.Redacted<string>) =>
+				Effect.gen(function* () {
+					const { executable } = yield* CodexAdapterConfig;
+					yield* checkVersion(executable);
+					const client = yield* makeCodexRpcClient(appServer(executable, apiKey));
+					yield* initialize(client);
+					return client;
+				});
 
-			const checkAuth = Effect.gen(function* () {
-				const client = yield* connect;
-				const { account, requiresOpenaiAuth } = yield* client
-					.request("account/read", {
-						refreshToken: false,
-					} satisfies GetAccountParams)
-					.pipe(Effect.flatMap(decodeCodex(AccountResponse)));
-				const status: AgentAuthStatus =
-					account === null
-						? requiresOpenaiAuth
-							? { status: "loggedOut" }
-							: { status: "unknown" }
-						: {
-								status: "loggedIn",
-								account: "email" in account ? account.email : account.type,
-							};
-				return status;
-			}).pipe(Effect.scoped, provide, Effect.withSpan("CodexAdapter.checkAuth"));
+			const checkAuth = Effect.fn("CodexAdapter.checkAuth")(
+				function* (auth: AgentAuth) {
+					const client = yield* connect(apiKeyOf(auth));
+					const { account, requiresOpenaiAuth } = yield* client
+						.request("account/read", {
+							refreshToken: false,
+						} satisfies GetAccountParams)
+						.pipe(Effect.flatMap(decodeCodex(AccountResponse)));
+					const status: AgentAuthStatus =
+						account === null
+							? requiresOpenaiAuth
+								? { status: "loggedOut" }
+								: { status: "unknown" }
+							: {
+									status: "loggedIn",
+									account: "email" in account ? account.email : account.type,
+								};
+					return status;
+				},
+				Effect.scoped,
+				provide,
+			);
 
 			// The installed Codex knows which models the account can use, so the list comes from it.
-			const listModels = Effect.gen(function* () {
-				const client = yield* connect;
-				const models: Array<AgentModel> = [];
-				let defaultModel = "";
-				let cursor: string | null = null;
-				// A cursor Codex already sent would page forever.
-				const seenCursors = new Set<string>();
-				do {
-					const page: typeof ModelListResponse.Type = yield* client
-						.request("model/list", { cursor } satisfies ModelListParams)
-						.pipe(Effect.flatMap(decodeCodex(ModelListResponse)));
-					for (const model of page.data) {
-						// model/list has no context window. Codex reports it per thread in its token usage instead.
-						models.push({
-							id: model.id,
-							label: model.displayName,
-							description: model.description,
-							efforts: model.supportedReasoningEfforts.map((option) => option.reasoningEffort),
-							defaultEffort: model.defaultReasoningEffort,
-							contextWindow: null,
-							supportsImages: model.inputModalities.includes("image"),
-						});
-						if (model.isDefault) defaultModel = model.id;
-					}
-					cursor = page.nextCursor;
-					if (cursor !== null && seenCursors.has(cursor)) {
-						yield* Effect.logWarning("Codex repeated a model/list cursor, so Octopus stopped paging");
-						break;
-					}
-					if (cursor !== null) seenCursors.add(cursor);
-				} while (cursor !== null);
-				return { models, defaultModel: defaultModel || (models[0]?.id ?? "") } satisfies AgentModels;
-			}).pipe(Effect.scoped, provide, Effect.withSpan("CodexAdapter.listModels"));
+			const listModels = Effect.fn("CodexAdapter.listModels")(
+				function* (auth: AgentAuth) {
+					const client = yield* connect(apiKeyOf(auth));
+					const models: Array<AgentModel> = [];
+					let defaultModel = "";
+					let cursor: string | null = null;
+					// A cursor Codex already sent would page forever.
+					const seenCursors = new Set<string>();
+					do {
+						const page: typeof ModelListResponse.Type = yield* client
+							.request("model/list", { cursor } satisfies ModelListParams)
+							.pipe(Effect.flatMap(decodeCodex(ModelListResponse)));
+						for (const model of page.data) {
+							// model/list has no context window. Codex reports it per thread in its token usage instead.
+							models.push({
+								id: model.id,
+								label: model.displayName,
+								description: model.description,
+								efforts: model.supportedReasoningEfforts.map((option) => option.reasoningEffort),
+								defaultEffort: model.defaultReasoningEffort,
+								contextWindow: null,
+								supportsImages: model.inputModalities.includes("image"),
+							});
+							if (model.isDefault) defaultModel = model.id;
+						}
+						cursor = page.nextCursor;
+						if (cursor !== null && seenCursors.has(cursor)) {
+							yield* Effect.logWarning("Codex repeated a model/list cursor, so Octopus stopped paging");
+							break;
+						}
+						if (cursor !== null) seenCursors.add(cursor);
+					} while (cursor !== null);
+					return { models, defaultModel: defaultModel || (models[0]?.id ?? "") } satisfies AgentModels;
+				},
+				Effect.scoped,
+				provide,
+			);
 
 			const startLogin = Effect.gen(function* () {
 				const scope = yield* Scope.make();
 				const login = yield* Effect.gen(function* () {
-					const client = yield* connect;
+					// The ChatGPT sign-in never uses an API key.
+					const client = yield* connect();
 					const { authUrl } = yield* client
 						.request("account/login/start", { type: "chatgpt" } satisfies LoginAccountParams)
 						.pipe(Effect.flatMap(decodeCodex(LoginResponse)));
@@ -731,9 +745,7 @@ export class CodexAdapter extends Context.Service<CodexAdapter, CodexAgentAdapte
 					effort: input.effort,
 					mode: input.mode,
 				});
-				const client = yield* makeCodexRpcClient(
-					appServer(executable, input.auth.mode === "apiKey" ? input.auth.apiKey : undefined, input.cwd),
-				);
+				const client = yield* makeCodexRpcClient(appServer(executable, apiKeyOf(input.auth), input.cwd));
 
 				yield* client.incoming.pipe(
 					Stream.runForEach((message) =>

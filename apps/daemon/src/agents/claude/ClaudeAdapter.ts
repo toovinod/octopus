@@ -1019,11 +1019,12 @@ export class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAgentAda
 				kind: "claude",
 				capabilities,
 				authModes: ["apiKey", "subscription"],
-				checkAuth,
+				// Claude's check reads the CLI's own login with every credential unset, whatever the auth mode.
+				checkAuth: () => checkAuth,
 				startLogin,
 				submitLoginCode,
 				loginResults: Stream.fromPubSub(loginResults),
-				listModels: Effect.succeed(models),
+				listModels: () => Effect.succeed(models),
 				startSession,
 			});
 		}),

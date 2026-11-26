@@ -23,6 +23,7 @@ import {
 } from "@repo/contracts/AgentSession";
 import {
 	type AgentAdapter,
+	type AgentAuth,
 	type AgentAuthStatus,
 	type AgentError,
 	type AgentModels,
@@ -577,6 +578,15 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			return { mode: "apiKey", apiKey: apiKey.value } satisfies StartSessionInput["auth"];
 		});
 
+		// A probe runs with the auth a session would get. With API key mode and no key stored it runs with no key, and
+		// then only finds a missing or broken CLI, since the agent's own sign-in does not count in that mode.
+		const probeAuthFor = (agent: AgentKind) =>
+			authFor(agent).pipe(
+				Effect.catchTag("AgentUnavailableError", () =>
+					Effect.succeed({ mode: "subscription" } satisfies StartSessionInput["auth"]),
+				),
+			);
+
 		// A workspace's code is trusted when its project is, unless it is a fork's pull request.
 		const workspaceTrust = Effect.fnUntraced(function* (workspaceId: string) {
 			const [target] = yield* database.query((db) =>
@@ -670,7 +680,8 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 
 		const checkImagesSupported = Effect.fnUntraced(function* (sessionId: string) {
 			const row = yield* getRow(sessionId);
-			const { models } = yield* modelsOf(row.agent).pipe(Effect.mapError(toUnavailable(row.agent)));
+			const auth = yield* probeAuthFor(row.agent);
+			const { models } = yield* modelsOf(row.agent, auth).pipe(Effect.mapError(toUnavailable(row.agent)));
 			const model = models.find((candidate) => candidate.id === row.model);
 			// An unlisted model is left to the agent, which knows its own models best.
 			if (model?.supportsImages === false) {
@@ -1209,10 +1220,13 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 			}),
 		);
 
-		const modelsOf = (kind: AgentKind) => {
+		// Cached per agent. A change of auth mode or key forgets the agent's models, so they never mix.
+		const modelsOf = (kind: AgentKind, auth: AgentAuth) => {
 			const cached = modelCache.get(kind);
 			if (cached !== undefined) return Effect.succeed(cached);
-			return adapters[kind].listModels.pipe(Effect.tap((models) => Effect.sync(() => modelCache.set(kind, models))));
+			return adapters[kind]
+				.listModels(auth)
+				.pipe(Effect.tap((models) => Effect.sync(() => modelCache.set(kind, models))));
 		};
 
 		const agentInfo = Effect.fnUntraced(function* (kind: AgentKind) {
@@ -1231,8 +1245,9 @@ export class SessionService extends Context.Service<SessionService>()("octopus/d
 					}),
 				);
 			// Also run in API key mode: it is what finds a missing or mismatched CLI.
-			const auth = yield* Effect.result(withDeadline(adapter.checkAuth));
-			const listed = yield* Effect.result(withDeadline(modelsOf(kind)));
+			const probeAuth = yield* probeAuthFor(kind);
+			const auth = yield* Effect.result(withDeadline(adapter.checkAuth(probeAuth)));
+			const listed = yield* Effect.result(withDeadline(modelsOf(kind, probeAuth)));
 			if (Result.isFailure(listed)) {
 				yield* Effect.logWarning("Could not list agent models, showing none", listed.failure).pipe(
 					Effect.annotateLogs({ agent: kind }),

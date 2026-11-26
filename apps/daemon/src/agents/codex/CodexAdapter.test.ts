@@ -1,4 +1,4 @@
-import type { AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
+import type { AgentAuth, AgentSessionHandle, StartSessionInput } from "../AgentAdapter.ts";
 import codexVersionFile from "./generated/CODEX_VERSION" with { type: "text" };
 import { Duration, Effect, Fiber, Option, Redacted, Stream } from "effect";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -35,10 +35,13 @@ const runSession = <A, E>(program: (handle: AgentSessionHandle) => Effect.Effect
 		}).pipe(Effect.scoped),
 	);
 
-const checkAuth = Effect.gen(function* () {
-	const codex = yield* CodexAdapter;
-	return yield* codex.checkAuth;
-});
+const subscription: AgentAuth = { mode: "subscription" };
+
+const checkAuth = (auth: AgentAuth = subscription) =>
+	Effect.gen(function* () {
+		const codex = yield* CodexAdapter;
+		return yield* codex.checkAuth(auth);
+	});
 
 const takeUntil = (handle: AgentSessionHandle, type: AgentEvent["type"]) =>
 	handle.events.pipe(
@@ -54,7 +57,7 @@ const requestIdOf = (events: ReadonlyArray<AgentEvent>) => {
 
 describe("CodexAdapter", () => {
 	test("reports the login from account/read", async () => {
-		const status = await runWithCodex(checkAuth);
+		const status = await runWithCodex(checkAuth());
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
 	});
 
@@ -82,7 +85,7 @@ describe("CodexAdapter", () => {
 	});
 
 	test("lists models from every model/list page", async () => {
-		const models = await runWithCodex(Effect.flatMap(CodexAdapter, (codex) => codex.listModels));
+		const models = await runWithCodex(Effect.flatMap(CodexAdapter, (codex) => codex.listModels(subscription)));
 		expect(models).toEqual({
 			models: [
 				{
@@ -248,14 +251,21 @@ describe("CodexAdapter", () => {
 			});
 		});
 
+		test("the sign-in check in API key mode reads the user's key", async () => {
+			expect(await runWithCodex(checkAuth({ mode: "apiKey", apiKey: Redacted.make("sk-user") }))).toEqual({
+				status: "loggedIn",
+				account: "apiKey",
+			});
+		});
+
 		test("the sign-in check reads the ChatGPT sign-in, not the daemon's key", async () => {
-			expect(await runWithCodex(checkAuth)).toEqual({ status: "loggedIn", account: "dev@example.com" });
+			expect(await runWithCodex(checkAuth())).toEqual({ status: "loggedIn", account: "dev@example.com" });
 		});
 	});
 
 	test("stops paging models when Codex repeats a cursor", async () => {
 		const { models } = await runWithCodex(
-			Effect.flatMap(CodexAdapter, (codex) => codex.listModels),
+			Effect.flatMap(CodexAdapter, (codex) => codex.listModels(subscription)),
 			`${import.meta.dir}/fixtures/loopingModelsCodex.ts`,
 		);
 		expect(models.map((model) => model.id)).toEqual(["gpt-first", "gpt-later"]);
@@ -701,7 +711,7 @@ describe("CodexAdapter", () => {
 	});
 
 	test("fails when the installed version is older than the generated types", async () => {
-		const error = await runWithCodex(Effect.flip(checkAuth), `${import.meta.dir}/fixtures/outdatedCodex.ts`);
+		const error = await runWithCodex(Effect.flip(checkAuth()), `${import.meta.dir}/fixtures/outdatedCodex.ts`);
 		expect(error).toMatchObject({
 			_tag: "CodexVersionMismatchError",
 			actual: "0.0.1",
@@ -713,12 +723,12 @@ describe("CodexAdapter", () => {
 	});
 
 	test("accepts a version newer than the generated types", async () => {
-		const status = await runWithCodex(checkAuth, `${import.meta.dir}/fixtures/newerCodex.ts`);
+		const status = await runWithCodex(checkAuth(), `${import.meta.dir}/fixtures/newerCodex.ts`);
 		expect(status).toEqual({ status: "loggedIn", account: "dev@example.com" });
 	});
 
 	test("reports a missing executable as not installed", async () => {
-		const error = await runWithCodex(Effect.flip(checkAuth), "/nonexistent/codex");
+		const error = await runWithCodex(Effect.flip(checkAuth()), "/nonexistent/codex");
 		expect(error._tag).toBe("AgentNotInstalledError");
 		expect(error.message).toBe(
 			"Octopus could not find /nonexistent/codex. Install it, or add its folder to the PATH your login shell sets.",

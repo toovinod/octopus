@@ -35,6 +35,7 @@ export const StartSessionInput = Schema.Struct({
 	]),
 });
 export type StartSessionInput = typeof StartSessionInput.Type;
+export type AgentAuth = StartSessionInput["auth"];
 
 export const AgentAuthStatus = Schema.Union([
 	Schema.Struct({
@@ -158,7 +159,9 @@ export interface AgentAdapter {
 	readonly capabilities: AgentCapabilities;
 	// The auth modes the user may pick, the default first.
 	readonly authModes: ReadonlyArray<AgentAuthMode>;
-	readonly checkAuth: Effect.Effect<AgentAuthStatus, AgentError>;
-	readonly listModels: Effect.Effect<AgentModels, AgentError>;
+	// Both run with the auth a session would get, so an API key mode probe sees the user's key and a subscription
+	// probe sees none.
+	checkAuth(auth: AgentAuth): Effect.Effect<AgentAuthStatus, AgentError>;
+	listModels(auth: AgentAuth): Effect.Effect<AgentModels, AgentError>;
 	startSession(input: StartSessionInput): Effect.Effect<AgentSessionHandle, AgentError, Scope.Scope>;
 }

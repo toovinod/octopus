@@ -1,5 +1,6 @@
 import {
 	type AgentAdapter,
+	type AgentAuth,
 	AgentAuthError,
 	AgentNotInstalledError,
 	AgentProtocolError,
@@ -1717,13 +1718,14 @@ describe("SessionService", () => {
 
 	test("refuses images for a model that cannot read them", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
-		const { models } = await Effect.runPromise(replay.listModels);
+		const { models } = await Effect.runPromise(replay.listModels({ mode: "subscription" }));
 		const codex: AgentAdapter = {
 			...replay,
-			listModels: Effect.succeed({
-				models: models.map((model) => ({ ...model, supportsImages: false })),
-				defaultModel: "replay",
-			}),
+			listModels: () =>
+				Effect.succeed({
+					models: models.map((model) => ({ ...model, supportsImages: false })),
+					defaultModel: "replay",
+				}),
 		};
 		const error = await runInTempDir((tempDir) =>
 			withServices(
@@ -1991,7 +1993,7 @@ describe("SessionService", () => {
 	test("reports a missing CLI even when an API key is stored", async () => {
 		const claude: AgentAdapter = {
 			...makeReplayAdapter({ ...commandWithApproval, kind: "claude" }),
-			checkAuth: Effect.fail(new AgentNotInstalledError({ executable: "claude" })),
+			checkAuth: () => Effect.fail(new AgentNotInstalledError({ executable: "claude" })),
 		};
 		const agents = await runInTempDir((tempDir) =>
 			withServices(
@@ -2032,7 +2034,7 @@ describe("SessionService", () => {
 	test("an agent that never answers its probe is reported, not waited on", async () => {
 		const claude: AgentAdapter = {
 			...makeReplayAdapter({ ...commandWithApproval, kind: "claude" }),
-			checkAuth: Effect.never,
+			checkAuth: () => Effect.never,
 		};
 		const agents = await runInTempDir((tempDir) =>
 			withServices(
@@ -2055,10 +2057,11 @@ describe("SessionService", () => {
 		let calls = 0;
 		const codex: AgentAdapter = {
 			...replay,
-			listModels: Effect.andThen(
-				Effect.sync(() => calls++),
-				replay.listModels,
-			),
+			listModels: (auth) =>
+				Effect.andThen(
+					Effect.sync(() => calls++),
+					replay.listModels(auth),
+				),
 		};
 		await runInTempDir((tempDir) =>
 			withServices(
@@ -2069,16 +2072,53 @@ describe("SessionService", () => {
 		expect(calls).toBe(1);
 	});
 
+	test("the sign-in check and the model list run with the auth a session would get", async () => {
+		const replay = makeReplayAdapter(commandWithApproval);
+		const seen: Array<[string, string]> = [];
+		const record = (probe: string, auth: AgentAuth) =>
+			Effect.sync(() => seen.push([probe, auth.mode === "apiKey" ? Redacted.value(auth.apiKey) : auth.mode]));
+		const codex: AgentAdapter = {
+			...replay,
+			checkAuth: (auth) => Effect.andThen(record("checkAuth", auth), replay.checkAuth(auth)),
+			listModels: (auth) => Effect.andThen(record("listModels", auth), replay.listModels(auth)),
+		};
+		await runInTempDir((tempDir) =>
+			withServices(
+				join(tempDir, "data"),
+				testAgentServices({ claude: makeReplayAdapter({ ...commandWithApproval, kind: "claude" }), codex }),
+			)(
+				Effect.gen(function* () {
+					const sessions = yield* SessionService;
+					yield* sessions.listAgents;
+					yield* sessions.setAuthMode("codex", "apiKey");
+					yield* sessions.listAgents;
+					yield* sessions.setApiKey("codex", Redacted.make("sk-test"));
+					yield* sessions.listAgents;
+				}),
+			),
+		);
+		expect(seen).toEqual([
+			["checkAuth", "subscription"],
+			["listModels", "subscription"],
+			// API key mode without a stored key probes with none, so it only finds a missing or broken CLI.
+			["checkAuth", "subscription"],
+			["listModels", "subscription"],
+			["checkAuth", "sk-test"],
+			["listModels", "sk-test"],
+		]);
+	});
+
 	test("a finished Codex sign-in reaches watchers and fetches the models again", async () => {
 		const replay = makeReplayAdapter(commandWithApproval);
 		let calls = 0;
 		const logins = Effect.runSync(Queue.unbounded<{ success: boolean; error: string | null }>());
 		const codex = {
 			...replay,
-			listModels: Effect.andThen(
-				Effect.sync(() => calls++),
-				replay.listModels,
-			),
+			listModels: (auth: AgentAuth) =>
+				Effect.andThen(
+					Effect.sync(() => calls++),
+					replay.listModels(auth),
+				),
 			loginResults: Stream.fromQueue(logins),
 		};
 		const result = await runInTempDir((tempDir) =>
@@ -2111,10 +2151,11 @@ describe("SessionService", () => {
 		let calls = 0;
 		const codex: AgentAdapter = {
 			...replay,
-			listModels: Effect.andThen(
-				Effect.sync(() => calls++),
-				replay.listModels,
-			),
+			listModels: (auth) =>
+				Effect.andThen(
+					Effect.sync(() => calls++),
+					replay.listModels(auth),
+				),
 		};
 		const counts = await runInTempDir((tempDir) =>
 			withServices(
