@@ -328,10 +328,18 @@ pub fn run() {
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app, event| match event {
+      // Holding every exit back would also cancel a macOS logout or restart, so it is held only to ask first.
+      // Otherwise the app exits now and `RunEvent::Exit` closes octopusd's stdin, which shuts it down cleanly.
       // Our own `app.exit` in `quit` asks again, and that one goes through.
-      RunEvent::ExitRequested { api, .. } if !app.state::<Daemon>().quitting.load(Ordering::SeqCst) => {
-        api.prevent_exit();
-        request_quit(app);
+      RunEvent::ExitRequested { api, .. } => {
+        let daemon = app.state::<Daemon>();
+        if holds_exit(daemon.quitting.load(Ordering::SeqCst), quit_warning(app).as_deref()) {
+          api.prevent_exit();
+          request_quit(app);
+        } else {
+          // So octopusd stopping is not reported to the webview as a crash.
+          daemon.quitting.store(true, Ordering::SeqCst);
+        }
       }
       // A click on the dock icon brings back the window that closing hid.
       #[cfg(target_os = "macos")]
@@ -375,10 +383,18 @@ fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
   Ok(menu)
 }
 
+fn quit_warning(app: &tauri::AppHandle) -> Option<String> {
+  app.state::<QuitWarning>().0.lock().ok().and_then(|warning| warning.clone())
+}
+
+// An exit is held back only while it is not already quitting and there is something to ask about.
+fn holds_exit(quitting: bool, warning: Option<&str>) -> bool {
+  !quitting && warning.is_some()
+}
+
 // Asks first when the webview reported running turns or pending approvals.
 fn request_quit(app: &tauri::AppHandle) {
-  let warning = app.state::<QuitWarning>().0.lock().ok().and_then(|warning| warning.clone());
-  let Some(warning) = warning else {
+  let Some(warning) = quit_warning(app) else {
     quit(app);
     return;
   };
@@ -522,6 +538,13 @@ mod tests {
     assert_eq!(stopped_report(&stopped, true), None);
     assert_eq!(stopped_report(&DaemonStatus::Starting, false), None);
     assert_eq!(stopped_report(&DaemonStatus::Ready(connection()), false), None);
+  }
+
+  #[test]
+  fn an_exit_is_held_back_only_to_ask_first() {
+    assert!(holds_exit(false, Some("1 chat is working. Quitting stops it.")));
+    assert!(!holds_exit(false, None));
+    assert!(!holds_exit(true, Some("1 chat is working. Quitting stops it.")));
   }
 
   #[test]
